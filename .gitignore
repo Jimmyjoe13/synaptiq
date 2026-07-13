@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.log
+.idea/
+.vscode/
+data/
+db_data/
+postgres_data/
+redis_data/

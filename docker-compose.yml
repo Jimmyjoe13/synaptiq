@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: synaptiq-postgres
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_USER: synaptiq
+      POSTGRES_PASSWORD: synaptiq_password
+      POSTGRES_DB: synaptiq_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - synaptiq-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: synaptiq-redis
+    ports:
+      - "6399:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --save 60 1 --loglevel warning
+    networks:
+      - synaptiq-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  synaptiq-network:
+    driver: bridge
