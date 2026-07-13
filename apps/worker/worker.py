@@ -48,6 +48,7 @@ def generate_mock_embedding(text: str) -> list:
         vector = [x / norm for x in vector]
     return vector
 
+
 def call_llm_extractor(event_content: str) -> dict:
     """
     Analyse l'événement brut pour en extraire des mémoires consolidées.
@@ -58,6 +59,40 @@ def call_llm_extractor(event_content: str) -> dict:
     if LLM_PROVIDER == "mock" or not LLM_API_KEY or "your_api_key" in LLM_API_KEY:
         logger.info("Utilisation de l'extracteur heuristique local (sans LLM).")
         
+        # Détection des erreurs de code et des résolutions
+        error_match = re.search(
+            r"(?:erreur|bug|exception|traceback|crash|failed|plantage|corrigé|résolu|warning)\s+([^.]+)",
+            event_content,
+            re.IGNORECASE
+        )
+        if error_match:
+            return {
+                "extracted": True,
+                "type": "procedural",
+                "subtype": "code_error_resolution",
+                "content": f"Résolution de bug/erreur détectée : {error_match.group(0).strip()}",
+                "summary": "Résolution d'erreur de code",
+                "confidence": 0.85,
+                "importance": 0.7
+            }
+            
+        # Détection des bonnes pratiques et playbooks
+        best_practice_match = re.search(
+            r"(?:bonne pratique|toujours|ne jamais|règle de conception|recommandation|best practice)\s+([^.]+)",
+            event_content,
+            re.IGNORECASE
+        )
+        if best_practice_match:
+            return {
+                "extracted": True,
+                "type": "procedural",
+                "subtype": "coding_best_practices",
+                "content": f"Directive de conception/code : {best_practice_match.group(0).strip()}",
+                "summary": "Directive de conception de code",
+                "confidence": 0.9,
+                "importance": 0.8
+            }
+            
         # Détection basique des préférences de l'utilisateur
         pref_match = re.search(
             r"(?:je préfère|je veux|ma préférence|utilise plutôt|ne fais pas|écris en)\s+([^.]+)", 
@@ -76,7 +111,7 @@ def call_llm_extractor(event_content: str) -> dict:
                 "importance": 0.8
             }
             
-        # Si aucun pattern de préférence, on extrait comme un épisode générique
+        # Si aucun pattern, on extrait comme un épisode générique
         return {
             "extracted": True,
             "type": "episodic",
@@ -96,14 +131,19 @@ def call_llm_extractor(event_content: str) -> dict:
     Interaction à analyser :
     "{event_content}"
     
-    Tu dois renvoyer UN UNIQUE objet JSON contenant :
+    Tu devez classifier cette mémoire selon l'un des types suivants :
+    1. "procedural" (sous-type "code_error_resolution" pour des erreurs système, tracebacks et leurs résolutions, ou "coding_best_practices" pour des playbooks, règles d'architecture et bonnes pratiques de programmation).
+    2. "semantic" (sous-type "preference" pour les choix explicites de l'utilisateur, ou "fact" pour des faits généraux stables).
+    3. "episodic" (sous-type "interaction" pour un résumé historique d'une action menée à bien ou d'une étape projet importante).
+    
+    Tu devez renvoyer UN UNIQUE objet JSON contenant :
     {{
-      "type": "semantic" (pour des faits, préférences ou connaissances stables) ou "episodic" (pour un résumé d'action/résultat) ou "procedural" (règles et playbooks),
-      "subtype": "preference", "fact", "rule" ou "interaction",
-      "content": "Le fait extrait rédigé de manière claire et concise à la troisième personne",
-      "summary": "Un titre ou résumé très court du fait",
+      "type": "semantic", "episodic" ou "procedural",
+      "subtype": "code_error_resolution", "coding_best_practices", "preference", "fact" ou "interaction",
+      "content": "Le souvenir extrait rédigé de manière claire, concise et affirmative à la troisième personne (ex: 'L'agent ne doit pas importer de librairies réseau au niveau global sous Windows')",
+      "summary": "Un titre ou résumé très court du souvenir (ex: 'Windows Multiprocessing Fix')",
       "confidence": un float entre 0.0 et 1.0 (degré de certitude),
-      "importance": un float entre 0.0 et 1.0 (importance opérationnelle)
+      "importance": un float entre 0.0 et 1.0 (importance opérationnelle pour l'agent)
     }}
     
     Renvoie UNIQUEMENT le JSON brut, aucun autre texte.
@@ -196,7 +236,7 @@ def process_event(event: dict) -> bool:
     # 2. Génération d'embedding
     embedding = generate_mock_embedding(memory_data['content'])
     
-    # 3. Écriture en base de données avec gestion des contradictions
+    # 3. Écriture en base de données avec gestion des contradictions et des intrications
     try:
         conn = psycopg2.connect(DATABASE_URL)
         with conn.cursor() as cur:
@@ -229,15 +269,62 @@ def process_event(event: dict) -> bool:
             ))
             
             new_mem_id = cur.fetchone()[0]
+            logger.info(f"Nouvelle mémoire consolidée créée avec l'ID {new_mem_id} ({memory_data['type']}/{memory_data['subtype']}).")
             
-            # Insertion d'une relation d'intrication (relation entre l'événement source et la mémoire créée)
-            # Pour la v0, on peut par exemple créer une relation s'il y a lieu.
+            # 4. Graphe d'intrication sémantique automatique (Q-EM)
+            # Si c'est une règle, une erreur ou une bonne pratique, on cherche sémantiquement des souvenirs associés pour créer des liaisons
+            if memory_data['type'] == 'procedural' or memory_data['subtype'] == 'preference':
+                embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+                find_rel_query = """
+                    SELECT id, type, subtype, (1 - (embedding <=> %s::vector)) AS similarity
+                    FROM memories
+                    WHERE tenant_id = %s
+                      AND agent_id = %s
+                      AND id != %s
+                      AND status = 'active'
+                    ORDER BY similarity DESC
+                    LIMIT 3;
+                """
+                cur.execute(find_rel_query, (
+                    embedding_str,
+                    tenant_id,
+                    agent_id,
+                    new_mem_id
+                ))
+                related_rows = cur.fetchall()
+                for rel_row in related_rows:
+                    similarity = float(rel_row[3] or 0.0)
+                    if similarity > 0.7:  # Seuil d'intrication sémantique
+                        target_id = rel_row[0]
+                        relation_type = "entangled_with"
+                        
+                        # Règle d'intrication : une bonne pratique résout/remplace une erreur associée
+                        if memory_data['subtype'] == 'coding_best_practices' and rel_row[2] == 'code_error_resolution':
+                            relation_type = "supersedes_by"
+                        elif memory_data['subtype'] == 'code_error_resolution' and rel_row[2] == 'coding_best_practices':
+                            # Inverser la relation : la cible remplace la source
+                            relation_type = "supersedes_by"
+                            
+                        # Insérer la relation
+                        insert_rel_query = """
+                            INSERT INTO relationships (source_memory_id, target_memory_id, relation_type, weight)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (source_memory_id, target_memory_id) DO NOTHING;
+                        """
+                        # Si relation inversée, inverser les arguments
+                        if relation_type == "supersedes_by" and memory_data['subtype'] == 'code_error_resolution':
+                            cur.execute(insert_rel_query, (target_id, new_mem_id, relation_type, similarity))
+                        else:
+                            cur.execute(insert_rel_query, (new_mem_id, target_id, relation_type, similarity))
+                        
+                        logger.info(f"Intrication Q-EM établie : {new_mem_id} --({relation_type})--> {target_id} (sim={similarity:.2f})")
             
             conn.commit()
-            logger.info(f"Nouvelle mémoire consolidée créée avec l'ID {new_mem_id}.")
             return True
             
     except Exception as e:
+        if 'conn' in locals() and conn:
+            conn.rollback()
         logger.error(f"Erreur SQL lors de l'enregistrement de la mémoire : {e}")
         return False
     finally:

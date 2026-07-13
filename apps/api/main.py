@@ -358,8 +358,11 @@ def build_context(request: ContextRequest):
             collapsed_candidates.sort(key=lambda x: x['utility_density'], reverse=True)
 
             facts = []
+            preferences = []
             episodes = []
             rules = []
+            best_practices = []
+            errors = []
             examples = []
             selected_ids = []
             token_count = 0
@@ -372,13 +375,23 @@ def build_context(request: ContextRequest):
                     token_count += c['tokens']
                     
                     m_type = c['type']
+                    m_subtype = c.get('subtype')
                     content = c['content']
+                    
                     if m_type == 'semantic':
-                        facts.append(content)
+                        if m_subtype == 'preference':
+                            preferences.append(content)
+                        else:
+                            facts.append(content)
                     elif m_type == 'episodic':
                         episodes.append(content)
                     elif m_type == 'procedural':
-                        rules.append(content)
+                        if m_subtype == 'coding_best_practices':
+                            best_practices.append(content)
+                        elif m_subtype == 'code_error_resolution':
+                            errors.append(content)
+                        else:
+                            rules.append(content)
                     elif m_type == 'working':
                         examples.append(content)
                 else:
@@ -398,8 +411,11 @@ def build_context(request: ContextRequest):
             # Construction finale du paquet
             context_packet = {
                 "facts": facts,
+                "preferences": preferences,
                 "episodes": episodes,
                 "rules": rules,
+                "best_practices": best_practices,
+                "errors": errors,
                 "examples": examples
             }
             

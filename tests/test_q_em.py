@@ -251,5 +251,82 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
         self.assertNotIn(m1_content, context_packet['facts'])
         print("[SUCCESS] Interférence destructive de contradiction vérifiée !")
 
+    def test_q_em_classification_and_auto_entanglement(self):
+        """
+        Test de la classification automatique et de l'intrication automatique (Q-EM) :
+        1. On simule un log d'erreur de programmation (event) -> classifié en code_error_resolution.
+        2. On simule une règle de bonne pratique de programmation proche sémantiquement -> classifiée en coding_best_practices.
+        3. On vérifie qu'une relation d'intrication 'supersedes_by' a été créée automatiquement.
+        """
+        from apps.worker.worker import process_event
+        from unittest.mock import patch
+        
+        tenant_id = "tenant_quantum"
+        agent_id = "agent_quantum"
+        session_id = "session_quantum"
+        
+        # 1. Événement d'erreur (contenant le mot clé 'traceback' ou 'erreur')
+        event_error = {
+            "id": "e0000000-0000-0000-0000-000000000001",
+            "tenant_id": tenant_id,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "content": "Erreur critique : le script Python a crashé avec un traceback d'import de socket au démarrage sous Windows."
+        }
+        
+        # 2. Événement de bonne pratique proche sémantiquement (contenant 'bonne pratique' ou 'toujours')
+        event_best_practice = {
+            "id": "e0000000-0000-0000-0000-000000000002",
+            "tenant_id": tenant_id,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "content": "Bonne pratique : toujours importer de façon paresseuse les modules réseau sous Windows pour éviter les plantages."
+        }
+        
+        # On force les deux événements à renvoyer le même embedding (similarité = 1.0) pour déclencher l'intrication automatique
+        dummy_embedding = generate_mock_embedding("dummy text")
+        with patch('apps.worker.worker.generate_mock_embedding', return_value=dummy_embedding):
+            success1 = process_event(event_error)
+            self.assertTrue(success1)
+            
+            success2 = process_event(event_best_practice)
+            self.assertTrue(success2)
+        
+        # 3. Vérification en base de données
+        with self.db_conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Récupérer les souvenirs créés
+            cur.execute(
+                "SELECT id, type, subtype, content FROM memories WHERE tenant_id = %s AND agent_id = %s ORDER BY created_at ASC;",
+                (tenant_id, agent_id)
+            )
+            rows = cur.fetchall()
+            self.assertEqual(len(rows), 2)
+            
+            err_mem = rows[0]
+            bp_mem = rows[1]
+            
+            # Vérifier la classification
+            self.assertEqual(err_mem['type'], 'procedural')
+            self.assertEqual(err_mem['subtype'], 'code_error_resolution')
+            
+            self.assertEqual(bp_mem['type'], 'procedural')
+            self.assertEqual(bp_mem['subtype'], 'coding_best_practices')
+            
+            # Vérifier que la relation d'intrication 'supersedes_by' a été créée automatiquement !
+            cur.execute(
+                "SELECT source_memory_id, target_memory_id, relation_type FROM relationships WHERE source_memory_id = %s OR target_memory_id = %s;",
+                (err_mem['id'], err_mem['id'])
+            )
+            rels = cur.fetchall()
+            self.assertGreater(len(rels), 0, "Aucune relation d'intrication n'a été créée automatiquement !")
+            
+            # La bonne pratique (bp_mem) remplace/résout l'erreur (err_mem), donc bp_mem --(supersedes_by)--> err_mem
+            rel = rels[0]
+            self.assertEqual(str(rel['source_memory_id']), str(bp_mem['id']))
+            self.assertEqual(str(rel['target_memory_id']), str(err_mem['id']))
+            self.assertEqual(rel['relation_type'], 'supersedes_by')
+            
+            print("[SUCCESS] Classification de code et intrication automatique validées en BD !")
+
 if __name__ == '__main__':
     unittest.main()
