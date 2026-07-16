@@ -45,6 +45,18 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE INDEX IF NOT EXISTS idx_memories_lookup ON memories(tenant_id, agent_id, type, status);
 
+-- Table des clés API (auth + scoping multi-tenant, Phase 3)
+CREATE TABLE IF NOT EXISTS api_keys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    key_hash VARCHAR(64) NOT NULL UNIQUE,   -- SHA256 hex de la clé en clair (jamais stockée en clair)
+    tenant_id VARCHAR(50) NOT NULL,          -- tenant auquel la clé donne accès
+    name VARCHAR(100),                       -- libellé lisible (ex: 'agent-ouroboros-prod')
+    active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TIMESTAMP WITH TIME ZONE
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash) WHERE active;
+
 -- Table des relations (Intrication Quantique)
 CREATE TABLE IF NOT EXISTS relationships (
     source_memory_id UUID REFERENCES memories(id) ON DELETE CASCADE,

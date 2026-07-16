@@ -1,24 +1,29 @@
 import os
+import sys
 import json
 import time
 import logging
 import re
-import hashlib
-from datetime import datetime
 import psycopg2
-from psycopg2.extras import RealDictCursor
 import redis
 import requests
 from dotenv import load_dotenv
+
+# Rendre le package partagé packages/core importable (dev local hors conteneur)
+_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+for _p in (_root, os.path.join(_root, "packages", "core")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from synaptiq_core import get_embedder, to_pgvector, handle_contradictions
+from synaptiq_core.embeddings import generate_mock_embedding  # noqa: F401 (compat rétro tests)
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("synaptiq-worker")
 
-# Chargement du fichier .env (on cherche d'abord localement, puis à côté dans apps/api/)
-load_dotenv()
-if not os.getenv("DATABASE_URL"):
-    load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../api/.env"))
+# Chargement des variables d'environnement depuis le .env RACINE (source unique)
+load_dotenv(os.path.join(_root, ".env"))
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6399/0")
@@ -26,28 +31,6 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6399/0")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mock")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/llama-3-8b-instruct:free")
-
-# Fonction de mock d'embedding (dimension 384) pour all-MiniLM-L6-v2
-def generate_mock_embedding(text: str) -> list:
-    """
-    Génère un vecteur déterministe normalisé de 384 floats basé sur le hash du texte.
-    Pratique pour le test et le fonctionnement v0 hors-ligne.
-    """
-    sha = hashlib.sha256(text.encode('utf-8')).digest()
-    vector = []
-    for i in range(384):
-        # Utiliser les octets du hash de manière circulaire
-        val = sha[i % 32]
-        # Mapper l'octet (0-255) vers une valeur entre -1.0 et 1.0
-        val_normalized = (val / 127.5) - 1.0
-        vector.append(val_normalized)
-        
-    # Normalisation du vecteur pour la similarité cosinus
-    norm = sum(x**2 for x in vector)**0.5
-    if norm > 0:
-        vector = [x / norm for x in vector]
-    return vector
-
 
 def call_llm_extractor(event_content: str) -> dict:
     """
@@ -198,27 +181,6 @@ def call_llm_extractor(event_content: str) -> dict:
             "importance": 0.3
         }
 
-def handle_contradictions(cur, tenant_id: str, agent_id: str, new_memory: dict) -> None:
-    """
-    Gère la détection et le traitement des contradictions.
-    Si la nouvelle mémoire est une préférence ('preference') ou une règle ('rule'),
-    on archive les anciennes de même type/subtype pour éviter les conflits directs.
-    """
-    if new_memory['type'] == 'semantic' and new_memory['subtype'] == 'preference':
-        logger.info(f"Analyse des contradictions pour la préférence : {new_memory['content']}")
-        # Archiver les anciennes préférences
-        archive_query = """
-            UPDATE memories
-            SET status = 'archived', updated_at = CURRENT_TIMESTAMP
-            WHERE tenant_id = %s
-              AND agent_id = %s
-              AND type = 'semantic'
-              AND subtype = 'preference'
-              AND status = 'active';
-        """
-        cur.execute(archive_query, (tenant_id, agent_id))
-        logger.info("Anciennes préférences archivées avec succès.")
-
 def process_event(event: dict) -> bool:
     """
     Traite un événement brut extrait de Redis.
@@ -233,15 +195,15 @@ def process_event(event: dict) -> bool:
     # 1. Extraction de la mémoire
     memory_data = call_llm_extractor(content)
     
-    # 2. Génération d'embedding
-    embedding = generate_mock_embedding(memory_data['content'])
+    # 2. Génération d'embedding (fournisseur réel configuré : LM Studio par défaut)
+    embedding = get_embedder().embed_one(memory_data['content'])
     
     # 3. Écriture en base de données avec gestion des contradictions et des intrications
     try:
         conn = psycopg2.connect(DATABASE_URL)
         with conn.cursor() as cur:
-            # Gestion des contradictions (Archivage + Confiance)
-            handle_contradictions(cur, tenant_id, agent_id, memory_data)
+            # Gestion des contradictions (archivage scopé sémantiquement)
+            handle_contradictions(cur, tenant_id, agent_id, memory_data, embedding)
             
             # Insertion de la nouvelle mémoire
             insert_query = """
@@ -274,7 +236,7 @@ def process_event(event: dict) -> bool:
             # 4. Graphe d'intrication sémantique automatique (Q-EM)
             # Si c'est une règle, une erreur ou une bonne pratique, on cherche sémantiquement des souvenirs associés pour créer des liaisons
             if memory_data['type'] == 'procedural' or memory_data['subtype'] == 'preference':
-                embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+                embedding_str = to_pgvector(embedding)
                 find_rel_query = """
                     SELECT id, type, subtype, (1 - (embedding <=> %s::vector)) AS similarity
                     FROM memories
@@ -331,8 +293,75 @@ def process_event(event: dict) -> bool:
         if 'conn' in locals() and conn:
             conn.close()
 
+# ─── File d'événements : Redis Streams (consumer group + ACK + DLQ) ───
+STREAM = os.getenv("EVENT_STREAM", "synaptiq:events")
+GROUP = os.getenv("EVENT_GROUP", "synaptiq-workers")
+DLQ = os.getenv("EVENT_DLQ", "synaptiq:events:dlq")
+CONSUMER = f"worker-{os.getpid()}"
+MAX_DELIVERIES = int(os.getenv("EVENT_MAX_DELIVERIES", "5"))
+IDLE_RECLAIM_MS = int(os.getenv("EVENT_IDLE_RECLAIM_MS", "30000"))
+
+
+def ensure_group(r) -> None:
+    """Crée le consumer group (et le stream) s'il n'existe pas déjà."""
+    try:
+        r.xgroup_create(STREAM, GROUP, id="0", mkstream=True)
+        logger.info("Consumer group '%s' créé sur le stream '%s'.", GROUP, STREAM)
+    except redis.ResponseError as e:
+        if "BUSYGROUP" not in str(e):
+            raise
+
+
+def _to_dlq(r, msg_id: str, raw: str, reason: str, deliveries: int = 0) -> None:
+    r.xadd(DLQ, {"data": raw or "", "error": reason, "deliveries": str(deliveries), "orig_id": msg_id})
+    r.xack(STREAM, GROUP, msg_id)
+    logger.error("Message %s envoyé en DLQ (%s).", msg_id, reason)
+
+
+def _handle(r, msg_id: str, fields: dict) -> None:
+    """Traite un message : ACK si OK, DLQ si empoisonné/dépassé, sinon laissé en pending."""
+    raw = fields.get("data", "")
+    # 1. Décodage : un message illisible est empoisonné -> DLQ direct (pas de boucle infinie)
+    try:
+        event = json.loads(raw)
+    except Exception as e:
+        _to_dlq(r, msg_id, raw, f"decode: {e}")
+        return
+
+    # 2. Traitement métier
+    if process_event(event):
+        r.xack(STREAM, GROUP, msg_id)
+        return
+
+    # 3. Échec : router en DLQ si le nombre de livraisons dépasse le plafond
+    deliveries = 1
+    pend = r.xpending_range(STREAM, GROUP, min=msg_id, max=msg_id, count=1)
+    if pend:
+        deliveries = pend[0].get("times_delivered", 1)
+    if deliveries >= MAX_DELIVERIES:
+        _to_dlq(r, msg_id, raw, "process_event failed", deliveries)
+    else:
+        logger.warning("Événement %s en échec (livraison %d/%d), re-livraison ultérieure.",
+                       msg_id, deliveries, MAX_DELIVERIES)
+        # Pas d'ACK : le message reste pending et sera repris par _reclaim()
+
+
+def _reclaim(r) -> None:
+    """Reprend les messages pending trop longtemps (worker mort, échec précédent)."""
+    try:
+        res = r.xautoclaim(STREAM, GROUP, CONSUMER, min_idle_time=IDLE_RECLAIM_MS,
+                           start_id="0-0", count=10)
+        # redis-py renvoie [next_cursor, messages] ou [next_cursor, messages, deleted]
+        messages = res[1] if len(res) >= 2 else []
+        for msg_id, fields in messages:
+            if fields:
+                _handle(r, msg_id, fields)
+    except Exception as e:
+        logger.debug("reclaim ignoré : %s", e)
+
+
 def main():
-    logger.info("SynaptiQ Memory Worker démarré...")
+    logger.info("SynaptiQ Memory Worker démarré (consumer=%s)...", CONSUMER)
     r = None
     while r is None:
         try:
@@ -342,31 +371,27 @@ def main():
         except Exception as e:
             logger.warning(f"En attente de Redis... ({e})")
             time.sleep(2)
-            
-    # Boucle de consommation d'événements
+
+    ensure_group(r)
+
+    # Boucle de consommation via consumer group (XREADGROUP bloquant, ACK explicite)
     while True:
         try:
-            # Récupération non bloquante de la liste avec un court sleep s'il n'y a rien (évite les Socket Timeouts de Redis sous Windows)
-            raw_payload = r.lpop("synaptiq:event_queue")
-            if not raw_payload:
-                time.sleep(1)
+            resp = r.xreadgroup(GROUP, CONSUMER, {STREAM: ">"}, count=10, block=5000)
+            if not resp:
+                # Aucun nouveau message : on tente de reprendre les pending bloqués
+                _reclaim(r)
                 continue
-            
-            event = json.loads(raw_payload)
-            success = process_event(event)
-            
-            if not success:
-                logger.warning(f"Échec du traitement de l'événement {event.get('id')}. Réintroduction dans la queue.")
-                # Optionnel : réintroduire dans la queue pour re-tentative en v0
-                r.rpush("synaptiq:event_queue", raw_payload)
-                time.sleep(1)
-                
+            for _stream, messages in resp:
+                for msg_id, fields in messages:
+                    _handle(r, msg_id, fields)
         except KeyboardInterrupt:
             logger.info("Arrêt du worker par l'utilisateur.")
             break
         except Exception as e:
             logger.error(f"Erreur dans la boucle principale du worker : {e}")
             time.sleep(2)
+
 
 if __name__ == "__main__":
     main()

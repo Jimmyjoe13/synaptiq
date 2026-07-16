@@ -1,4 +1,6 @@
-version: '3.8'
+# SynaptiQ — stack complète (Postgres + Redis + API + Worker + MCP)
+# Prérequis : LM Studio lancé sur l'hôte (serveur local, modèle d'embedding chargé, port 1234).
+# Démarrage : cp .env.example .env && docker compose up
 
 services:
   postgres:
@@ -13,6 +15,11 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synaptiq -d synaptiq_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     networks:
       - synaptiq-network
 
@@ -24,6 +31,79 @@ services:
     volumes:
       - redis_data:/data
     command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - synaptiq-network
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: synaptiq-api
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      # Surcharge des URLs pour le réseau interne Docker
+      DATABASE_URL: postgresql://synaptiq:synaptiq_password@postgres:5432/synaptiq_db
+      REDIS_URL: redis://redis:6379/0
+      # LM Studio tourne sur l'hôte, joignable via host.docker.internal
+      EMBEDDING_BASE_URL: http://host.docker.internal:1234/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health | grep -q '\"status\":\"ok\"' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - synaptiq-network
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    container_name: synaptiq-worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://synaptiq:synaptiq_password@postgres:5432/synaptiq_db
+      REDIS_URL: redis://redis:6379/0
+      EMBEDDING_BASE_URL: http://host.docker.internal:1234/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - synaptiq-network
+
+  mcp:
+    build:
+      context: .
+      dockerfile: apps/mcp/Dockerfile
+    container_name: synaptiq-mcp
+    ports:
+      - "8765:8765"
+    environment:
+      SYNAPTIQ_API_URL: http://api:8000
+      MCP_TRANSPORT: sse
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8765
+    depends_on:
+      api:
+        condition: service_healthy
     networks:
       - synaptiq-network
 

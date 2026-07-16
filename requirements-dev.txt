@@ -1,0 +1,10 @@
+# Dépendances de développement — inclut le runtime complet
+-r requirements.txt
+
+# Serveur MCP (pour le tester en local)
+fastmcp==2.3.4
+
+# Tests & qualité
+pytest==8.3.4
+httpx==0.28.1
+ruff==0.8.4

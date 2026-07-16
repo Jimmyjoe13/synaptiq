@@ -1,0 +1,19 @@
+# SynaptiQ — dépendances runtime (API + worker + core + SDK)
+# NB : le serveur MCP a ses propres deps (fastmcp) dans apps/mcp/requirements.txt
+# Pour l'environnement de dev complet (tests, lint, mcp) : requirements-dev.txt
+
+# --- API FastAPI ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+
+# --- Stockage ---
+psycopg2-binary==2.9.10
+redis==5.2.1
+
+# --- HTTP / config (worker, embeddings LM Studio, SDK) ---
+requests==2.32.3
+python-dotenv==1.0.1
+
+# --- Sécurité (Phase 3 : rate limiting) ---
+slowapi==0.1.9

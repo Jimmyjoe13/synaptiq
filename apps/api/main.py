@@ -1,59 +1,183 @@
 import sys
 import os
 
-# Ajouter la racine du projet au sys.path pour résoudre les imports absolus du monorepo
+# Ajouter la racine du projet + packages/core au sys.path (imports monorepo, dev local)
 root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if root_path not in sys.path:
-    sys.path.insert(0, root_path)
+for _p in (root_path, os.path.join(root_path, "packages", "core")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import json
 import logging
+import hashlib
+from contextlib import contextmanager, asynccontextmanager
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel, Field
-import psycopg2
+from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor
 import redis
 from dotenv import load_dotenv
+
+# Logique partagée (embeddings pluggables + gouvernance), plus d'import depuis le worker
+from synaptiq_core import get_embedder, to_pgvector, handle_contradictions
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("synaptiq-api")
 
-# Chargement des variables d'environnement
-load_dotenv()
+# Chargement des variables d'environnement depuis le .env RACINE (source unique).
+# NB : load_dotenv() sans argument remonterait depuis apps/api/ et chargerait un
+# apps/api/.env résiduel — on force donc le .env de la racine du monorepo.
+load_dotenv(os.path.join(root_path, ".env"))
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6399/0")
 
-app = FastAPI(title="SynaptiQ API", version="0.1.0")
+# File d'événements (Redis Streams) + idempotence
+EVENT_STREAM = os.getenv("EVENT_STREAM", "synaptiq:events")
+IDEMPOTENCY_TTL = int(os.getenv("IDEMPOTENCY_TTL", "86400"))  # 24 h
 
-# Connexions aux services
-db_conn = None
+# ─── Pools de connexions (thread-safe, initialisés au lifespan) ───
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
+
+db_pool: Optional[pg_pool.ThreadedConnectionPool] = None
 redis_client = None
 
-def get_db_connection():
-    global db_conn
-    if db_conn is None or db_conn.closed != 0:
-        try:
-            db_conn = psycopg2.connect(DATABASE_URL)
-            logger.info("Connexion établie avec PostgreSQL.")
-        except Exception as e:
-            logger.error(f"Erreur de connexion PostgreSQL: {e}")
-            raise HTTPException(status_code=500, detail="Database connection failed")
-    return db_conn
+
+@contextmanager
+def get_conn():
+    """Emprunte une connexion au pool et la restitue systématiquement.
+
+    Remplace l'ancienne connexion globale unique (non thread-safe) : chaque
+    requête obtient sa propre connexion, évitant les conditions de course sous
+    charge (FastAPI sert les routes sync dans un threadpool).
+    """
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
+    conn = db_pool.getconn()
+    try:
+        yield conn
+    finally:
+        db_pool.putconn(conn)
+
 
 def get_redis_client():
-    global redis_client
     if redis_client is None:
-        try:
-            redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-            logger.info("Connexion établie avec Redis.")
-        except Exception as e:
-            logger.error(f"Erreur de connexion Redis: {e}")
-            raise HTTPException(status_code=500, detail="Redis connection failed")
+        raise HTTPException(status_code=503, detail="Redis non initialisé")
     return redis_client
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Cycle de vie applicatif (remplace @app.on_event('startup') déprécié)."""
+    global db_pool, redis_client
+    try:
+        db_pool = pg_pool.ThreadedConnectionPool(DB_POOL_MIN, DB_POOL_MAX, dsn=DATABASE_URL)
+        logger.info("Pool PostgreSQL initialisé (%d–%d connexions).", DB_POOL_MIN, DB_POOL_MAX)
+    except Exception as e:
+        logger.error("Échec d'initialisation du pool PostgreSQL : %s", e)
+        db_pool = None
+    try:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client.ping()
+        logger.info("Client Redis initialisé.")
+    except Exception as e:
+        logger.error("Échec d'initialisation de Redis : %s", e)
+        redis_client = None
+    yield
+    if db_pool is not None:
+        db_pool.closeall()
+    if redis_client is not None:
+        redis_client.close()
+
+
+app = FastAPI(title="SynaptiQ API", version="0.1.0", lifespan=lifespan)
+
+# ─── Sécurité : CORS + rate limiting ───
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
+
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS or ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+limiter = Limiter(key_func=get_remote_address, default_limits=[os.getenv("RATE_LIMIT", "120/minute")])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+# ─── Authentification par clé API + scoping tenant ───
+AUTH_REQUIRED = os.getenv("SYNAPTIQ_AUTH_REQUIRED", "false").lower() in ("1", "true", "yes")
+
+
+class AuthContext:
+    def __init__(self, tenant_id: str):
+        self.tenant_id = tenant_id
+
+
+def _hash_key(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def get_auth(authorization: Optional[str] = Header(default=None)) -> Optional[AuthContext]:
+    """Résout la clé API (header Bearer) vers un tenant.
+
+    - Aucune clé + auth désactivée  -> None (mode dev, pas d'isolation).
+    - Aucune clé + auth requise      -> 401.
+    - Clé fournie                    -> validée en base, sinon 401.
+    """
+    if not authorization:
+        if AUTH_REQUIRED:
+            raise HTTPException(status_code=401, detail="Clé API requise (Authorization: Bearer <clé>)")
+        return None
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Format attendu : Authorization: Bearer <clé>")
+    raw = authorization.split(" ", 1)[1].strip()
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT tenant_id FROM api_keys WHERE key_hash = %s AND active = true",
+                (_hash_key(raw),),
+            )
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    "UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE key_hash = %s",
+                    (_hash_key(raw),),
+                )
+                conn.commit()
+    finally:
+        db_pool.putconn(conn)
+    if not row:
+        raise HTTPException(status_code=401, detail="Clé API invalide ou révoquée")
+    return AuthContext(tenant_id=row[0])
+
+
+def resolve_tenant(auth: Optional[AuthContext], body_tenant: str) -> str:
+    """Impose le tenant de la clé (isolation stricte).
+
+    Empêche un appelant de lire/écrire un autre tenant même en trafiquant le body.
+    En mode dev (auth désactivée, auth=None), le tenant du body est utilisé tel quel.
+    """
+    if auth is None:
+        return body_tenant
+    if body_tenant and body_tenant != auth.tenant_id:
+        raise HTTPException(status_code=403, detail="tenant_id ne correspond pas à la clé API")
+    return auth.tenant_id
 
 def parse_embedding(val) -> list:
     if isinstance(val, list):
@@ -72,6 +196,9 @@ class EventInput(BaseModel):
     session_id: str = Field(..., example="sess_abc")
     content: str = Field(..., example="L'utilisateur demande à rédiger un email pro.")
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    # Clé de déduplication optionnelle : deux appels avec la même clé (même tenant)
+    # ne créent qu'un seul événement.
+    idempotency_key: Optional[str] = Field(default=None, example="evt-2026-07-15-001")
 
 class ContextConstraints(BaseModel):
     max_tokens: int = Field(default=1200)
@@ -85,27 +212,18 @@ class ContextRequest(BaseModel):
     query: str = Field(..., example="Style d'écriture concis de Jimmy")
     constraints: ContextConstraints = Field(default_factory=ContextConstraints)
 
-@app.on_event("startup")
-def startup_event():
-    # S'assurer que les connexions sont prêtes au démarrage
-    try:
-        get_db_connection()
-        get_redis_client()
-    except Exception as e:
-        logger.warning(f"Impossible d'établir toutes les connexions au démarrage : {e}")
-
 @app.get("/health")
 def health_check():
     db_status = "healthy"
     redis_status = "healthy"
-    
+
     try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
     except Exception:
         db_status = "unhealthy"
-        
+
     try:
         r = get_redis_client()
         r.ping()
@@ -121,60 +239,72 @@ def health_check():
     }
 
 @app.post("/events", status_code=201)
-def capture_event(event: EventInput):
+def capture_event(event: EventInput, auth: Optional[AuthContext] = Depends(get_auth)):
     """
-    Enregistre un événement brut de l'agent et le publie dans Redis pour traitement asynchrone.
+    Enregistre un événement brut et le publie dans le stream Redis (traitement asynchrone).
+    Idempotent si `idempotency_key` est fourni.
     """
-    conn = get_db_connection()
+    tenant = resolve_tenant(auth, event.tenant_id)
+    r = get_redis_client()
+
+    # Garde d'idempotence : SET NX pose un verrou ; si la clé existe, c'est un doublon.
+    idem_k = None
+    if event.idempotency_key:
+        idem_k = f"synaptiq:idem:{tenant}:{event.idempotency_key}"
+        if not r.set(idem_k, "pending", nx=True, ex=IDEMPOTENCY_TTL):
+            existing = r.get(idem_k)
+            logger.info("Événement idempotent ignoré (clé=%s).", event.idempotency_key)
+            return {"status": "duplicate", "event_id": existing}
+
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Insertion dans PostgreSQL
-            query = """
-                INSERT INTO events (tenant_id, agent_id, session_id, content, metadata)
-                VALUES (%s, %s, %s, %s, %s)
-                RETURNING id, created_at;
-            """
-            cur.execute(query, (
-                event.tenant_id,
-                event.agent_id,
-                event.session_id,
-                event.content,
-                json.dumps(event.metadata)
-            ))
-            result = cur.fetchone()
-            conn.commit()
-            
-            event_id = str(result['id'])
-            created_at = result['created_at'].isoformat()
-            
-            # Publication dans la queue Redis pour le worker
-            r = get_redis_client()
-            event_payload = {
-                "id": event_id,
-                "tenant_id": event.tenant_id,
-                "agent_id": event.agent_id,
-                "session_id": event.session_id,
-                "content": event.content,
-                "metadata": json.dumps(event.metadata),
-                "created_at": created_at
-            }
-            # Utilisation d'une liste Redis simple comme FIFO Queue pour la v0
-            r.rpush("synaptiq:event_queue", json.dumps(event_payload))
-            
-            logger.info(f"Événement {event_id} capturé et empilé dans Redis.")
-            return {
-                "status": "captured",
-                "event_id": event_id,
-                "created_at": created_at
-            }
-            
+        with get_conn() as conn:
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO events (tenant_id, agent_id, session_id, content, metadata)
+                        VALUES (%s, %s, %s, %s, %s)
+                        RETURNING id, created_at;
+                        """,
+                        (tenant, event.agent_id, event.session_id,
+                         event.content, json.dumps(event.metadata)),
+                    )
+                    result = cur.fetchone()
+                    conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        event_id = str(result['id'])
+        created_at = result['created_at'].isoformat()
+
+        # Publication dans le stream Redis (consommé par le worker via consumer group)
+        payload = {
+            "id": event_id,
+            "tenant_id": tenant,
+            "agent_id": event.agent_id,
+            "session_id": event.session_id,
+            "content": event.content,
+            "metadata": json.dumps(event.metadata),
+            "created_at": created_at,
+        }
+        r.xadd(EVENT_STREAM, {"data": json.dumps(payload)})
+
+        if idem_k:
+            r.set(idem_k, event_id, ex=IDEMPOTENCY_TTL)
+
+        logger.info(f"Événement {event_id} capturé et publié dans le stream.")
+        return {"status": "captured", "event_id": event_id, "created_at": created_at}
+
     except Exception as e:
-        conn.rollback()
+        # Libérer le verrou d'idempotence pour permettre un nouvel essai
+        if idem_k:
+            r.delete(idem_k)
         logger.error(f"Erreur lors de la capture de l'événement : {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/context/build")
-def build_context(request: ContextRequest):
+def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends(get_auth)):
     """
     Assemble un paquet de contexte compact pour le LLM en fonction de la tâche.
     Implémente le module Q-EM (Quantum Entanglement Memory) :
@@ -183,14 +313,15 @@ def build_context(request: ContextRequest):
     3. Interférence : Filtrage destructif des contradictions et redondances.
     4. Mesure : Collapse par densité de tokens pour maximiser l'utilité sous budget de tokens.
     """
-    from apps.worker.worker import generate_mock_embedding
-    
-    conn = get_db_connection()
+    tenant = resolve_tenant(auth, request.tenant_id)
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
+    conn = db_pool.getconn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # 1. Génération de l'embedding de la requête
-            query_vector = generate_mock_embedding(request.query)
-            vector_str = "[" + ",".join(map(str, query_vector)) + "]"
+            # 1. Génération de l'embedding de la requête (fournisseur réel)
+            query_vector = get_embedder().embed_one(request.query)
+            vector_str = to_pgvector(query_vector)
             
             # 2. Superposition (Recherche sémantique des candidats)
             # Tri par similarité cosinus décroissante ( pgvector <=> distance cosinus )
@@ -208,7 +339,7 @@ def build_context(request: ContextRequest):
             
             cur.execute(query, (
                 vector_str,
-                request.tenant_id,
+                tenant,
                 request.agent_id,
                 request.constraints.memory_types
             ))
@@ -428,9 +559,14 @@ def build_context(request: ContextRequest):
                 "trace_id": f"trace_{int(datetime.utcnow().timestamp())}"
             }
             
+    except HTTPException:
+        raise
     except Exception as e:
+        conn.rollback()
         logger.error(f"Erreur lors de la construction du contexte : {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db_pool.putconn(conn)
 
 class MemoryInput(BaseModel):
     tenant_id: str = Field(..., example="org_01")
@@ -442,14 +578,16 @@ class MemoryInput(BaseModel):
     importance: float = Field(default=0.5)
 
 @app.post("/memories", status_code=201)
-def create_memory(memory: MemoryInput):
+def create_memory(memory: MemoryInput, auth: Optional[AuthContext] = Depends(get_auth)):
     """
     Permet à un agent IA d'enregistrer directement un souvenir consolidé.
     """
-    from apps.worker.worker import generate_mock_embedding, handle_contradictions
-    conn = get_db_connection()
+    tenant = resolve_tenant(auth, memory.tenant_id)
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
+    conn = db_pool.getconn()
     try:
-        embedding = generate_mock_embedding(memory.content)
+        embedding = get_embedder().embed_one(memory.content)
         with conn.cursor() as cur:
             # Gestion des contradictions
             new_mem_dict = {
@@ -457,7 +595,7 @@ def create_memory(memory: MemoryInput):
                 "subtype": memory.subtype,
                 "content": memory.content
             }
-            handle_contradictions(cur, memory.tenant_id, memory.agent_id, new_mem_dict)
+            handle_contradictions(cur, tenant, memory.agent_id, new_mem_dict, embedding)
             
             # Insertion
             query = """
@@ -466,7 +604,7 @@ def create_memory(memory: MemoryInput):
                 RETURNING id;
             """
             cur.execute(query, (
-                memory.tenant_id,
+                tenant,
                 memory.agent_id,
                 memory.type,
                 memory.subtype,
@@ -483,10 +621,14 @@ def create_memory(memory: MemoryInput):
                 "status": "created",
                 "memory_id": str(new_id)
             }
+    except HTTPException:
+        raise
     except Exception as e:
         conn.rollback()
         logger.error(f"Erreur lors de la création de la mémoire : {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db_pool.putconn(conn)
 
 class RetrieveRequest(BaseModel):
     tenant_id: str
@@ -496,40 +638,94 @@ class RetrieveRequest(BaseModel):
     memory_type: Optional[str] = None
 
 @app.post("/retrieve")
-def retrieve_memories(request: RetrieveRequest):
+def retrieve_memories(request: RetrieveRequest, auth: Optional[AuthContext] = Depends(get_auth)):
     """
-    Permet à un agent IA de rechercher sémantiquement dans ses souvenirs.
+    Recherche SÉMANTIQUE vectorielle (pgvector) : embed la requête puis trie les
+    souvenirs actifs par similarité cosinus décroissante (opérateur <=>).
+    Le paramètre `query` pilote désormais réellement le classement.
     """
-    conn = get_db_connection()
+    tenant = resolve_tenant(auth, request.tenant_id)
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
+    conn = db_pool.getconn()
     try:
+        query_vector = get_embedder().embed_one(request.query)
+        vector_str = to_pgvector(query_vector)
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            params: list = [vector_str, tenant, request.agent_id]
+            type_filter = ""
             if request.memory_type:
-                query = """
-                    SELECT id, type, subtype, content, confidence, importance, last_accessed_at
-                    FROM memories
-                    WHERE tenant_id = %s
-                      AND agent_id = %s
-                      AND type = %s
-                      AND status = 'active'
-                    ORDER BY created_at DESC
-                    LIMIT %s;
-                """
-                cur.execute(query, (request.tenant_id, request.agent_id, request.memory_type, request.limit))
-            else:
-                query = """
-                    SELECT id, type, subtype, content, confidence, importance, last_accessed_at
-                    FROM memories
-                    WHERE tenant_id = %s
-                      AND agent_id = %s
-                      AND status = 'active'
-                    ORDER BY created_at DESC
-                    LIMIT %s;
-                """
-                cur.execute(query, (request.tenant_id, request.agent_id, request.limit))
-                
+                type_filter = "AND type = %s"
+                params.append(request.memory_type)
+            params.append(request.limit)
+
+            query = f"""
+                SELECT id, type, subtype, content, confidence, importance, last_accessed_at,
+                       (1 - (embedding <=> %s::vector)) AS similarity
+                FROM memories
+                WHERE tenant_id = %s
+                  AND agent_id = %s
+                  {type_filter}
+                  AND status = 'active'
+                ORDER BY similarity DESC
+                LIMIT %s;
+            """
+            cur.execute(query, tuple(params))
             results = cur.fetchall()
             return {"memories": results}
+    except HTTPException:
+        raise
     except Exception as e:
+        conn.rollback()
         logger.error(f"Erreur de recherche de souvenirs : {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db_pool.putconn(conn)
+
+
+@app.delete("/memories")
+def purge_memories(
+    tenant_id: str,
+    agent_id: Optional[str] = None,
+    auth: Optional[AuthContext] = Depends(get_auth),
+):
+    """
+    Purge RGPD : supprime les mémoires (et événements) d'un tenant.
+    Scopé au tenant de la clé API ; les relationships sont supprimées en cascade (FK).
+    Filtre optionnel par `agent_id`.
+    """
+    tenant = resolve_tenant(auth, tenant_id)
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            if agent_id:
+                cur.execute("DELETE FROM memories WHERE tenant_id = %s AND agent_id = %s", (tenant, agent_id))
+                deleted_mem = cur.rowcount
+                cur.execute("DELETE FROM events WHERE tenant_id = %s AND agent_id = %s", (tenant, agent_id))
+                deleted_evt = cur.rowcount
+            else:
+                cur.execute("DELETE FROM memories WHERE tenant_id = %s", (tenant,))
+                deleted_mem = cur.rowcount
+                cur.execute("DELETE FROM events WHERE tenant_id = %s", (tenant,))
+                deleted_evt = cur.rowcount
+            conn.commit()
+        logger.info("Purge RGPD tenant=%s agent=%s : %d mémoires, %d événements.",
+                    tenant, agent_id, deleted_mem, deleted_evt)
+        return {
+            "status": "purged",
+            "tenant_id": tenant,
+            "agent_id": agent_id,
+            "deleted_memories": deleted_mem,
+            "deleted_events": deleted_evt,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Erreur lors de la purge RGPD : {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db_pool.putconn(conn)
 

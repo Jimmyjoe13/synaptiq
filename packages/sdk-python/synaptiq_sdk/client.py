@@ -7,15 +7,17 @@ class SynaptiqClient:
     dans n'importe quel pipeline d'agent IA.
     """
     
-    def __init__(self, base_url: str = "http://127.0.0.1:8000"):
+    def __init__(self, base_url: str = "http://127.0.0.1:8000", api_key: Optional[str] = None):
         self.base_url = base_url.rstrip('/')
+        # En-tête d'auth propagé à chaque appel (Phase 3, multi-tenant)
+        self.headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         
     def health(self) -> Dict[str, Any]:
         """
         Vérifie l'état des services de SynaptiQ.
         """
         try:
-            response = requests.get(f"{self.base_url}/health", timeout=5)
+            response = requests.get(f"{self.base_url}/health", headers=self.headers, timeout=5)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -35,7 +37,7 @@ class SynaptiqClient:
             "metadata": metadata or {}
         }
         try:
-            response = requests.post(url, json=payload, timeout=5)
+            response = requests.post(url, json=payload, headers=self.headers, timeout=5)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -58,7 +60,7 @@ class SynaptiqClient:
             }
         }
         try:
-            response = requests.post(url, json=payload, timeout=5)
+            response = requests.post(url, json=payload, headers=self.headers, timeout=5)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -80,7 +82,7 @@ class SynaptiqClient:
             "importance": importance
         }
         try:
-            response = requests.post(url, json=payload, timeout=5)
+            response = requests.post(url, json=payload, headers=self.headers, timeout=5)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -99,7 +101,7 @@ class SynaptiqClient:
             "memory_type": memory_type
         }
         try:
-            response = requests.post(url, json=payload, timeout=5)
+            response = requests.post(url, json=payload, headers=self.headers, timeout=5)
             response.raise_for_status()
             return response.json()
         except Exception as e:
