@@ -37,12 +37,10 @@ def main():
     print("Services PostgreSQL (pgvector) & Redis : OK.")
     print_separator()
     
-    tenant_id = "demo_org"
     agent_id = "interactive_assistant"
     session_id = "session_interactive_1"
-    
-    print(f"Initialisation de la session :")
-    print(f"  - Tenant : {tenant_id}")
+
+    print("Initialisation de la session :")
     print(f"  - Agent  : {agent_id}")
     print(f"  - Session: {session_id}")
     print_separator()
@@ -67,7 +65,7 @@ def main():
                 
             # --- Étape 2 : Enregistrement de l'événement ---
             print("\n⚙️  Envoi de l'événement à SynaptiQ (asynchrone)...")
-            client.capture(tenant_id, agent_id, session_id, user_input)
+            client.capture(agent_id, session_id, user_input)
             
             # Laisser un très court instant pour que le worker traite l'événement en arrière-plan
             # (En conditions réelles, le temps de réponse de l'utilisateur ou du LLM suffit largement)
@@ -77,7 +75,6 @@ def main():
             # --- Étape 3 : Récupération du contexte mémoire ---
             print("⚙️  Appel à /context/build pour récupérer le contexte mémoire...")
             context_data = client.build_context(
-                tenant_id=tenant_id,
                 agent_id=agent_id,
                 session_id=session_id,
                 task="Répondre au message de l'utilisateur",

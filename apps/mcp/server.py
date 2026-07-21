@@ -21,20 +21,18 @@ HEADERS = {"Authorization": f"Bearer {SYNAPTIQ_API_KEY}"} if SYNAPTIQ_API_KEY el
 mcp = FastMCP("SynaptiQ Memory Engine")
 
 @mcp.tool()
-def store_memory(content: str, memory_type: str, subtype: Optional[str] = None, tenant_id: str = "default_tenant", agent_id: str = "qwen_code_agent") -> str:
+def store_memory(content: str, memory_type: str, subtype: Optional[str] = None, agent_id: str = "qwen_code_agent") -> str:
     """
     Enregistre de maniere autonome un fait, une preference, une regle ou un episode dans la memoire SynaptiQ.
-    
+
     Args:
         content: Le souvenir ou fait a retenir (ex: 'L'utilisateur prefere les rapports courts').
         memory_type: Le type de memoire ('semantic' pour les faits/preferences, 'procedural' pour les regles/playbooks, 'episodic' pour les actions/resultats).
         subtype: Precision optionnelle (ex: 'preference', 'rule', 'error_resolution').
-        tenant_id: Identifiant du locataire (default: 'default_tenant').
         agent_id: Identifiant de l'agent qui ecrit (default: 'qwen_code_agent').
     """
     url = f"{SYNAPTIQ_API_URL}/memories"
     payload = {
-        "tenant_id": tenant_id,
         "agent_id": agent_id,
         "type": memory_type,
         "subtype": subtype,
@@ -51,20 +49,18 @@ def store_memory(content: str, memory_type: str, subtype: Optional[str] = None, 
         return f"[ERROR] Echec de l'enregistrement de la memoire : {e}"
 
 @mcp.tool()
-def recall_memories(query: str, limit: int = 5, memory_type: Optional[str] = None, tenant_id: str = "default_tenant", agent_id: str = "qwen_code_agent") -> str:
+def recall_memories(query: str, limit: int = 5, memory_type: Optional[str] = None, agent_id: str = "qwen_code_agent") -> str:
     """
     Recherche sementiquement des souvenirs ou regles dans la memoire SynaptiQ pour adapter les reponses ou actions de l'agent.
-    
+
     Args:
         query: Le sujet ou mot-cle a rechercher (ex: 'preferences style ecriture').
         limit: Nombre maximum de souvenirs a ramener (default: 5).
         memory_type: Filtrer par type de memoire ('semantic', 'procedural', 'episodic').
-        tenant_id: Identifiant du locataire.
         agent_id: Identifiant de l'agent.
     """
     url = f"{SYNAPTIQ_API_URL}/retrieve"
     payload = {
-        "tenant_id": tenant_id,
         "agent_id": agent_id,
         "query": query,
         "limit": limit,
@@ -88,7 +84,7 @@ def recall_memories(query: str, limit: int = 5, memory_type: Optional[str] = Non
 
 @mcp.tool()
 def build_context(task: str, query: str, max_tokens: int = 1200,
-                  tenant_id: str = "default_tenant", agent_id: str = "qwen_code_agent") -> str:
+                  agent_id: str = "qwen_code_agent") -> str:
     """
     Assemble un paquet de contexte compact (Q-EM) pret a injecter dans le prompt systeme
     de l'agent : faits, preferences, episodes, regles, bonnes pratiques, erreurs.
@@ -97,12 +93,10 @@ def build_context(task: str, query: str, max_tokens: int = 1200,
         task: La tache en cours (ex: 'Rediger un email de suivi B2B').
         query: La requete de rappel semantique (ex: 'style d'ecriture, preferences client').
         max_tokens: Budget de tokens du contexte (default: 1200).
-        tenant_id: Identifiant du locataire.
         agent_id: Identifiant de l'agent.
     """
     url = f"{SYNAPTIQ_API_URL}/context/build"
     payload = {
-        "tenant_id": tenant_id,
         "agent_id": agent_id,
         "session_id": "mcp-session",
         "task": task,

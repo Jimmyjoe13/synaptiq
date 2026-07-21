@@ -20,6 +20,9 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
     
     @classmethod
     def setUpClass(cls):
+        # Le tenant est désormais résolu côté serveur (plus dans le body) : on aligne
+        # le tenant d'instance sur celui utilisé par les insertions directes du test.
+        os.environ["SYNAPTIQ_TENANT"] = "tenant_quantum"
         try:
             cls.db_conn = psycopg2.connect(DATABASE_URL)
             cls.redis_client = redis.from_url(REDIS_URL, decode_responses=True)

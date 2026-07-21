@@ -22,7 +22,12 @@ DATABASE_URL = os.getenv(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Créer une clé API SynaptiQ.")
-    parser.add_argument("--tenant", required=True, help="Identifiant du tenant (ex: org_01)")
+    parser.add_argument(
+        "--tenant",
+        default=os.getenv("SYNAPTIQ_TENANT", "default"),
+        help="Identifiant du tenant (défaut : SYNAPTIQ_TENANT du .env, sinon 'default'). "
+             "En instance auto-hébergée, laisser la valeur par défaut.",
+    )
     parser.add_argument("--name", default=None, help="Libellé lisible de la clé")
     args = parser.parse_args()
 

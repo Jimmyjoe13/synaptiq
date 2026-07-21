@@ -103,11 +103,19 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
 
-CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
+# CORS : par défaut AUCUNE origine navigateur autorisée (SynaptiQ est appelée
+# serveur-à-serveur par le SDK/MCP, non soumis au CORS). Pour un front web,
+# lister explicitement les origines dans CORS_ORIGINS.
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+_cors_wildcard = CORS_ORIGINS == ["*"]
+if _cors_wildcard:
+    logger.warning("CORS_ORIGINS=* : credentials désactivés (combinaison non conforme). "
+                   "Lister des origines explicites pour un front navigateur avec cookies.")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS or ["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    # '*' est incompatible avec allow_credentials=True : on désactive alors les credentials.
+    allow_credentials=not _cors_wildcard,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -119,6 +127,15 @@ app.add_middleware(SlowAPIMiddleware)
 
 # ─── Authentification par clé API + scoping tenant ───
 AUTH_REQUIRED = os.getenv("SYNAPTIQ_AUTH_REQUIRED", "false").lower() in ("1", "true", "yes")
+
+
+def _instance_tenant() -> str:
+    """Tenant de l'instance auto-hébergée (un déploiement = un tenant).
+
+    Lu dynamiquement (pas figé à l'import) pour rester testable et reconfigurable.
+    N'est jamais fourni par l'appelant : le périmètre est décidé par le serveur.
+    """
+    return os.getenv("SYNAPTIQ_TENANT", "default")
 
 
 class AuthContext:
@@ -167,17 +184,16 @@ def get_auth(authorization: Optional[str] = Header(default=None)) -> Optional[Au
     return AuthContext(tenant_id=row[0])
 
 
-def resolve_tenant(auth: Optional[AuthContext], body_tenant: str) -> str:
-    """Impose le tenant de la clé (isolation stricte).
+def resolve_tenant(auth: Optional[AuthContext]) -> str:
+    """Résout le tenant effectif de la requête.
 
-    Empêche un appelant de lire/écrire un autre tenant même en trafiquant le body.
-    En mode dev (auth désactivée, auth=None), le tenant du body est utilisé tel quel.
+    - Clé API valide -> tenant porté par la clé.
+    - Sans auth (instance auto-hébergée) -> tenant d'instance (SYNAPTIQ_TENANT).
+
+    Le tenant n'est plus jamais transmis par l'appelant : impossible de lire ou
+    d'écrire dans un autre périmètre en trafiquant le body.
     """
-    if auth is None:
-        return body_tenant
-    if body_tenant and body_tenant != auth.tenant_id:
-        raise HTTPException(status_code=403, detail="tenant_id ne correspond pas à la clé API")
-    return auth.tenant_id
+    return auth.tenant_id if auth else _instance_tenant()
 
 def parse_embedding(val) -> list:
     if isinstance(val, list):
@@ -191,7 +207,6 @@ def parse_embedding(val) -> list:
 
 # Modèles Pydantic
 class EventInput(BaseModel):
-    tenant_id: str = Field(..., example="org_01")
     agent_id: str = Field(..., example="agent_sales_01")
     session_id: str = Field(..., example="sess_abc")
     content: str = Field(..., example="L'utilisateur demande à rédiger un email pro.")
@@ -205,7 +220,6 @@ class ContextConstraints(BaseModel):
     memory_types: List[str] = Field(default=["semantic", "episodic", "procedural", "working"])
 
 class ContextRequest(BaseModel):
-    tenant_id: str = Field(..., example="org_01")
     agent_id: str = Field(..., example="agent_sales_01")
     session_id: str = Field(..., example="sess_abc")
     task: str = Field(..., example="Rédiger un email de suivi")
@@ -244,7 +258,7 @@ def capture_event(event: EventInput, auth: Optional[AuthContext] = Depends(get_a
     Enregistre un événement brut et le publie dans le stream Redis (traitement asynchrone).
     Idempotent si `idempotency_key` est fourni.
     """
-    tenant = resolve_tenant(auth, event.tenant_id)
+    tenant = resolve_tenant(auth)
     r = get_redis_client()
 
     # Garde d'idempotence : SET NX pose un verrou ; si la clé existe, c'est un doublon.
@@ -301,7 +315,7 @@ def capture_event(event: EventInput, auth: Optional[AuthContext] = Depends(get_a
         if idem_k:
             r.delete(idem_k)
         logger.error(f"Erreur lors de la capture de l'événement : {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Erreur interne du serveur.")
 
 @app.post("/context/build")
 def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends(get_auth)):
@@ -313,7 +327,7 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
     3. Interférence : Filtrage destructif des contradictions et redondances.
     4. Mesure : Collapse par densité de tokens pour maximiser l'utilité sous budget de tokens.
     """
-    tenant = resolve_tenant(auth, request.tenant_id)
+    tenant = resolve_tenant(auth)
     if db_pool is None:
         raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
     conn = db_pool.getconn()
@@ -564,12 +578,11 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
     except Exception as e:
         conn.rollback()
         logger.error(f"Erreur lors de la construction du contexte : {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Erreur interne du serveur.")
     finally:
         db_pool.putconn(conn)
 
 class MemoryInput(BaseModel):
-    tenant_id: str = Field(..., example="org_01")
     agent_id: str = Field(..., example="agent_sales_01")
     type: str = Field(..., example="semantic")
     subtype: Optional[str] = Field(None, example="preference")
@@ -582,7 +595,7 @@ def create_memory(memory: MemoryInput, auth: Optional[AuthContext] = Depends(get
     """
     Permet à un agent IA d'enregistrer directement un souvenir consolidé.
     """
-    tenant = resolve_tenant(auth, memory.tenant_id)
+    tenant = resolve_tenant(auth)
     if db_pool is None:
         raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
     conn = db_pool.getconn()
@@ -626,12 +639,11 @@ def create_memory(memory: MemoryInput, auth: Optional[AuthContext] = Depends(get
     except Exception as e:
         conn.rollback()
         logger.error(f"Erreur lors de la création de la mémoire : {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Erreur interne du serveur.")
     finally:
         db_pool.putconn(conn)
 
 class RetrieveRequest(BaseModel):
-    tenant_id: str
     agent_id: str
     query: str
     limit: int = 5
@@ -644,7 +656,7 @@ def retrieve_memories(request: RetrieveRequest, auth: Optional[AuthContext] = De
     souvenirs actifs par similarité cosinus décroissante (opérateur <=>).
     Le paramètre `query` pilote désormais réellement le classement.
     """
-    tenant = resolve_tenant(auth, request.tenant_id)
+    tenant = resolve_tenant(auth)
     if db_pool is None:
         raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
     conn = db_pool.getconn()
@@ -678,23 +690,22 @@ def retrieve_memories(request: RetrieveRequest, auth: Optional[AuthContext] = De
     except Exception as e:
         conn.rollback()
         logger.error(f"Erreur de recherche de souvenirs : {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Erreur interne du serveur.")
     finally:
         db_pool.putconn(conn)
 
 
 @app.delete("/memories")
 def purge_memories(
-    tenant_id: str,
     agent_id: Optional[str] = None,
     auth: Optional[AuthContext] = Depends(get_auth),
 ):
     """
-    Purge RGPD : supprime les mémoires (et événements) d'un tenant.
-    Scopé au tenant de la clé API ; les relationships sont supprimées en cascade (FK).
+    Purge RGPD : supprime les mémoires (et événements) de l'instance.
+    Scopé au tenant résolu côté serveur ; les relationships sont supprimées en cascade (FK).
     Filtre optionnel par `agent_id`.
     """
-    tenant = resolve_tenant(auth, tenant_id)
+    tenant = resolve_tenant(auth)
     if db_pool is None:
         raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
     conn = db_pool.getconn()
@@ -725,7 +736,7 @@ def purge_memories(
     except Exception as e:
         conn.rollback()
         logger.error(f"Erreur lors de la purge RGPD : {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Erreur interne du serveur.")
     finally:
         db_pool.putconn(conn)
 

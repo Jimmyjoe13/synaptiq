@@ -27,9 +27,7 @@ def main():
         print("[-] API SynaptiQ non demarree sur le port 8000.")
         sys.exit(1)
         
-    tenant_id = "demo_org"
     agent_id = "autonomous_sales_agent"
-    session_id = "session_sales_99"
     
     print("\n--- SIMULATION D'UN CYCLE DE PENSEE DE L'AGENT ---")
     print("Jimmy dit a l'agent :")
@@ -47,7 +45,6 @@ def main():
     rule_content = "Regle de scraping : limiter le rythme des requetes a 1 appel par minute pour eviter le blocage."
     
     result = client.store_memory(
-        tenant_id=tenant_id,
         agent_id=agent_id,
         memory_type="procedural",
         subtype="rule",
@@ -78,7 +75,6 @@ def main():
     print("\n[ACTION DE L'AGENT IA] : Appel de l'outil 'retrieve(query=\"contraintes scraping\")'")
     
     search_results = client.retrieve(
-        tenant_id=tenant_id,
         agent_id=agent_id,
         query="contraintes scraping",
         limit=3,

@@ -101,13 +101,13 @@ client = SynaptiqClient("http://127.0.0.1:8000", api_key=None)
 
 # 1. Capturer une interaction (classée et consolidée en asynchrone par le worker)
 client.capture(
-    tenant_id="org_01", agent_id="george", session_id="sess_1",
+    agent_id="george", session_id="sess_1",
     content="L'utilisateur préfère des rapports courts en français.",
 )
 
 # 2. Réhydrater un contexte compact avant d'appeler le LLM
 ctx = client.build_context(
-    tenant_id="org_01", agent_id="george", session_id="sess_1",
+    agent_id="george", session_id="sess_1",
     task="Rédiger un rapport de suivi",
     query="préférences de style et de format",
 )
@@ -126,23 +126,28 @@ print(ctx["token_estimate"], packet["preferences"])
 | POST | `/memories` | Écriture directe d'un souvenir consolidé |
 | POST | `/retrieve` | Recherche sémantique vectorielle (pgvector) |
 | POST | `/context/build` | Assemblage du paquet de contexte Q-EM sous budget de tokens |
-| DELETE | `/memories?tenant_id=` | Purge RGPD scopée au tenant |
+| DELETE | `/memories` | Purge RGPD (filtre optionnel `?agent_id=`) scopée à l'instance |
 
 Le serveur MCP expose les mêmes capacités comme outils (`store_memory`, `recall_memories`, `build_context`) pour tout client MCP (Claude Desktop, Cursor…).
 
 ---
 
-## 🔑 Sécurité & Multi-tenant
+## 🔑 Sécurité & modèle d'isolation
 
-L'auth par clé API est optionnelle (`SYNAPTIQ_AUTH_REQUIRED=false` par défaut, mode dev). Pour l'activer :
+SynaptiQ est **auto-hébergé : un déploiement = un périmètre**. Le tenant est fixé côté serveur (`SYNAPTIQ_TENANT`, défaut `default`) et n'est **jamais** transmis par l'appelant — impossible de lire/écrire un autre périmètre en trafiquant le corps de la requête. La séparation entre agents d'une même instance se fait via `agent_id`.
+
+L'auth par clé API est optionnelle :
+
+- `SYNAPTIQ_AUTH_REQUIRED=false` (défaut) : instance de confiance (localhost / réseau interne).
+- **Si l'API est exposée sur Internet, passer à `true`** — sinon l'instance est ouverte en lecture/écriture. Puis :
 
 ```bash
-# Créer une clé pour un tenant (la clé en clair n'est affichée qu'une seule fois)
-python scripts/create_api_key.py --tenant org_01 --name "agent-prod"
-# Puis passer SYNAPTIQ_AUTH_REQUIRED=true et envoyer :  Authorization: Bearer <clé>
+# Créer une clé (la clé en clair n'est affichée qu'une seule fois)
+python scripts/create_api_key.py --name "agent-prod"
+# Puis envoyer :  Authorization: Bearer <clé>
 ```
 
-Chaque clé est scopée à un tenant : impossible de lire/écrire les données d'un autre tenant, même en trafiquant le corps de la requête.
+Les origines CORS d'un front navigateur se déclarent explicitement dans `CORS_ORIGINS` (vide par défaut ; le SDK/MCP server-à-serveur n'est pas concerné).
 
 ---
 

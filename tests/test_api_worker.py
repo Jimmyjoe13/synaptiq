@@ -20,6 +20,9 @@ class TestSynaptiqIntegration(unittest.TestCase):
     
     @classmethod
     def setUpClass(cls):
+        # Le tenant est désormais résolu côté serveur (plus dans le body) : on aligne
+        # le tenant d'instance sur celui utilisé par les insertions directes du test.
+        os.environ["SYNAPTIQ_TENANT"] = "test_tenant"
         # S'assurer que les connexions de test fonctionnent
         try:
             cls.db_conn = psycopg2.connect(DATABASE_URL)
