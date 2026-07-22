@@ -1,11 +1,11 @@
 import os
 import sys
 import json
-import time
 import unittest
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import redis
+from unittest.mock import patch
 
 # Ajouter les chemins au sys.path pour pouvoir importer les modules
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
@@ -15,6 +15,20 @@ from apps.worker.worker import process_event, generate_mock_embedding
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6399/0")
+
+
+class _ConstEmbedder:
+    """Embedder de test renvoyant un vecteur constant (similarité 1.0 déterministe)."""
+    dim = 384
+
+    def __init__(self, vec):
+        self._v = vec
+
+    def embed(self, texts):
+        return [self._v for _ in texts]
+
+    def embed_one(self, text):
+        return self._v
 
 class TestSynaptiqIntegration(unittest.TestCase):
     
@@ -47,6 +61,14 @@ class TestSynaptiqIntegration(unittest.TestCase):
         self.redis_client.delete("synaptiq:event_queue")
 
     def test_end_to_end_flow(self):
+        # Embedder déterministe (constant) pour le worker ET l'API : garantit
+        # l'archivage de la préférence contradictoire puis son rappel (similarité 1.0).
+        const_vec = generate_mock_embedding("const")
+        for target in ("apps.worker.worker.get_embedder", "apps.api.main.get_embedder"):
+            p = patch(target, return_value=_ConstEmbedder(const_vec))
+            p.start()
+            self.addCleanup(p.stop)
+
         tenant_id = "test_tenant"
         agent_id = "test_agent"
         session_id = "test_session"
@@ -159,7 +181,9 @@ class TestSynaptiqIntegration(unittest.TestCase):
         # --- Étape 5 : Récupération du contexte (Retrieval / Collapse) ---
         # Appel de l'API de build de contexte via la fonction de FastAPI main
         from fastapi.testclient import TestClient
-        client = TestClient(fastapi_app)
+        # TestClient en context manager pour déclencher le lifespan (init du pool PostgreSQL).
+        client_ctx = TestClient(fastapi_app)
+        client = client_ctx.__enter__()
         
         response = client.post("/context/build", json={
             "tenant_id": tenant_id,
@@ -182,6 +206,7 @@ class TestSynaptiqIntegration(unittest.TestCase):
         self.assertIn("détaillés et formels", context_packet['facts'][0])
         self.assertNotIn("courts et concis", context_packet['facts'][0])
         
+        client_ctx.__exit__(None, None, None)
         print("\n[SUCCESS] Test d'integration de bout en bout reussi avec succes !")
 
 if __name__ == '__main__':

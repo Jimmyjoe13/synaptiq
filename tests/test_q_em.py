@@ -1,6 +1,5 @@
 import os
 import sys
-import json
 import unittest
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -16,6 +15,22 @@ from apps.worker.worker import generate_mock_embedding
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6399/0")
 
+
+class _ConstEmbedder:
+    """Embedder de test renvoyant un vecteur constant : force une similarité de 1.0
+    entre toutes les mémoires (pilotage déterministe du moteur sémantique)."""
+    dim = 384
+
+    def __init__(self, vec):
+        self._v = vec
+
+    def embed(self, texts):
+        return [self._v for _ in texts]
+
+    def embed_one(self, text):
+        return self._v
+
+
 class TestQuantumEntanglementMemory(unittest.TestCase):
     
     @classmethod
@@ -26,13 +41,19 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
         try:
             cls.db_conn = psycopg2.connect(DATABASE_URL)
             cls.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-            cls.client = TestClient(fastapi_app)
+            # TestClient DOIT être utilisé comme context manager pour déclencher le
+            # lifespan FastAPI (init du pool PostgreSQL + client Redis), sinon db_pool
+            # reste None et l'API renvoie 503.
+            cls._client_ctx = TestClient(fastapi_app)
+            cls.client = cls._client_ctx.__enter__()
         except Exception as e:
             print(f"\n[ERROR] ERREUR DE CONNEXION DANS SETUPCLASS : {e}")
             raise e
 
     @classmethod
     def tearDownClass(cls):
+        if hasattr(cls, '_client_ctx'):
+            cls._client_ctx.__exit__(None, None, None)
         if hasattr(cls, 'db_conn') and cls.db_conn:
             cls.db_conn.close()
 
@@ -288,10 +309,12 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
         
         # On force les deux événements à renvoyer le même embedding (similarité = 1.0) pour déclencher l'intrication automatique
         dummy_embedding = generate_mock_embedding("dummy text")
-        with patch('apps.worker.worker.generate_mock_embedding', return_value=dummy_embedding):
+        # Le worker consolide via get_embedder().embed_one() : on le force à un
+        # embedder constant pour garantir une similarité de 1.0 (> seuil d'intrication).
+        with patch('apps.worker.worker.get_embedder', return_value=_ConstEmbedder(dummy_embedding)):
             success1 = process_event(event_error)
             self.assertTrue(success1)
-            
+
             success2 = process_event(event_best_practice)
             self.assertTrue(success2)
         
