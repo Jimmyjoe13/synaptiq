@@ -43,6 +43,15 @@ IDEMPOTENCY_TTL = int(os.getenv("IDEMPOTENCY_TTL", "86400"))  # 24 h
 DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
 DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
 
+# Seuils du moteur Q-EM (externalisés : ajustables sans redéploiement de code).
+# Amortissement de la propagation d'activation le long des liens 'entangled_with'.
+QEM_ENTANGLE_DAMPING = float(os.getenv("QEM_ENTANGLE_DAMPING", "0.5"))
+# Au-delà de ce cosinus entre deux candidats, le moins prioritaire est filtré (redondance).
+QEM_REDUNDANCY_THRESHOLD = float(os.getenv("QEM_REDUNDANCY_THRESHOLD", "0.75"))
+# Décroissance temporelle : demi-vie (en jours) du score de récence. Une mémoire non
+# ré-accédée voit sa pertinence divisée par 2 tous les N jours. 0 (ou négatif) = désactivé.
+QEM_RECENCY_HALFLIFE_DAYS = float(os.getenv("QEM_RECENCY_HALFLIFE_DAYS", "90"))
+
 db_pool: Optional[pg_pool.ThreadedConnectionPool] = None
 redis_client = None
 
@@ -341,7 +350,8 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
             # Tri par similarité cosinus décroissante ( pgvector <=> distance cosinus )
             query = """
                 SELECT id, type, subtype, content, confidence, importance, last_accessed_at, created_at, embedding::text,
-                       (1 - (embedding <=> %s::vector)) AS similarity
+                       (1 - (embedding <=> %s::vector)) AS similarity,
+                       EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_accessed_at)) AS age_seconds
                 FROM memories
                 WHERE tenant_id = %s
                   AND agent_id = %s
@@ -366,6 +376,12 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
                 mem_id = str(row['id'])
                 sim = float(row['similarity'] or 0.0)
                 sim_clipped = max(0.0, sim)
+                # Décroissance temporelle : atténue la pertinence des mémoires anciennes
+                # (demi-vie configurable). Réactivée à chaque accès (last_accessed_at).
+                recency_factor = 1.0
+                if QEM_RECENCY_HALFLIFE_DAYS > 0:
+                    age_days = float(row['age_seconds'] or 0.0) / 86400.0
+                    recency_factor = 0.5 ** (age_days / QEM_RECENCY_HALFLIFE_DAYS)
                 candidates[mem_id] = {
                     "id": mem_id,
                     "type": row['type'],
@@ -377,12 +393,16 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
                     "created_at": row['created_at'],
                     "embedding": parse_embedding(row['embedding']),
                     "similarity": sim_clipped,
-                    "score": sim_clipped
+                    "recency_factor": recency_factor,
+                    # Le score de départ pondère la similarité par la récence.
+                    "score": sim_clipped * recency_factor
                 }
 
             if not candidates:
+                # Schéma complet (7 clés) même à vide, pour un contrat stable côté consommateur.
                 return {
-                    "context_packet": {"facts": [], "episodes": [], "rules": [], "examples": []},
+                    "context_packet": {"facts": [], "preferences": [], "episodes": [],
+                                       "rules": [], "best_practices": [], "errors": [], "examples": []},
                     "token_estimate": 0,
                     "selected_memory_ids": [],
                     "trace_id": f"trace_{int(datetime.utcnow().timestamp())}"
@@ -438,11 +458,10 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
                     tgt = str(rel['target_memory_id'])
                     weight = float(rel['weight'] or 1.0)
                     
-                    # Propagation bidirectionnelle amortie (0.5)
+                    # Propagation bidirectionnelle amortie (QEM_ENTANGLE_DAMPING)
                     if src in candidates and tgt in candidates:
-                        candidates[tgt]['score'] += candidates[src]['similarity'] * weight * 0.5
-                    if tgt in candidates and src in candidates:
-                        candidates[src]['score'] += candidates[tgt]['similarity'] * weight * 0.5
+                        candidates[tgt]['score'] += candidates[src]['similarity'] * weight * QEM_ENTANGLE_DAMPING
+                        candidates[src]['score'] += candidates[tgt]['similarity'] * weight * QEM_ENTANGLE_DAMPING
 
             # 5. Interférences Quantiques (Filtre destructif)
             # A. Contradictions et Remplacements (supersedes)
@@ -481,7 +500,7 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
                     if emb_i and emb_j:
                         # Similarité cosinus via produit scalaire (puisque normalisés)
                         cosine_sim = sum(x * y for x, y in zip(emb_i, emb_j))
-                        if cosine_sim > 0.75:
+                        if cosine_sim > QEM_REDUNDANCY_THRESHOLD:
                             candidates[id_j]['score'] = 0.0
                             logger.info(f"Q-EM: Interférence destructive (redondance sim={cosine_sim:.2f}) : {id_j} annulé au profit de {id_i}")
 

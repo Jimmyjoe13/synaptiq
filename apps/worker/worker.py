@@ -4,7 +4,7 @@ import json
 import time
 import logging
 import re
-import psycopg2
+from psycopg2 import pool as pg_pool
 import redis
 import requests
 from dotenv import load_dotenv
@@ -28,158 +28,159 @@ load_dotenv(os.path.join(_root, ".env"))
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6399/0")
 
+# Pool de connexions PostgreSQL partagé par le process worker : évite d'ouvrir/fermer
+# une connexion à chaque événement. Initialisé paresseusement au premier usage.
+DB_POOL_MIN = int(os.getenv("WORKER_DB_POOL_MIN", "1"))
+DB_POOL_MAX = int(os.getenv("WORKER_DB_POOL_MAX", "4"))
+_db_pool: "pg_pool.ThreadedConnectionPool | None" = None
+
+
+def get_db_pool() -> "pg_pool.ThreadedConnectionPool":
+    """Retourne le pool de connexions (créé au premier appel)."""
+    global _db_pool
+    if _db_pool is None:
+        _db_pool = pg_pool.ThreadedConnectionPool(DB_POOL_MIN, DB_POOL_MAX, dsn=DATABASE_URL)
+        logger.info("Pool PostgreSQL worker initialisé (%d–%d connexions).", DB_POOL_MIN, DB_POOL_MAX)
+    return _db_pool
+
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mock")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/llama-3-8b-instruct:free")
 
-def call_llm_extractor(event_content: str) -> dict:
-    """
-    Analyse l'événement brut pour en extraire des mémoires consolidées.
-    Supporte l'extraction par LLM (OpenRouter) et une heuristique locale (mock) si aucune clé n'est fournie.
-    """
-    # 1. Règle d'extraction locale par défaut (Heuristique/Mock)
-    # Très utile pour le test hors-ligne ou si aucune clé n'est fournie
-    if LLM_PROVIDER == "mock" or not LLM_API_KEY or "your_api_key" in LLM_API_KEY:
-        logger.info("Utilisation de l'extracteur heuristique local (sans LLM).")
-        
-        # Détection des erreurs de code et des résolutions
-        error_match = re.search(
-            r"(?:erreur|bug|exception|traceback|crash|failed|plantage|corrigé|résolu|warning)\s+([^.]+)",
-            event_content,
-            re.IGNORECASE
-        )
-        if error_match:
-            return {
-                "extracted": True,
-                "type": "procedural",
-                "subtype": "code_error_resolution",
-                "content": f"Résolution de bug/erreur détectée : {error_match.group(0).strip()}",
-                "summary": "Résolution d'erreur de code",
-                "confidence": 0.85,
-                "importance": 0.7
-            }
-            
-        # Détection des bonnes pratiques et playbooks
-        best_practice_match = re.search(
-            r"(?:bonne pratique|toujours|ne jamais|règle de conception|recommandation|best practice)\s+([^.]+)",
-            event_content,
-            re.IGNORECASE
-        )
-        if best_practice_match:
-            return {
-                "extracted": True,
-                "type": "procedural",
-                "subtype": "coding_best_practices",
-                "content": f"Directive de conception/code : {best_practice_match.group(0).strip()}",
-                "summary": "Directive de conception de code",
-                "confidence": 0.9,
-                "importance": 0.8
-            }
-            
-        # Détection basique des préférences de l'utilisateur
-        pref_match = re.search(
-            r"(?:je préfère|je veux|ma préférence|utilise plutôt|ne fais pas|écris en)\s+([^.]+)", 
-            event_content, 
-            re.IGNORECASE
-        )
-        if pref_match:
-            extracted_fact = f"L'utilisateur a spécifié une préférence : {pref_match.group(1).strip()}"
-            return {
-                "extracted": True,
-                "type": "semantic",
-                "subtype": "preference",
-                "content": extracted_fact,
-                "summary": "Préférence utilisateur extraite",
-                "confidence": 0.9,
-                "importance": 0.8
-            }
-            
-        # Si aucun pattern, on extrait comme un épisode générique
-        return {
-            "extracted": True,
-            "type": "episodic",
-            "subtype": "interaction",
-            "content": f"Interaction : {event_content}",
-            "summary": "Épisode d'interaction",
-            "confidence": 0.8,
-            "importance": 0.4
-        }
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 
-    # 2. Extraction via LLM (OpenRouter / APIs)
-    logger.info(f"Appel du LLM ({LLM_PROVIDER} : {LLM_MODEL}) pour l'extraction de mémoire.")
-    
-    prompt = f"""
-    Tu es le module d'extraction de mémoire de SynaptiQ. Ton rôle est d'analyser l'interaction suivante et d'extraire des éléments de mémoire durable pour l'agent.
-    
-    Interaction à analyser :
-    "{event_content}"
-    
-    Tu devez classifier cette mémoire selon l'un des types suivants :
-    1. "procedural" (sous-type "code_error_resolution" pour des erreurs système, tracebacks et leurs résolutions, ou "coding_best_practices" pour des playbooks, règles d'architecture et bonnes pratiques de programmation).
-    2. "semantic" (sous-type "preference" pour les choix explicites de l'utilisateur, ou "fact" pour des faits généraux stables).
-    3. "episodic" (sous-type "interaction" pour un résumé historique d'une action menée à bien ou d'une étape projet importante).
-    
-    Tu devez renvoyer UN UNIQUE objet JSON contenant :
-    {{
-      "type": "semantic", "episodic" ou "procedural",
-      "subtype": "code_error_resolution", "coding_best_practices", "preference", "fact" ou "interaction",
-      "content": "Le souvenir extrait rédigé de manière claire, concise et affirmative à la troisième personne (ex: 'L'agent ne doit pas importer de librairies réseau au niveau global sous Windows')",
-      "summary": "Un titre ou résumé très court du souvenir (ex: 'Windows Multiprocessing Fix')",
-      "confidence": un float entre 0.0 et 1.0 (degré de certitude),
-      "importance": un float entre 0.0 et 1.0 (importance opérationnelle pour l'agent)
-    }}
-    
-    Renvoie UNIQUEMENT le JSON brut, aucun autre texte.
+# Seuil de similarité cosinus au-delà duquel deux mémoires sont automatiquement intriquées.
+QEM_ENTANGLE_THRESHOLD = float(os.getenv("QEM_ENTANGLE_THRESHOLD", "0.7"))
+
+
+def _heuristic_extract(event_content: str) -> dict:
+    """Extraction locale par heuristiques regex FR (hors-ligne / fallback).
+
+    Fragile par nature (dépend de tournures françaises) : sert de repli quand le
+    LLM est indisponible. La voie robuste est l'extraction LLM structurée.
     """
-    
-    try:
-        headers = {
-            "Authorization": f"Bearer {LLM_API_KEY}",
-            "Content-Type": "application/json"
+    # Erreurs de code et résolutions
+    error_match = re.search(
+        r"(?:erreur|bug|exception|traceback|crash|failed|plantage|corrigé|résolu|warning)\s+([^.]+)",
+        event_content, re.IGNORECASE,
+    )
+    if error_match:
+        return {
+            "extracted": True, "type": "procedural", "subtype": "code_error_resolution",
+            "content": f"Résolution de bug/erreur détectée : {error_match.group(0).strip()}",
+            "summary": "Résolution d'erreur de code", "confidence": 0.85, "importance": 0.7,
         }
-        
+    # Bonnes pratiques / playbooks
+    best_practice_match = re.search(
+        r"(?:bonne pratique|toujours|ne jamais|règle de conception|recommandation|best practice)\s+([^.]+)",
+        event_content, re.IGNORECASE,
+    )
+    if best_practice_match:
+        return {
+            "extracted": True, "type": "procedural", "subtype": "coding_best_practices",
+            "content": f"Directive de conception/code : {best_practice_match.group(0).strip()}",
+            "summary": "Directive de conception de code", "confidence": 0.9, "importance": 0.8,
+        }
+    # Préférences utilisateur
+    pref_match = re.search(
+        r"(?:je préfère|je veux|ma préférence|utilise plutôt|ne fais pas|écris en)\s+([^.]+)",
+        event_content, re.IGNORECASE,
+    )
+    if pref_match:
+        return {
+            "extracted": True, "type": "semantic", "subtype": "preference",
+            "content": f"L'utilisateur a spécifié une préférence : {pref_match.group(1).strip()}",
+            "summary": "Préférence utilisateur extraite", "confidence": 0.9, "importance": 0.8,
+        }
+    # Défaut : épisode générique
+    return {
+        "extracted": True, "type": "episodic", "subtype": "interaction",
+        "content": f"Interaction : {event_content}",
+        "summary": "Épisode d'interaction", "confidence": 0.8, "importance": 0.4,
+    }
+
+
+# Taxonomie autorisée (type -> subtypes valides) pour valider la sortie LLM.
+_VALID_SUBTYPES = {
+    "procedural": {"code_error_resolution", "coding_best_practices", "rule"},
+    "semantic": {"preference", "fact"},
+    "episodic": {"interaction"},
+    "working": {"scratch"},
+}
+_DEFAULT_SUBTYPE = {"procedural": "rule", "semantic": "fact", "episodic": "interaction", "working": "scratch"}
+
+
+def _validate_extraction(data: dict, event_content: str) -> dict:
+    """Normalise et valide la sortie LLM contre la taxonomie ; corrige les incohérences."""
+    mtype = data.get("type") if data.get("type") in _VALID_SUBTYPES else "semantic"
+    subtype = data.get("subtype")
+    if subtype not in _VALID_SUBTYPES[mtype]:
+        subtype = _DEFAULT_SUBTYPE[mtype]
+
+    def _clamp(value, default):
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "extracted": True,
+        "type": mtype,
+        "subtype": subtype,
+        "content": (data.get("content") or event_content).strip(),
+        "summary": (data.get("summary") or "Mémoire extraite").strip(),
+        "confidence": _clamp(data.get("confidence"), 0.9),
+        "importance": _clamp(data.get("importance"), 0.5),
+    }
+
+
+def call_llm_extractor(event_content: str) -> dict:
+    """Extrait une mémoire consolidée d'un événement brut.
+
+    - Sans clé LLM (ou LLM_PROVIDER=mock) : heuristiques regex locales.
+    - Avec LLM : extraction structurée (JSON natif) validée ; repli sur les
+      heuristiques en cas d'échec réseau/parse.
+    """
+    if LLM_PROVIDER == "mock" or not LLM_API_KEY or "your_api_key" in LLM_API_KEY:
+        logger.info("Extraction heuristique locale (sans LLM).")
+        return _heuristic_extract(event_content)
+
+    logger.info("Appel LLM (%s : %s) pour l'extraction de mémoire.", LLM_PROVIDER, LLM_MODEL)
+    prompt = (
+        "Analyse l'interaction suivante (quelle que soit sa langue) et extrais UNE mémoire "
+        "durable pour l'agent.\n\n"
+        f"Interaction :\n\"{event_content}\"\n\n"
+        "Classe-la :\n"
+        "- type 'procedural' : subtype 'code_error_resolution' (erreurs/tracebacks + résolution) "
+        "ou 'coding_best_practices' (règles d'archi, bonnes pratiques).\n"
+        "- type 'semantic' : subtype 'preference' (choix explicite utilisateur) ou 'fact' (fait stable).\n"
+        "- type 'episodic' : subtype 'interaction' (résumé d'une action/étape).\n\n"
+        "Réponds par un UNIQUE objet JSON : {\"type\":..., \"subtype\":..., "
+        "\"content\": \"souvenir clair, concis, 3e personne\", \"summary\": \"titre court\", "
+        "\"confidence\": float 0-1, \"importance\": float 0-1}."
+    )
+    try:
+        headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
         payload = {
             "model": LLM_MODEL,
             "messages": [
-                {"role": "system", "content": "Tu es un extracteur de mémoire de précision qui répond uniquement en JSON."},
-                {"role": "user", "content": prompt}
-            ]
+                {"role": "system", "content": "Extracteur de mémoire de précision. Répond uniquement en JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            "response_format": {"type": "json_object"},  # JSON natif garanti
+            "temperature": 0,
         }
-        
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=15)
+        response = requests.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=15)
         response.raise_for_status()
-        
-        response_json = response.json()
-        raw_content = response_json["choices"][0]["message"]["content"].strip()
-        
-        # Nettoyer les balises de code markdown si le LLM en a rajouté
-        if raw_content.startswith("```json"):
-            raw_content = raw_content[7:-3].strip()
-        elif raw_content.startswith("```"):
-            raw_content = raw_content[3:-3].strip()
-            
-        data = json.loads(raw_content)
-        return {
-            "extracted": True,
-            "type": data.get("type", "semantic"),
-            "subtype": data.get("subtype", "fact"),
-            "content": data.get("content", event_content),
-            "summary": data.get("summary", "Mémoire extraite"),
-            "confidence": float(data.get("confidence", 0.9)),
-            "importance": float(data.get("importance", 0.5))
-        }
+        raw = response.json()["choices"][0]["message"]["content"].strip()
+        # Tolérance : certains modèles encadrent le JSON en markdown malgré response_format
+        if "```" in raw:
+            raw = raw[raw.find("{"): raw.rfind("}") + 1]
+        return _validate_extraction(json.loads(raw), event_content)
     except Exception as e:
-        logger.error(f"Échec de l'extraction LLM : {e}. Utilisation du fallback heuristique.")
-        # Fallback local en cas d'erreur API
-        return {
-            "extracted": True,
-            "type": "episodic",
-            "subtype": "interaction",
-            "content": f"Interaction (brute suite erreur LLM) : {event_content}",
-            "summary": "Épisode d'interaction",
-            "confidence": 0.5,
-            "importance": 0.3
-        }
+        logger.error("Échec de l'extraction LLM : %s. Repli sur les heuristiques regex.", e)
+        return _heuristic_extract(event_content)
+
 
 def process_event(event: dict) -> bool:
     """
@@ -199,8 +200,10 @@ def process_event(event: dict) -> bool:
     embedding = get_embedder().embed_one(memory_data['content'])
     
     # 3. Écriture en base de données avec gestion des contradictions et des intrications
+    pool = get_db_pool()
+    conn = pool.getconn()
+    broken = False
     try:
-        conn = psycopg2.connect(DATABASE_URL)
         with conn.cursor() as cur:
             # Gestion des contradictions (archivage scopé sémantiquement)
             handle_contradictions(cur, tenant_id, agent_id, memory_data, embedding)
@@ -256,7 +259,7 @@ def process_event(event: dict) -> bool:
                 related_rows = cur.fetchall()
                 for rel_row in related_rows:
                     similarity = float(rel_row[3] or 0.0)
-                    if similarity > 0.7:  # Seuil d'intrication sémantique
+                    if similarity > QEM_ENTANGLE_THRESHOLD:  # Seuil d'intrication sémantique
                         target_id = rel_row[0]
                         relation_type = "entangled_with"
                         
@@ -283,15 +286,19 @@ def process_event(event: dict) -> bool:
             
             conn.commit()
             return True
-            
+
     except Exception as e:
-        if 'conn' in locals() and conn:
+        broken = True
+        try:
             conn.rollback()
+            broken = False  # rollback réussi → connexion réutilisable
+        except Exception:
+            pass
         logger.error(f"Erreur SQL lors de l'enregistrement de la mémoire : {e}")
         return False
     finally:
-        if 'conn' in locals() and conn:
-            conn.close()
+        # Recycler la connexion ; la fermer si son état est douteux (rollback échoué).
+        pool.putconn(conn, close=broken)
 
 # ─── File d'événements : Redis Streams (consumer group + ACK + DLQ) ───
 STREAM = os.getenv("EVENT_STREAM", "synaptiq:events")

@@ -37,12 +37,14 @@ CREATE TABLE IF NOT EXISTS memories (
     provenance JSONB DEFAULT '{}'::jsonb
 );
 
--- Index pour recherche sémantique (HNSW) sur la colonne embedding
--- Note : L'index HNSW sera créé après avoir des données pour des performances optimales en prod,
--- mais pour la v0 locale, un index de base ou pas d'index (recherche exacte par défaut) suffit.
--- On peut ajouter un index IVFFlat ou HNSW si besoin :
--- CREATE INDEX ON memories USING hnsw (embedding vector_cosine_ops);
+-- Index vectoriel HNSW pour la recherche sémantique (opérateur <=> = distance cosinus).
+-- vector_cosine_ops car les embeddings sont L2-normalisés et toutes les requêtes trient par <=>.
+-- HNSW se construit à vide et se met à jour à l'insertion (pas de reindex différé nécessaire).
+-- Paramètres par défaut (m=16, ef_construction=64) adaptés à la volumétrie visée ; ajuster si besoin.
+CREATE INDEX IF NOT EXISTS idx_memories_embedding_hnsw
+    ON memories USING hnsw (embedding vector_cosine_ops);
 
+-- Index B-tree pour le filtrage (tenant/agent/type/status) appliqué avant/avec la recherche vectorielle.
 CREATE INDEX IF NOT EXISTS idx_memories_lookup ON memories(tenant_id, agent_id, type, status);
 
 -- Table des clés API (auth + scoping multi-tenant, Phase 3)

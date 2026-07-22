@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+*.egg-info/
 .venv/
 venv/
 # Secrets : ignorer tous les .env (racine ET sous-dossiers comme apps/api/.env)
@@ -17,4 +18,5 @@ redis_data/
 SynaptiQ_Audit_et_Roadmap_15072026.md
 AGENTS.md
 handoff.md
+CLAUDE.md
 
