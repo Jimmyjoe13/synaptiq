@@ -201,10 +201,11 @@ class TestSynaptiqIntegration(unittest.TestCase):
         data = response.json()
         
         context_packet = data['context_packet']
-        # Le paquet de contexte ne doit contenir QUE le fait actif ("très détaillés et formels")
-        self.assertEqual(len(context_packet['facts']), 1)
-        self.assertIn("détaillés et formels", context_packet['facts'][0])
-        self.assertNotIn("courts et concis", context_packet['facts'][0])
+        # La mémoire active est semantic/preference -> collection 'preferences'.
+        # Elle ne doit contenir QUE la préférence active ("très détaillés et formels").
+        self.assertEqual(len(context_packet['preferences']), 1)
+        self.assertIn("détaillés et formels", context_packet['preferences'][0])
+        self.assertNotIn("courts et concis", context_packet['preferences'][0])
         
         client_ctx.__exit__(None, None, None)
         print("\n[SUCCESS] Test d'integration de bout en bout reussi avec succes !")

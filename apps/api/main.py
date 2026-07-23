@@ -22,6 +22,15 @@ from dotenv import load_dotenv
 
 # Logique partagée (embeddings pluggables + gouvernance), plus d'import depuis le worker
 from synaptiq_core import get_embedder, to_pgvector, handle_contradictions
+# Cœur algorithmique Q-EM (fonctions pures : superposition -> intrication -> interférence -> mesure)
+from synaptiq_core.qem import (
+    compute_recency_factor,
+    initial_score,
+    propagate_entanglement,
+    apply_contradictions,
+    filter_redundancy,
+    collapse_by_utility,
+)
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -377,11 +386,9 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
                 sim = float(row['similarity'] or 0.0)
                 sim_clipped = max(0.0, sim)
                 # Décroissance temporelle : atténue la pertinence des mémoires anciennes
-                # (demi-vie configurable). Réactivée à chaque accès (last_accessed_at).
-                recency_factor = 1.0
-                if QEM_RECENCY_HALFLIFE_DAYS > 0:
-                    age_days = float(row['age_seconds'] or 0.0) / 86400.0
-                    recency_factor = 0.5 ** (age_days / QEM_RECENCY_HALFLIFE_DAYS)
+                # (demi-vie configurable, réactivée à chaque accès via last_accessed_at).
+                # Seuil externalisé lu ici, calcul délégué au cœur pur (qem.py).
+                recency_factor = compute_recency_factor(row['age_seconds'], QEM_RECENCY_HALFLIFE_DAYS)
                 candidates[mem_id] = {
                     "id": mem_id,
                     "type": row['type'],
@@ -395,7 +402,7 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
                     "similarity": sim_clipped,
                     "recency_factor": recency_factor,
                     # Le score de départ pondère la similarité par la récence.
-                    "score": sim_clipped * recency_factor
+                    "score": initial_score(sim_clipped, recency_factor)
                 }
 
             if not candidates:
@@ -451,115 +458,23 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
                         "score": 0.0
                     }
 
-            # 4. Propagation de l'activation (Intrication)
-            for rel in relationships:
-                if rel['relation_type'] == 'entangled_with':
-                    src = str(rel['source_memory_id'])
-                    tgt = str(rel['target_memory_id'])
-                    weight = float(rel['weight'] or 1.0)
-                    
-                    # Propagation bidirectionnelle amortie (QEM_ENTANGLE_DAMPING)
-                    if src in candidates and tgt in candidates:
-                        candidates[tgt]['score'] += candidates[src]['similarity'] * weight * QEM_ENTANGLE_DAMPING
-                        candidates[src]['score'] += candidates[tgt]['similarity'] * weight * QEM_ENTANGLE_DAMPING
+            # ── Algorithme Q-EM délégué au cœur pur (packages/core/synaptiq_core/qem.py) ──
+            # Les seuils QEM_* restent lus côté API (os.getenv) et sont passés en paramètres.
 
-            # 5. Interférences Quantiques (Filtre destructif)
-            # A. Contradictions et Remplacements (supersedes)
-            for rel in relationships:
-                if rel['relation_type'] in ('contradicts', 'supersedes_by'):
-                    src = str(rel['source_memory_id'])
-                    tgt = str(rel['target_memory_id'])
-                    if src in candidates and tgt in candidates:
-                        # Annuler le score de la plus ancienne ou de moindre confiance
-                        c_src = candidates[src]
-                        c_tgt = candidates[tgt]
-                        if c_src['created_at'] < c_tgt['created_at']:
-                            c_src['score'] = 0.0
-                            logger.info(f"Q-EM: Interférence destructive (contradiction) : {src} annulé par {tgt}")
-                        else:
-                            c_tgt['score'] = 0.0
-                            logger.info(f"Q-EM: Interférence destructive (contradiction) : {tgt} annulé par {src}")
+            # 4. Intrication : propagation d'activation amortie ('entangled_with')
+            propagate_entanglement(candidates, relationships, QEM_ENTANGLE_DAMPING)
 
-            # B. Redondances sémantiques (similarité cosinus des embeddings > 0.75)
-            active_ids = [cid for cid, c in candidates.items() if c['score'] > 0.0]
-            # Trier pour conserver les plus importants ou récents en priorité
-            active_ids.sort(key=lambda cid: (candidates[cid]['importance'], candidates[cid]['created_at']), reverse=True)
-            
-            for i in range(len(active_ids)):
-                id_i = active_ids[i]
-                if candidates[id_i]['score'] == 0.0:
-                    continue
-                emb_i = candidates[id_i]['embedding']
-                
-                for j in range(i + 1, len(active_ids)):
-                    id_j = active_ids[j]
-                    if candidates[id_j]['score'] == 0.0:
-                        continue
-                    emb_j = candidates[id_j]['embedding']
-                    
-                    if emb_i and emb_j:
-                        # Similarité cosinus via produit scalaire (puisque normalisés)
-                        cosine_sim = sum(x * y for x, y in zip(emb_i, emb_j))
-                        if cosine_sim > QEM_REDUNDANCY_THRESHOLD:
-                            candidates[id_j]['score'] = 0.0
-                            logger.info(f"Q-EM: Interférence destructive (redondance sim={cosine_sim:.2f}) : {id_j} annulé au profit de {id_i}")
+            # 5. Interférences destructives
+            #    A. Contradictions / supersession (annule la plus ancienne)
+            apply_contradictions(candidates, relationships)
+            #    B. Redondances sémantiques (cosinus des embeddings > seuil)
+            filter_redundancy(candidates, QEM_REDUNDANCY_THRESHOLD)
 
-            # 6. Mesure (Collapse du contexte par densité d'utilité/token)
-            collapsed_candidates = []
-            for mem_id, c in candidates.items():
-                if c['score'] > 0.0:
-                    tokens = max(1, int(len(c['content'].split()) * 1.3))
-                    utility_density = c['score'] / tokens
-                    collapsed_candidates.append({
-                        "id": mem_id,
-                        "type": c['type'],
-                        "content": c['content'],
-                        "tokens": tokens,
-                        "utility_density": utility_density
-                    })
-
-            # Trier par densité d'utilité par token décroissante
-            collapsed_candidates.sort(key=lambda x: x['utility_density'], reverse=True)
-
-            facts = []
-            preferences = []
-            episodes = []
-            rules = []
-            best_practices = []
-            errors = []
-            examples = []
-            selected_ids = []
-            token_count = 0
+            # 6. Mesure : collapse glouton par densité d'utilité/token + routage 7 clés
+            context_packet, selected_ids, token_count = collapse_by_utility(
+                candidates, request.constraints.max_tokens
+            )
             max_tokens = request.constraints.max_tokens
-
-            # Collapse glouton sous contrainte de jetons
-            for c in collapsed_candidates:
-                if token_count + c['tokens'] <= max_tokens:
-                    selected_ids.append(c['id'])
-                    token_count += c['tokens']
-                    
-                    m_type = c['type']
-                    m_subtype = c.get('subtype')
-                    content = c['content']
-                    
-                    if m_type == 'semantic':
-                        if m_subtype == 'preference':
-                            preferences.append(content)
-                        else:
-                            facts.append(content)
-                    elif m_type == 'episodic':
-                        episodes.append(content)
-                    elif m_type == 'procedural':
-                        if m_subtype == 'coding_best_practices':
-                            best_practices.append(content)
-                        elif m_subtype == 'code_error_resolution':
-                            errors.append(content)
-                        else:
-                            rules.append(content)
-                    elif m_type == 'working':
-                        examples.append(content)
-                else:
-                    logger.debug(f"Q-EM: Hors budget pour {c['id']} (tokens={c['tokens']}, restant={max_tokens - token_count})")
 
             # 7. Enregistrement des statistiques d'accès
             if selected_ids:
@@ -572,17 +487,7 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
                 cur.execute(update_query, (selected_ids,))
                 conn.commit()
 
-            # Construction finale du paquet
-            context_packet = {
-                "facts": facts,
-                "preferences": preferences,
-                "episodes": episodes,
-                "rules": rules,
-                "best_practices": best_practices,
-                "errors": errors,
-                "examples": examples
-            }
-            
+            # `context_packet` (7 clés) est déjà assemblé par collapse_by_utility.
             logger.info(f"Q-EM: Mesure achevée. {len(selected_ids)} mémoires sélectionnées. Tokens: {token_count}/{max_tokens}")
             
             return {

@@ -197,9 +197,10 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
         selected_ids = data['selected_memory_ids']
         
         # Le contexte ne doit contenir qu'UNE SEULE des deux mémoires (celle de plus forte importance, M1)
+        # Mémoires semantic/preference -> routées dans la collection 'preferences'.
         self.assertEqual(len(selected_ids), 1, "L'interférence destructive de redondance aurait dû éliminer la mémoire en doublon.")
-        self.assertIn(m1_content, context_packet['facts'])
-        self.assertNotIn(m2_content, context_packet['facts'])
+        self.assertIn(m1_content, context_packet['preferences'])
+        self.assertNotIn(m2_content, context_packet['preferences'])
         print("[SUCCESS] Interférence destructive de redondance vérifiée !")
 
     def test_q_em_destructive_interference_contradiction(self):
