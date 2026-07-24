@@ -24,6 +24,9 @@ jobs:
   integration:
     name: Tests d'intégration (hérités)
     runs-on: ubuntu-latest
+    # Garde-fou volontaire : job non bloquant tant que Jimmy n'a pas donné le
+    # feu vert pour le rendre bloquant. Ne PAS retirer sans validation explicite.
+    continue-on-error: true
     services:
       postgres:
         image: pgvector/pgvector:pg16

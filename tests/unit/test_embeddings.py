@@ -61,7 +61,11 @@ def test_openai_compat_dimension_incoherente(monkeypatch):
 
 
 def test_openai_compat_respecte_ordre(monkeypatch):
-    """Les vecteurs doivent être réordonnés selon le champ 'index'."""
+    """Les vecteurs doivent être réordonnés selon le champ 'index'.
+
+    Vecteurs 2-dim choisis pour rester distincts APRÈS normalisation L2 (systématique
+    désormais) : [3,4] -> [0.6,0.8] (norme 5), [0,2] -> [0,1] (norme 2).
+    """
     import synaptiq_core.embeddings as emb
 
     class FakeResp:
@@ -70,11 +74,29 @@ def test_openai_compat_respecte_ordre(monkeypatch):
 
         def json(self):
             return {"data": [
-                {"index": 1, "embedding": [2.0]},
-                {"index": 0, "embedding": [1.0]},
+                {"index": 1, "embedding": [0.0, 2.0]},
+                {"index": 0, "embedding": [3.0, 4.0]},
             ]}
 
     monkeypatch.setattr(emb.requests, "post", lambda *a, **k: FakeResp())
-    e = OpenAICompatEmbedder(base_url="http://fake/v1", model="m", dim=1)
+    e = OpenAICompatEmbedder(base_url="http://fake/v1", model="m", dim=2)
     out = e.embed(["premier", "second"])
-    assert out == [[1.0], [2.0]]
+    assert out == [[0.6, 0.8], [0.0, 1.0]]
+
+
+def test_openai_compat_normalise_l2(monkeypatch):
+    """Un endpoint renvoyant un vecteur NON unitaire est normalisé L2 en sortie."""
+    import synaptiq_core.embeddings as emb
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": [{"index": 0, "embedding": [3.0, 4.0]}]}  # norme 5, non unitaire
+
+    monkeypatch.setattr(emb.requests, "post", lambda *a, **k: FakeResp())
+    e = OpenAICompatEmbedder(base_url="http://fake/v1", model="m", dim=2)
+    (vec,) = e.embed(["texte"])
+    assert abs((vec[0] ** 2 + vec[1] ** 2) ** 0.5 - 1.0) < 1e-9  # norme == 1
+    assert vec == [0.6, 0.8]

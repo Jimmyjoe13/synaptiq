@@ -48,6 +48,9 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/llama-3-8b-instruct:free")
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+# Résilience aux erreurs transitoires (429 fréquent sur les modèles :free).
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
+LLM_RETRY_BACKOFF_S = float(os.getenv("LLM_RETRY_BACKOFF_S", "2.0"))
 
 # Seuil de similarité cosinus au-delà duquel deux mémoires sont automatiquement intriquées.
 QEM_ENTANGLE_THRESHOLD = float(os.getenv("QEM_ENTANGLE_THRESHOLD", "0.7"))
@@ -141,7 +144,11 @@ def call_llm_extractor(event_content: str) -> dict:
     - Avec LLM : extraction structurée (JSON natif) validée ; repli sur les
       heuristiques en cas d'échec réseau/parse.
     """
-    if LLM_PROVIDER == "mock" or not LLM_API_KEY or "your_api_key" in LLM_API_KEY:
+    # Un endpoint LOCAL (LM Studio, Ollama…) n'exige aucune clé API. On ne retombe donc
+    # sur l'heuristique que si : provider=mock, OU provider distant sans clé valide.
+    _local_llm = any(h in LLM_BASE_URL for h in ("localhost", "127.0.0.1", "host.docker.internal"))
+    _no_valid_key = (not LLM_API_KEY) or ("your_api_key" in LLM_API_KEY)
+    if LLM_PROVIDER == "mock" or (_no_valid_key and not _local_llm):
         logger.info("Extraction heuristique locale (sans LLM).")
         return _heuristic_extract(event_content)
 
@@ -160,7 +167,9 @@ def call_llm_extractor(event_content: str) -> dict:
         "\"confidence\": float 0-1, \"importance\": float 0-1}."
     )
     try:
-        headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
+        if LLM_API_KEY and "your_api_key" not in LLM_API_KEY:
+            headers["Authorization"] = f"Bearer {LLM_API_KEY}"
         payload = {
             "model": LLM_MODEL,
             "messages": [
@@ -170,7 +179,19 @@ def call_llm_extractor(event_content: str) -> dict:
             "response_format": {"type": "json_object"},  # JSON natif garanti
             "temperature": 0,
         }
-        response = requests.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=15)
+        # Retry avec backoff sur les erreurs transitoires (429 rate-limit fréquent sur les
+        # modèles :free d'OpenRouter ; 5xx). On respecte l'en-tête Retry-After si présent.
+        response = None
+        for attempt in range(LLM_MAX_RETRIES):
+            response = requests.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=30)
+            if response.status_code in (429, 500, 502, 503, 504) and attempt < LLM_MAX_RETRIES - 1:
+                retry_after = response.headers.get("Retry-After")
+                delay = float(retry_after) if (retry_after or "").isdigit() else LLM_RETRY_BACKOFF_S * (2 ** attempt)
+                logger.warning("LLM %s (tentative %d/%d), nouvel essai dans %.1fs.",
+                               response.status_code, attempt + 1, LLM_MAX_RETRIES, delay)
+                time.sleep(delay)
+                continue
+            break
         response.raise_for_status()
         raw = response.json()["choices"][0]["message"]["content"].strip()
         # Tolérance : certains modèles encadrent le JSON en markdown malgré response_format
@@ -313,6 +334,8 @@ DLQ = os.getenv("EVENT_DLQ", "synaptiq:events:dlq")
 CONSUMER = f"worker-{os.getpid()}"
 MAX_DELIVERIES = int(os.getenv("EVENT_MAX_DELIVERIES", "5"))
 IDLE_RECLAIM_MS = int(os.getenv("EVENT_IDLE_RECLAIM_MS", "30000"))
+# Intervalle max entre deux reclaim, même sous charge continue (retry qui avance toujours).
+RECLAIM_INTERVAL_MS = int(os.getenv("EVENT_RECLAIM_INTERVAL_MS", "15000"))
 
 
 def ensure_group(r) -> None:
@@ -387,13 +410,23 @@ def main():
 
     ensure_group(r)
 
+    # Reclaim périodique INDÉPENDANT du débit : sous charge continue, `xreadgroup`
+    # ne retourne jamais vide, donc le reclaim déclenché sur inactivité seul ne passait
+    # jamais -> les messages en échec restaient bloqués en pending sans être rejugés.
+    # On force un reclaim au moins tous les RECLAIM_INTERVAL_MS quel que soit le trafic.
+    last_reclaim = time.monotonic()
+    reclaim_interval_s = RECLAIM_INTERVAL_MS / 1000.0
+
     # Boucle de consommation via consumer group (XREADGROUP bloquant, ACK explicite)
     while True:
         try:
             resp = r.xreadgroup(GROUP, CONSUMER, {STREAM: ">"}, count=10, block=5000)
-            if not resp:
-                # Aucun nouveau message : on tente de reprendre les pending bloqués
+            now = time.monotonic()
+            if not resp or (now - last_reclaim) >= reclaim_interval_s:
+                # Inactivité OU intervalle écoulé : reprendre les pending bloqués.
                 _reclaim(r)
+                last_reclaim = now
+            if not resp:
                 continue
             for _stream, messages in resp:
                 for msg_id, fields in messages:

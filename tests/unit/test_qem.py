@@ -82,6 +82,51 @@ def test_propagation_intrication():
     assert candidates["M1"]["score"] == 1.0
 
 
+def test_propagation_multihop():
+    """Chaîne M1(seed)→M2→M3 : l'activation se propage à 2 sauts, atténuée par damping.
+
+    Verrouille le comportement multi-hop (vrai spreading activation) : M3, à 2 liens
+    du seed, remonte alors qu'il ne matche pas la requête.
+    """
+    candidates = {
+        "M1": _cand("M1", similarity=1.0, score=1.0),
+        "M2": _cand("M2", similarity=0.0, score=0.0),
+        "M3": _cand("M3", similarity=0.0, score=0.0),
+    }
+    relationships = [
+        {"source_memory_id": "M1", "target_memory_id": "M2",
+         "relation_type": "entangled_with", "weight": 1.0},
+        {"source_memory_id": "M2", "target_memory_id": "M3",
+         "relation_type": "entangled_with", "weight": 1.0},
+    ]
+    propagate_entanglement(candidates, relationships, damping=0.5, max_hops=2)
+
+    # hop1 : M2 += M1.sim(1.0)*w*damping(0.5) = 0.5
+    assert candidates["M2"]["score"] == 0.5
+    # hop2 : M3 += activation(M2)=0.5 * w * damping(0.5) = 0.25
+    assert candidates["M3"]["score"] == 0.25
+    # M1 (seed, déjà visité) n'est jamais re-boosté : pas de retour d'onde
+    assert candidates["M1"]["score"] == 1.0
+
+
+def test_propagation_mono_hop_borne():
+    """max_hops=1 : seul le voisin direct est activé, M3 (2 sauts) reste à 0."""
+    candidates = {
+        "M1": _cand("M1", similarity=1.0, score=1.0),
+        "M2": _cand("M2", similarity=0.0, score=0.0),
+        "M3": _cand("M3", similarity=0.0, score=0.0),
+    }
+    relationships = [
+        {"source_memory_id": "M1", "target_memory_id": "M2",
+         "relation_type": "entangled_with", "weight": 1.0},
+        {"source_memory_id": "M2", "target_memory_id": "M3",
+         "relation_type": "entangled_with", "weight": 1.0},
+    ]
+    propagate_entanglement(candidates, relationships, damping=0.5, max_hops=1)
+    assert candidates["M2"]["score"] == 0.5
+    assert candidates["M3"]["score"] == 0.0
+
+
 def test_propagation_ignore_extremites_absentes():
     """Un lien vers une mémoire hors des candidats ne propage rien (pas de KeyError)."""
     candidates = {"M1": _cand("M1", similarity=1.0, score=1.0)}

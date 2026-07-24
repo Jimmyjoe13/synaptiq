@@ -113,7 +113,12 @@ class OpenAICompatEmbedder(Embedder):
                 f"Dimension d'embedding inattendue : reçu {got}, attendu {self.dim}. "
                 "Aligner EMBEDDING_DIM et la colonne VECTOR(n) de la base."
             )
-        return vectors
+        # Normalisation L2 systématique : de nombreux endpoints (LM Studio, certains
+        # modèles gguf) renvoient des vecteurs NON unitaires. Or le cœur Q-EM
+        # (filter_redundancy) assimile le produit scalaire au cosinus -> il EXIGE des
+        # vecteurs normalisés. On normalise ici pour garantir l'invariant côté stockage
+        # ET côté calcul Python, quel que soit le fournisseur.
+        return [_l2_normalize(v) for v in vectors]
 
 
 class LMStudioEmbedder(OpenAICompatEmbedder):

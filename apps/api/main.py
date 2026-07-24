@@ -57,6 +57,9 @@ DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
 # Seuils du moteur Q-EM (externalisés : ajustables sans redéploiement de code).
 # Amortissement de la propagation d'activation le long des liens 'entangled_with'.
 QEM_ENTANGLE_DAMPING = float(os.getenv("QEM_ENTANGLE_DAMPING", "0.5"))
+# Nombre maximal de sauts de propagation d'activation (spreading activation multi-hop).
+# 1 = comportement mono-saut historique ; 2 (défaut) ramène les souvenirs à 2 liens.
+QEM_ENTANGLE_MAX_HOPS = int(os.getenv("QEM_ENTANGLE_MAX_HOPS", "2"))
 # Au-delà de ce cosinus entre deux candidats, le moins prioritaire est filtré (redondance).
 QEM_REDUNDANCY_THRESHOLD = float(os.getenv("QEM_REDUNDANCY_THRESHOLD", "0.75"))
 # Décroissance temporelle : demi-vie (en jours) du score de récence. Une mémoire non
@@ -117,7 +120,7 @@ async def lifespan(app: FastAPI):
         redis_client.close()
 
 
-app = FastAPI(title="SynaptiQ API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="SynaptiQ API", version="0.2.0", lifespan=lifespan)
 
 # ─── Sécurité : CORS + rate limiting ───
 from fastapi.middleware.cors import CORSMiddleware
@@ -472,7 +475,7 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
             # Les seuils QEM_* restent lus côté API (os.getenv) et sont passés en paramètres.
 
             # 4. Intrication : propagation d'activation amortie ('entangled_with')
-            propagate_entanglement(candidates, relationships, QEM_ENTANGLE_DAMPING)
+            propagate_entanglement(candidates, relationships, QEM_ENTANGLE_DAMPING, QEM_ENTANGLE_MAX_HOPS)
 
             # 5. Interférences destructives
             #    A. Contradictions / supersession (annule la plus ancienne)

@@ -59,23 +59,68 @@ def propagate_entanglement(
     candidates: Dict[str, dict],
     relationships: List[dict],
     damping: float,
+    max_hops: int = 2,
 ) -> None:
-    """Propage l'activation le long des liens 'entangled_with' (mute les scores).
+    """Propage l'activation le long des liens 'entangled_with' — spreading activation.
 
-    Bidirectionnel et amorti : chaque extrémité reçoit la SIMILARITÉ directe de
-    l'autre extrémité * poids du lien * damping. On lit bien `similarity` (activation
-    « source ») et non `score` — réplique exacte de l'original. N'agit que si les deux
-    extrémités sont présentes dans `candidates`.
+    Vraie propagation MULTI-SAUTS (BFS par niveaux) : l'activation part des « seeds »
+    (candidats qui ont matché la requête, `similarity > 0`) et se diffuse le long du
+    graphe `entangled_with`, atténuée de `damping` à chaque saut. Un souvenir M3 relié
+    à M2 relié au seed M1 est ainsi ramené (à `damping**2`), là où l'ancienne version
+    ne propageait qu'à distance 1.
+
+    Invariants (compatibilité ascendante avec l'ancien comportement mono-saut) :
+      - Le graphe est bidirectionnel et pondéré (`weight`, défaut 1.0).
+      - Un nœud n'est activé qu'UNE fois (ensemble `visited`) : pas de retour d'onde,
+        pas de boucle, pas d'emballement. Les seeds ne sont donc jamais re-boostés
+        (avec `max_hops=1` sur un lien seed→non-seed, on retrouve exactement l'ancien
+        résultat : `similarity_seed * weight * damping`).
+      - N'agit que si les deux extrémités du lien sont présentes dans `candidates`.
+
+    `max_hops <= 0` désactive la propagation.
     """
-    for rel in relationships:
-        if rel['relation_type'] == 'entangled_with':
-            src = str(rel['source_memory_id'])
-            tgt = str(rel['target_memory_id'])
-            weight = float(rel['weight'] or 1.0)
+    if max_hops <= 0:
+        return
 
-            if src in candidates and tgt in candidates:
-                candidates[tgt]['score'] += candidates[src]['similarity'] * weight * damping
-                candidates[src]['score'] += candidates[tgt]['similarity'] * weight * damping
+    # Adjacence bidirectionnelle limitée aux liens dont les 2 extrémités sont candidates.
+    adjacency: Dict[str, List[Tuple[str, float]]] = {}
+    for rel in relationships:
+        if rel['relation_type'] != 'entangled_with':
+            continue
+        src = str(rel['source_memory_id'])
+        tgt = str(rel['target_memory_id'])
+        if src in candidates and tgt in candidates:
+            weight = float(rel['weight'] or 1.0)
+            adjacency.setdefault(src, []).append((tgt, weight))
+            adjacency.setdefault(tgt, []).append((src, weight))
+
+    if not adjacency:
+        return
+
+    # Frontière initiale = seeds (activation = similarité directe). Ordre déterministe.
+    frontier = [cid for cid, c in candidates.items() if c['similarity'] > 0.0]
+    activation = {cid: candidates[cid]['similarity'] for cid in frontier}
+    visited = set(frontier)
+
+    for _hop in range(max_hops):
+        # Contributions du niveau courant, sommées AVANT de marquer `visited` :
+        # un nœud atteint par plusieurs parents au même niveau cumule leurs apports.
+        level_contrib: Dict[str, float] = {}
+        for node in frontier:
+            for neighbor, weight in adjacency.get(node, []):
+                if neighbor in visited:
+                    continue
+                level_contrib[neighbor] = (
+                    level_contrib.get(neighbor, 0.0) + activation[node] * weight * damping
+                )
+        if not level_contrib:
+            break
+        for neighbor, contrib in level_contrib.items():
+            candidates[neighbor]['score'] += contrib
+            visited.add(neighbor)
+            logger.debug(f"Q-EM: Intrication (hop {_hop + 1}) : {neighbor} += {contrib:.3f}")
+        frontier = list(level_contrib.keys())
+        activation = level_contrib
 
 
 # ─────────────────────────────────────────────────────────────────────────────
