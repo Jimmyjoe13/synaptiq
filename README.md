@@ -282,6 +282,8 @@ python scripts/create_api_key.py --name "agent-prod"
 
 Les origines CORS d'un front navigateur se déclarent explicitement dans `CORS_ORIGINS` (vide par défaut ; le SDK/MCP server-à-serveur n'est pas concerné).
 
+Les profils de référence exposent les ports seulement sur `127.0.0.1`. Le serveur MCP est prévu en `stdio`; le profil HTTP optionnel (`docker compose --profile mcp-http up`) reste local et exige `SYNAPTIQ_API_KEY`.
+
 <br>
 
 ## 🧪 Tests & CI

@@ -24,9 +24,6 @@ jobs:
   integration:
     name: Tests d'intégration (hérités)
     runs-on: ubuntu-latest
-    # Les tests d'intégration existants encodent l'ancien comportement (pré-refactor
-    # sémantique) : non bloquants tant qu'ils ne sont pas remis à jour.
-    continue-on-error: true
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -57,5 +54,7 @@ jobs:
         run: pip install -r requirements-dev.txt
       - name: Initialiser le schéma
         run: psql "$DATABASE_URL" -f infra/postgres/init.sql
+      - name: Appliquer les migrations
+        run: alembic upgrade head
       - name: Tests d'intégration
         run: pytest -m integration -q

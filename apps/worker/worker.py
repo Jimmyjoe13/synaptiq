@@ -210,8 +210,9 @@ def process_event(event: dict) -> bool:
             
             # Insertion de la nouvelle mémoire
             insert_query = """
-                INSERT INTO memories (tenant_id, agent_id, type, subtype, content, summary, embedding, confidence, importance, provenance)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO memories (tenant_id, agent_id, type, subtype, content, summary, embedding, confidence, importance, provenance, source_event_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (source_event_id) WHERE source_event_id IS NOT NULL DO NOTHING
                 RETURNING id;
             """
             
@@ -230,10 +231,15 @@ def process_event(event: dict) -> bool:
                 embedding,
                 memory_data['confidence'],
                 memory_data['importance'],
-                json.dumps(provenance)
+                json.dumps(provenance),
+                event_id,
             ))
-            
-            new_mem_id = cur.fetchone()[0]
+            row = cur.fetchone()
+            if row is None:
+                conn.commit()
+                logger.info("Événement %s déjà consolidé; ACK sans duplication.", event_id)
+                return True
+            new_mem_id = row[0]
             logger.info(f"Nouvelle mémoire consolidée créée avec l'ID {new_mem_id} ({memory_data['type']}/{memory_data['subtype']}).")
             
             # 4. Graphe d'intrication sémantique automatique (Q-EM)

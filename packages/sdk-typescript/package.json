@@ -1,0 +1,12 @@
+{
+  "name": "@synaptiq/sdk",
+  "version": "0.2.0",
+  "description": "TypeScript client for the SynaptiQ memory API",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": { "build": "tsc -p tsconfig.json", "test": "node --test dist/**/*.test.js" },
+  "devDependencies": { "typescript": "^5.7.3" }
+}

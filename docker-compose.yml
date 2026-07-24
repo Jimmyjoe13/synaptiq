@@ -7,7 +7,7 @@ services:
     image: pgvector/pgvector:pg16
     container_name: synaptiq-postgres
     ports:
-      - "5435:5432"
+      - "127.0.0.1:5435:5432"
     environment:
       POSTGRES_USER: synaptiq
       POSTGRES_PASSWORD: synaptiq_password
@@ -27,7 +27,7 @@ services:
     image: redis:7-alpine
     container_name: synaptiq-redis
     ports:
-      - "6399:6379"
+      - "127.0.0.1:6399:6379"
     volumes:
       - redis_data:/data
     command: redis-server --save 60 1 --loglevel warning
@@ -45,7 +45,7 @@ services:
       dockerfile: apps/api/Dockerfile
     container_name: synaptiq-api
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     env_file: .env
     environment:
       # Surcharge des URLs pour le réseau interne Docker
@@ -60,6 +60,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health | grep -q '\"status\":\"ok\"' || exit 1"]
       interval: 10s
@@ -86,6 +88,43 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - synaptiq-network
+
+  relay:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: synaptiq-relay
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://synaptiq:synaptiq_password@postgres:5432/synaptiq_db
+      REDIS_URL: redis://redis:6379/0
+    command: ["python", "-u", "apps/relay/relay.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - synaptiq-network
+
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: synaptiq-migrate
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://synaptiq:synaptiq_password@postgres:5432/synaptiq_db
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - synaptiq-network
 
@@ -94,13 +133,16 @@ services:
       context: .
       dockerfile: apps/mcp/Dockerfile
     container_name: synaptiq-mcp
+    profiles: ["mcp-http"]
     ports:
-      - "8765:8765"
+      - "127.0.0.1:8765:8765"
+    env_file: .env
     environment:
       SYNAPTIQ_API_URL: http://api:8000
       MCP_TRANSPORT: sse
       MCP_HOST: 0.0.0.0
       MCP_PORT: 8765
+      SYNAPTIQ_AUTH_REQUIRED: "true"
     depends_on:
       api:
         condition: service_healthy

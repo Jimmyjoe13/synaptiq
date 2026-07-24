@@ -10,14 +10,16 @@ for _p in (root_path, os.path.join(root_path, "packages", "core")):
 import json
 import logging
 import hashlib
+import time
 from contextlib import contextmanager, asynccontextmanager
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Response
 from pydantic import BaseModel, Field
 from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor
 import redis
+from prometheus_client import Counter, Histogram, CONTENT_TYPE_LATEST, generate_latest
 from dotenv import load_dotenv
 
 # Logique partagée (embeddings pluggables + gouvernance), plus d'import depuis le worker
@@ -63,6 +65,9 @@ QEM_RECENCY_HALFLIFE_DAYS = float(os.getenv("QEM_RECENCY_HALFLIFE_DAYS", "90"))
 
 db_pool: Optional[pg_pool.ThreadedConnectionPool] = None
 redis_client = None
+EVENTS_CAPTURED = Counter("synaptiq_events_captured_total", "Events persisted in the transactional outbox")
+CONTEXT_BUILDS = Counter("synaptiq_context_builds_total", "Context builds", ["outcome"])
+CONTEXT_BUILD_SECONDS = Histogram("synaptiq_context_build_seconds", "Context build latency")
 
 
 @contextmanager
@@ -224,25 +229,29 @@ def parse_embedding(val) -> list:
     return []
 
 # Modèles Pydantic
+MemoryType = Literal["semantic", "episodic", "procedural", "working"]
+
+
 class EventInput(BaseModel):
-    agent_id: str = Field(..., example="agent_sales_01")
-    session_id: str = Field(..., example="sess_abc")
-    content: str = Field(..., example="L'utilisateur demande à rédiger un email pro.")
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+    agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$", json_schema_extra={"example": "agent_sales_01"})
+    session_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$", json_schema_extra={"example": "sess_abc"})
+    content: str = Field(..., min_length=1, max_length=12000, json_schema_extra={"example": "L'utilisateur demande à rédiger un email pro."})
+    metadata: Dict[str, Any] = Field(default_factory=dict, max_length=100)
     # Clé de déduplication optionnelle : deux appels avec la même clé (même tenant)
     # ne créent qu'un seul événement.
-    idempotency_key: Optional[str] = Field(default=None, example="evt-2026-07-15-001")
+    idempotency_key: Optional[str] = Field(default=None, max_length=128, json_schema_extra={"example": "evt-2026-07-15-001"})
 
 class ContextConstraints(BaseModel):
-    max_tokens: int = Field(default=1200)
-    memory_types: List[str] = Field(default=["semantic", "episodic", "procedural", "working"])
+    max_tokens: int = Field(default=1200, ge=1, le=8000)
+    memory_types: List[MemoryType] = Field(default=["semantic", "episodic", "procedural", "working"], min_length=1, max_length=4)
 
 class ContextRequest(BaseModel):
-    agent_id: str = Field(..., example="agent_sales_01")
-    session_id: str = Field(..., example="sess_abc")
-    task: str = Field(..., example="Rédiger un email de suivi")
-    query: str = Field(..., example="Style d'écriture concis de Jimmy")
+    agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$", json_schema_extra={"example": "agent_sales_01"})
+    session_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$", json_schema_extra={"example": "sess_abc"})
+    task: str = Field(..., min_length=1, max_length=4000, json_schema_extra={"example": "Rédiger un email de suivi"})
+    query: str = Field(..., min_length=1, max_length=8000, json_schema_extra={"example": "Style d'écriture concis de Jimmy"})
     constraints: ContextConstraints = Field(default_factory=ContextConstraints)
+    explain: bool = False
 
 @app.get("/health")
 def health_check():
@@ -270,6 +279,12 @@ def health_check():
         }
     }
 
+
+@app.get("/metrics", include_in_schema=False)
+def metrics() -> Response:
+    """Prometheus metrics. The reference Compose profile binds this endpoint to localhost."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 @app.post("/events", status_code=201)
 def capture_event(event: EventInput, auth: Optional[AuthContext] = Depends(get_auth)):
     """
@@ -277,61 +292,53 @@ def capture_event(event: EventInput, auth: Optional[AuthContext] = Depends(get_a
     Idempotent si `idempotency_key` est fourni.
     """
     tenant = resolve_tenant(auth)
-    r = get_redis_client()
-
-    # Garde d'idempotence : SET NX pose un verrou ; si la clé existe, c'est un doublon.
-    idem_k = None
-    if event.idempotency_key:
-        idem_k = f"synaptiq:idem:{tenant}:{event.idempotency_key}"
-        if not r.set(idem_k, "pending", nx=True, ex=IDEMPOTENCY_TTL):
-            existing = r.get(idem_k)
-            logger.info("Événement idempotent ignoré (clé=%s).", event.idempotency_key)
-            return {"status": "duplicate", "event_id": existing}
-
     try:
         with get_conn() as conn:
             try:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute(
                         """
-                        INSERT INTO events (tenant_id, agent_id, session_id, content, metadata)
-                        VALUES (%s, %s, %s, %s, %s)
+                        INSERT INTO events (tenant_id, agent_id, session_id, content, metadata, idempotency_key)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
                         RETURNING id, created_at;
                         """,
                         (tenant, event.agent_id, event.session_id,
-                         event.content, json.dumps(event.metadata)),
+                         event.content, json.dumps(event.metadata), event.idempotency_key),
                     )
                     result = cur.fetchone()
+                    if result is None:
+                        cur.execute(
+                            "SELECT id, created_at FROM events WHERE tenant_id = %s AND idempotency_key = %s",
+                            (tenant, event.idempotency_key),
+                        )
+                        result = cur.fetchone()
+                        conn.commit()
+                        return {"status": "duplicate", "event_id": str(result["id"]),
+                                "created_at": result["created_at"].isoformat()}
+
+                    event_id = str(result['id'])
+                    created_at = result['created_at'].isoformat()
+                    payload = {
+                        "id": event_id, "tenant_id": tenant, "agent_id": event.agent_id,
+                        "session_id": event.session_id, "content": event.content,
+                        "metadata": json.dumps(event.metadata), "created_at": created_at,
+                    }
+                    cur.execute(
+                        "INSERT INTO event_outbox (event_id, payload) VALUES (%s, %s) "
+                        "ON CONFLICT (event_id) DO NOTHING",
+                        (event_id, json.dumps(payload)),
+                    )
                     conn.commit()
             except Exception:
                 conn.rollback()
                 raise
 
-        event_id = str(result['id'])
-        created_at = result['created_at'].isoformat()
-
-        # Publication dans le stream Redis (consommé par le worker via consumer group)
-        payload = {
-            "id": event_id,
-            "tenant_id": tenant,
-            "agent_id": event.agent_id,
-            "session_id": event.session_id,
-            "content": event.content,
-            "metadata": json.dumps(event.metadata),
-            "created_at": created_at,
-        }
-        r.xadd(EVENT_STREAM, {"data": json.dumps(payload)})
-
-        if idem_k:
-            r.set(idem_k, event_id, ex=IDEMPOTENCY_TTL)
-
-        logger.info(f"Événement {event_id} capturé et publié dans le stream.")
+        logger.info("Événement %s capturé dans l'outbox.", event_id)
+        EVENTS_CAPTURED.inc()
         return {"status": "captured", "event_id": event_id, "created_at": created_at}
 
     except Exception as e:
-        # Libérer le verrou d'idempotence pour permettre un nouvel essai
-        if idem_k:
-            r.delete(idem_k)
         logger.error(f"Erreur lors de la capture de l'événement : {e}")
         raise HTTPException(status_code=500, detail="Erreur interne du serveur.")
 
@@ -346,6 +353,7 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
     4. Mesure : Collapse par densité de tokens pour maximiser l'utilité sous budget de tokens.
     """
     tenant = resolve_tenant(auth)
+    start_time = time.perf_counter()
     if db_pool is None:
         raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
     conn = db_pool.getconn()
@@ -407,12 +415,14 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
 
             if not candidates:
                 # Schéma complet (7 clés) même à vide, pour un contrat stable côté consommateur.
+                CONTEXT_BUILDS.labels("empty").inc()
                 return {
                     "context_packet": {"facts": [], "preferences": [], "episodes": [],
                                        "rules": [], "best_practices": [], "errors": [], "examples": []},
                     "token_estimate": 0,
                     "selected_memory_ids": [],
-                    "trace_id": f"trace_{int(datetime.utcnow().timestamp())}"
+                    "trace_id": f"trace_{int(datetime.utcnow().timestamp())}",
+                    "retrieval_trace": [] if request.explain else None,
                 }
 
             # 3. Récupération des relations d'intrication et de contradiction
@@ -490,29 +500,43 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
             # `context_packet` (7 clés) est déjà assemblé par collapse_by_utility.
             logger.info(f"Q-EM: Mesure achevée. {len(selected_ids)} mémoires sélectionnées. Tokens: {token_count}/{max_tokens}")
             
+            CONTEXT_BUILDS.labels("success").inc()
             return {
                 "context_packet": context_packet,
                 "token_estimate": token_count,
                 "selected_memory_ids": selected_ids,
-                "trace_id": f"trace_{int(datetime.utcnow().timestamp())}"
+                "trace_id": f"trace_{int(datetime.utcnow().timestamp())}",
+                "retrieval_trace": [
+                    {
+                        "memory_id": memory_id,
+                        "similarity": candidates[memory_id]["similarity"],
+                        "recency_factor": candidates[memory_id].get("recency_factor", 0.0),
+                        "score": candidates[memory_id]["score"],
+                        "selection_reason": "selected_by_utility_under_token_budget",
+                    }
+                    for memory_id in selected_ids
+                ] if request.explain else None,
             }
             
     except HTTPException:
+        CONTEXT_BUILDS.labels("error").inc()
         raise
     except Exception as e:
         conn.rollback()
+        CONTEXT_BUILDS.labels("error").inc()
         logger.error(f"Erreur lors de la construction du contexte : {e}")
         raise HTTPException(status_code=500, detail="Erreur interne du serveur.")
     finally:
+        CONTEXT_BUILD_SECONDS.observe(time.perf_counter() - start_time)
         db_pool.putconn(conn)
 
 class MemoryInput(BaseModel):
-    agent_id: str = Field(..., example="agent_sales_01")
-    type: str = Field(..., example="semantic")
-    subtype: Optional[str] = Field(None, example="preference")
-    content: str = Field(..., example="Jimmy préfère les e-mails courts.")
-    confidence: float = Field(default=1.0)
-    importance: float = Field(default=0.5)
+    agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$", json_schema_extra={"example": "agent_sales_01"})
+    type: MemoryType = Field(..., json_schema_extra={"example": "semantic"})
+    subtype: Optional[str] = Field(None, max_length=50, json_schema_extra={"example": "preference"})
+    content: str = Field(..., min_length=1, max_length=12000, json_schema_extra={"example": "Jimmy préfère les e-mails courts."})
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    importance: float = Field(default=0.5, ge=0.0, le=1.0)
 
 @app.post("/memories", status_code=201)
 def create_memory(memory: MemoryInput, auth: Optional[AuthContext] = Depends(get_auth)):
@@ -568,10 +592,10 @@ def create_memory(memory: MemoryInput, auth: Optional[AuthContext] = Depends(get
         db_pool.putconn(conn)
 
 class RetrieveRequest(BaseModel):
-    agent_id: str
-    query: str
-    limit: int = 5
-    memory_type: Optional[str] = None
+    agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$")
+    query: str = Field(..., min_length=1, max_length=8000)
+    limit: int = Field(default=5, ge=1, le=100)
+    memory_type: Optional[MemoryType] = None
 
 @app.post("/retrieve")
 def retrieve_memories(request: RetrieveRequest, auth: Optional[AuthContext] = Depends(get_auth)):

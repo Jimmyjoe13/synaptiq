@@ -308,6 +308,18 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             "content": "Bonne pratique : toujours importer de façon paresseuse les modules réseau sous Windows pour éviter les plantages."
         }
         
+        # Les événements doivent exister en base avant consolidation : le worker
+        # écrit memories.source_event_id qui référence events(id) (FK). En prod,
+        # l'API insère l'événement (outbox) avant que le worker ne le traite.
+        with self.db_conn.cursor() as cur:
+            for ev in (event_error, event_best_practice):
+                cur.execute(
+                    "INSERT INTO events (id, tenant_id, agent_id, session_id, content) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (ev["id"], ev["tenant_id"], ev["agent_id"], ev["session_id"], ev["content"]),
+                )
+            self.db_conn.commit()
+
         # On force les deux événements à renvoyer le même embedding (similarité = 1.0) pour déclencher l'intrication automatique
         dummy_embedding = generate_mock_embedding("dummy text")
         # Le worker consolide via get_embedder().embed_one() : on le force à un

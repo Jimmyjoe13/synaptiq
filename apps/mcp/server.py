@@ -127,6 +127,8 @@ if __name__ == "__main__":
     # Transport configurable : stdio par défaut (Claude Desktop / Cursor),
     # sse / streamable-http pour un déploiement conteneurisé joignable en réseau.
     transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport != "stdio" and not SYNAPTIQ_API_KEY:
+        raise RuntimeError("SYNAPTIQ_API_KEY est obligatoire pour exposer MCP en réseau.")
     if transport == "stdio":
         mcp.run()
     else:

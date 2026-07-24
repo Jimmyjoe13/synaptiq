@@ -1,4 +1,6 @@
 __pycache__/
+node_modules/
+packages/sdk-typescript/dist/
 *.pyc
 *.egg-info/
 .venv/

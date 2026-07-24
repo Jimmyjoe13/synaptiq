@@ -17,3 +17,5 @@ python-dotenv==1.0.1
 
 # --- Sécurité (Phase 3 : rate limiting) ---
 slowapi==0.1.9
+alembic==1.14.1
+prometheus-client==0.21.1

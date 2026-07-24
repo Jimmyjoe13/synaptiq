@@ -9,8 +9,11 @@ CREATE TABLE IF NOT EXISTS events (
     session_id VARCHAR(50) NOT NULL,
     content TEXT NOT NULL,
     metadata JSONB DEFAULT '{}'::jsonb,
+    idempotency_key VARCHAR(128),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_tenant_idempotency
+    ON events(tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 -- Index pour accélérer les recherches par session et agent
 CREATE INDEX IF NOT EXISTS idx_events_tenant_agent_session ON events(tenant_id, agent_id, session_id);
@@ -34,8 +37,13 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     status VARCHAR(20) DEFAULT 'active', -- active, archived, disputed
     version INTEGER DEFAULT 1,
-    provenance JSONB DEFAULT '{}'::jsonb
+    provenance JSONB DEFAULT '{}'::jsonb,
+    source_event_id UUID
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_source_event
+    ON memories(source_event_id) WHERE source_event_id IS NOT NULL;
+ALTER TABLE memories ADD CONSTRAINT fk_memories_source_event
+    FOREIGN KEY (source_event_id) REFERENCES events(id) ON DELETE SET NULL;
 
 -- Index vectoriel HNSW pour la recherche sémantique (opérateur <=> = distance cosinus).
 -- vector_cosine_ops car les embeddings sont L2-normalisés et toutes les requêtes trient par <=>.
@@ -58,6 +66,18 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at TIMESTAMP WITH TIME ZONE
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash) WHERE active;
+
+-- Transactional outbox: the relay publishes committed events to Redis Streams.
+CREATE TABLE IF NOT EXISTS event_outbox (
+    id BIGSERIAL PRIMARY KEY,
+    event_id UUID NOT NULL UNIQUE REFERENCES events(id) ON DELETE CASCADE,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    published_at TIMESTAMP WITH TIME ZONE,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_event_outbox_pending ON event_outbox(created_at) WHERE published_at IS NULL;
 
 -- Table des relations (Intrication Quantique)
 CREATE TABLE IF NOT EXISTS relationships (

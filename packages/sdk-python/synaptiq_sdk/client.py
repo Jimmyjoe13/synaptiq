@@ -23,7 +23,8 @@ class SynaptiqClient:
         except Exception as e:
             return {"status": "unhealthy", "error": str(e)}
 
-    def capture(self, agent_id: str, session_id: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def capture(self, agent_id: str, session_id: str, content: str, metadata: Optional[Dict[str, Any]] = None,
+                idempotency_key: Optional[str] = None) -> Dict[str, Any]:
         """
         Enregistre un événement ou une interaction brute dans SynaptiQ.
         Cet événement sera classifié et extrait en arrière-plan de manière asynchrone.
@@ -33,7 +34,8 @@ class SynaptiqClient:
             "agent_id": agent_id,
             "session_id": session_id,
             "content": content,
-            "metadata": metadata or {}
+            "metadata": metadata or {},
+            "idempotency_key": idempotency_key,
         }
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=5)
@@ -42,7 +44,8 @@ class SynaptiqClient:
         except Exception as e:
             raise RuntimeError(f"Échec de l'enregistrement de l'événement : {e}")
 
-    def build_context(self, agent_id: str, session_id: str, task: str, query: str, max_tokens: int = 1200, memory_types: Optional[List[str]] = None) -> Dict[str, Any]:
+    def build_context(self, agent_id: str, session_id: str, task: str, query: str, max_tokens: int = 1200,
+                      memory_types: Optional[List[str]] = None, explain: bool = False) -> Dict[str, Any]:
         """
         Récupère un paquet de contexte structuré et minimaliste pour alimenter le prompt du LLM.
         """
@@ -55,7 +58,8 @@ class SynaptiqClient:
             "constraints": {
                 "max_tokens": max_tokens,
                 "memory_types": memory_types or ["semantic", "episodic", "procedural", "working"]
-            }
+            },
+            "explain": explain,
         }
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=5)
