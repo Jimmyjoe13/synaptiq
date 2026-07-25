@@ -17,6 +17,11 @@ data/
 db_data/
 postgres_data/
 redis_data/
+# Datasets de benchmark : œuvres tierces avec leur propre licence, non redistribuées.
+# Procédure de téléchargement dans benchmarks/README.md.
+benchmarks/locomo10.json
+benchmarks/*_results*.json
+benchmarks/results_*.json
 SynaptiQ_Audit_et_Roadmap_15072026.md
 AGENTS.md
 handoff.md

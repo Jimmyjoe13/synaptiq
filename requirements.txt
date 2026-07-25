@@ -13,7 +13,9 @@ redis==5.2.1
 
 # --- HTTP / config (worker, embeddings LM Studio, SDK) ---
 requests==2.32.3
-python-dotenv==1.0.1
+# NB : >=1.1.0 requis par fastmcp (serveur MCP, requirements-dev). Épingler 1.0.1
+# rendait requirements-dev.txt non résoluble.
+python-dotenv>=1.1.0,<2
 
 # --- Sécurité (Phase 3 : rate limiting) ---
 slowapi==0.1.9

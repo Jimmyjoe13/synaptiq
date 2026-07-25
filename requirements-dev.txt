@@ -2,7 +2,7 @@
 -r requirements.txt
 
 # Serveur MCP (pour le tester en local)
-fastmcp==2.3.4
+fastmcp==2.9.2
 
 # Tests & qualité
 pytest==8.3.4

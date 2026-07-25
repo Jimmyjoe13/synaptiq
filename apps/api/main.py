@@ -33,6 +33,8 @@ from synaptiq_core.qem import (
     filter_redundancy,
     collapse_by_utility,
 )
+# Fusion de classements pour la recherche hybride (fonctions pures, cf. retrieval.py)
+from synaptiq_core.retrieval import DEFAULT_RRF_K, fuse_and_rank, reciprocal_rank_fusion
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -65,6 +67,23 @@ QEM_REDUNDANCY_THRESHOLD = float(os.getenv("QEM_REDUNDANCY_THRESHOLD", "0.75"))
 # Décroissance temporelle : demi-vie (en jours) du score de récence. Une mémoire non
 # ré-accédée voit sa pertinence divisée par 2 tous les N jours. 0 (ou négatif) = désactivé.
 QEM_RECENCY_HALFLIFE_DAYS = float(os.getenv("QEM_RECENCY_HALFLIFE_DAYS", "90"))
+# Plancher de pertinence du collapse, relatif au meilleur candidat : un souvenir dont le
+# score est sous `ratio * meilleur` est écarté même s'il reste du budget. Sans lui, le
+# remplissage glouton absorbait la longue traîne d'activations faibles (mesuré à 2,7x plus
+# de contexte que le top-k vectoriel, sans gain d'exactitude). 0 = désactivé.
+QEM_MIN_SCORE_RATIO = float(os.getenv("QEM_MIN_SCORE_RATIO", "0.25"))
+
+# ─── Recherche hybride (vectoriel + plein texte) ───
+# Le vecteur ramène le « sémantiquement proche », le plein texte les correspondances
+# littérales (noms propres, dates, identifiants). Désactivable pour mesurer son apport.
+RETRIEVAL_HYBRID = os.getenv("RETRIEVAL_HYBRID", "true").lower() in ("1", "true", "yes")
+# Nombre de candidats ramenés PAR CHEMIN avant fusion.
+RETRIEVAL_CANDIDATES = int(os.getenv("RETRIEVAL_CANDIDATES", "50"))
+# Amortissement de la fusion par rang (RRF). 60 = valeur de référence.
+RRF_K = int(os.getenv("RRF_K", str(DEFAULT_RRF_K)))
+# Importance relative des deux chemins dans la fusion.
+RRF_WEIGHT_VECTOR = float(os.getenv("RRF_WEIGHT_VECTOR", "1.0"))
+RRF_WEIGHT_FTS = float(os.getenv("RRF_WEIGHT_FTS", "1.0"))
 
 db_pool: Optional[pg_pool.ThreadedConnectionPool] = None
 redis_client = None
@@ -221,6 +240,71 @@ def resolve_tenant(auth: Optional[AuthContext]) -> str:
     """
     return auth.tenant_id if auth else _instance_tenant()
 
+def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
+                      agent_id: str, memory_types: List[str]) -> List[dict]:
+    """Ramène les candidats par similarité vectorielle ET, si activé, par plein texte.
+
+    Une seule requête à deux CTE plutôt que deux allers-retours : chaque ligne porte son
+    rang dans chaque chemin (`rank_vec`, `rank_fts`, NULL quand le chemin ne l'a pas
+    trouvée), ce qui permet la fusion RRF côté Python sur des fonctions pures testables.
+
+    `websearch_to_tsquery` est utilisé plutôt que `plainto_tsquery` : il tolère une requête
+    en langage naturel sans lever d'erreur de syntaxe, ce qui est indispensable ici où la
+    requête vient d'un agent et n'est jamais échappée à la main.
+    """
+    champs = ("id", "type", "subtype", "content", "confidence", "importance",
+              "last_accessed_at", "created_at", "occurred_at", "embedding::text")
+    colonnes = ", ".join(champs)
+    # Le SELECT final joint trois CTE qui portent toutes une colonne `id` : sans préfixe,
+    # PostgreSQL refuse la requête ("column reference id is ambiguous").
+    colonnes_filtre = ", ".join(f"f.{c}" for c in champs)
+
+    if not RETRIEVAL_HYBRID:
+        cur.execute(f"""
+            SELECT {colonnes},
+                   (1 - (embedding <=> %s::vector)) AS similarity,
+                   EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_accessed_at)) AS age_seconds,
+                   row_number() OVER (ORDER BY embedding <=> %s::vector) AS rank_vec,
+                   NULL::bigint AS rank_fts
+            FROM memories
+            WHERE tenant_id = %s AND agent_id = %s AND type = ANY(%s) AND status = 'active'
+            ORDER BY similarity DESC
+            LIMIT %s;
+        """, (vector_str, vector_str, tenant, agent_id, memory_types, RETRIEVAL_CANDIDATES))
+        return cur.fetchall()
+
+    cur.execute(f"""
+        WITH filtre AS (
+            SELECT * FROM memories
+            WHERE tenant_id = %s AND agent_id = %s AND type = ANY(%s) AND status = 'active'
+        ),
+        vectoriel AS (
+            SELECT id, row_number() OVER (ORDER BY embedding <=> %s::vector) AS rank_vec
+            FROM filtre ORDER BY embedding <=> %s::vector LIMIT %s
+        ),
+        plein_texte AS (
+            SELECT f.id,
+                   row_number() OVER (ORDER BY ts_rank(f.content_tsv, q.query) DESC) AS rank_fts
+            FROM filtre f, websearch_to_tsquery('simple', %s) AS q(query)
+            WHERE f.content_tsv @@ q.query
+            ORDER BY ts_rank(f.content_tsv, q.query) DESC
+            LIMIT %s
+        )
+        SELECT {colonnes_filtre},
+               (1 - (f.embedding <=> %s::vector)) AS similarity,
+               EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - f.last_accessed_at)) AS age_seconds,
+               v.rank_vec, t.rank_fts
+        FROM filtre f
+        LEFT JOIN vectoriel v ON v.id = f.id
+        LEFT JOIN plein_texte t ON t.id = f.id
+        WHERE v.rank_vec IS NOT NULL OR t.rank_fts IS NOT NULL;
+    """, (tenant, agent_id, memory_types,
+          vector_str, vector_str, RETRIEVAL_CANDIDATES,
+          query_text, RETRIEVAL_CANDIDATES,
+          vector_str))
+    return cur.fetchall()
+
+
 def parse_embedding(val) -> list:
     if isinstance(val, list):
         return val
@@ -365,31 +449,31 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
             # 1. Génération de l'embedding de la requête (fournisseur réel)
             query_vector = get_embedder().embed_one(request.query)
             vector_str = to_pgvector(query_vector)
-            
-            # 2. Superposition (Recherche sémantique des candidats)
-            # Tri par similarité cosinus décroissante ( pgvector <=> distance cosinus )
-            query = """
-                SELECT id, type, subtype, content, confidence, importance, last_accessed_at, created_at, embedding::text,
-                       (1 - (embedding <=> %s::vector)) AS similarity,
-                       EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_accessed_at)) AS age_seconds
-                FROM memories
-                WHERE tenant_id = %s
-                  AND agent_id = %s
-                  AND type = ANY(%s)
-                  AND status = 'active'
-                ORDER BY similarity DESC
-                LIMIT 50;
-            """
-            
-            cur.execute(query, (
-                vector_str,
-                tenant,
-                request.agent_id,
-                request.constraints.memory_types
-            ))
-            
-            rows = cur.fetchall()
-            
+
+            # 2. Superposition — recherche des candidats.
+            # Deux chemins complémentaires : la similarité vectorielle ramène le
+            # « sémantiquement proche », le plein texte rattrape les correspondances
+            # LITTÉRALES (noms propres, dates, identifiants) que l'embedding manque.
+            # Mesuré sur LOCOMO : 47 % des questions échouaient faute de rappel, quelle
+            # que soit la stratégie de classement en aval.
+            rows = _fetch_candidates(
+                cur, vector_str, request.query, tenant,
+                request.agent_id, request.constraints.memory_types,
+            )
+
+            # Rangs par chemin -> score de fusion RRF (indépendant des échelles de score).
+            rrf_scores = {}
+            if RETRIEVAL_HYBRID:
+                rang_vectoriel = [str(r['id']) for r in sorted(
+                    (r for r in rows if r['rank_vec'] is not None), key=lambda r: r['rank_vec'])]
+                rang_plein_texte = [str(r['id']) for r in sorted(
+                    (r for r in rows if r['rank_fts'] is not None), key=lambda r: r['rank_fts'])]
+                rrf_scores = reciprocal_rank_fusion(
+                    [rang_vectoriel, rang_plein_texte],
+                    k=RRF_K, weights=[RRF_WEIGHT_VECTOR, RRF_WEIGHT_FTS],
+                )
+            meilleur_rrf = max(rrf_scores.values()) if rrf_scores else 0.0
+
             # Initialiser la structure des candidats
             candidates = {}
             for row in rows:
@@ -409,11 +493,22 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
                     "importance": float(row['importance'] or 0.5),
                     "last_accessed_at": row['last_accessed_at'],
                     "created_at": row['created_at'],
+                    # Date du FAIT (≠ created_at) : préfixée au contenu par le collapse,
+                    # sans quoi le LLM ne peut répondre à aucune question « quand… ».
+                    "occurred_at": row['occurred_at'],
                     "embedding": parse_embedding(row['embedding']),
                     "similarity": sim_clipped,
                     "recency_factor": recency_factor,
-                    # Le score de départ pondère la similarité par la récence.
-                    "score": initial_score(sim_clipped, recency_factor)
+                    # Pertinence de départ. En hybride, elle vient du rang FUSIONNÉ
+                    # (normalisé sur le meilleur candidat) et non du seul cosinus : sans
+                    # cela, un souvenir trouvé uniquement par le plein texte entrerait avec
+                    # un score faible et serait éliminé par le collapse — le rappel gagné
+                    # serait aussitôt reperdu.
+                    "score": initial_score(
+                        rrf_scores[mem_id] / meilleur_rrf if meilleur_rrf else sim_clipped,
+                        recency_factor,
+                    ) if (RETRIEVAL_HYBRID and mem_id in rrf_scores)
+                    else initial_score(sim_clipped, recency_factor),
                 }
 
             if not candidates:
@@ -451,7 +546,7 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
 
             if missing_ids:
                 cur.execute("""
-                    SELECT id, type, subtype, content, confidence, importance, last_accessed_at, created_at, embedding::text
+                    SELECT id, type, subtype, content, confidence, importance, last_accessed_at, created_at, occurred_at, embedding::text
                     FROM memories
                     WHERE id = ANY(%s::uuid[]) AND status = 'active';
                 """, (missing_ids,))
@@ -466,6 +561,7 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
                         "importance": float(row['importance'] or 0.5),
                         "last_accessed_at": row['last_accessed_at'],
                         "created_at": row['created_at'],
+                        "occurred_at": row['occurred_at'],
                         "embedding": parse_embedding(row['embedding']),
                         "similarity": 0.0,
                         "score": 0.0
@@ -483,9 +579,10 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
             #    B. Redondances sémantiques (cosinus des embeddings > seuil)
             filter_redundancy(candidates, QEM_REDUNDANCY_THRESHOLD)
 
-            # 6. Mesure : collapse glouton par densité d'utilité/token + routage 7 clés
+            # 6. Mesure : collapse glouton par densité d'utilité/token + routage 7 clés,
+            #    sous plancher de pertinence (évite de remplir le budget avec du bruit).
             context_packet, selected_ids, token_count = collapse_by_utility(
-                candidates, request.constraints.max_tokens
+                candidates, request.constraints.max_tokens, QEM_MIN_SCORE_RATIO
             )
             max_tokens = request.constraints.max_tokens
 
@@ -603,9 +700,10 @@ class RetrieveRequest(BaseModel):
 @app.post("/retrieve")
 def retrieve_memories(request: RetrieveRequest, auth: Optional[AuthContext] = Depends(get_auth)):
     """
-    Recherche SÉMANTIQUE vectorielle (pgvector) : embed la requête puis trie les
-    souvenirs actifs par similarité cosinus décroissante (opérateur <=>).
-    Le paramètre `query` pilote désormais réellement le classement.
+    Recherche HYBRIDE : similarité vectorielle (pgvector) fusionnée par RRF avec une
+    recherche plein texte. Le vecteur ramène le sémantiquement proche, le plein texte les
+    correspondances littérales (noms propres, dates, identifiants) qu'il manque.
+    `RETRIEVAL_HYBRID=false` revient au classement purement vectoriel.
     """
     tenant = resolve_tenant(auth)
     if db_pool is None:
@@ -615,27 +713,71 @@ def retrieve_memories(request: RetrieveRequest, auth: Optional[AuthContext] = De
         query_vector = get_embedder().embed_one(request.query)
         vector_str = to_pgvector(query_vector)
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            params: list = [vector_str, tenant, request.agent_id]
-            type_filter = ""
+            type_filter = "AND type = %s" if request.memory_type else ""
+            filtre_params = [tenant, request.agent_id]
             if request.memory_type:
-                type_filter = "AND type = %s"
-                params.append(request.memory_type)
-            params.append(request.limit)
+                filtre_params.append(request.memory_type)
 
-            query = f"""
-                SELECT id, type, subtype, content, confidence, importance, last_accessed_at,
-                       (1 - (embedding <=> %s::vector)) AS similarity
-                FROM memories
-                WHERE tenant_id = %s
-                  AND agent_id = %s
-                  {type_filter}
-                  AND status = 'active'
-                ORDER BY similarity DESC
-                LIMIT %s;
-            """
-            cur.execute(query, tuple(params))
-            results = cur.fetchall()
-            return {"memories": results}
+            if not RETRIEVAL_HYBRID:
+                cur.execute(f"""
+                    SELECT id, type, subtype, content, confidence, importance, last_accessed_at,
+                           occurred_at, (1 - (embedding <=> %s::vector)) AS similarity
+                    FROM memories
+                    WHERE tenant_id = %s AND agent_id = %s {type_filter} AND status = 'active'
+                    ORDER BY similarity DESC
+                    LIMIT %s;
+                """, (vector_str, *filtre_params, request.limit))
+                return {"memories": cur.fetchall()}
+
+            # Sur-échantillonner chaque chemin avant fusion : la bonne réponse peut être
+            # 12e en vectoriel et 2e en plein texte, il faut donc regarder au-delà de
+            # `limit` dans les deux avant de trancher.
+            pool_size = max(request.limit * 4, RETRIEVAL_CANDIDATES)
+            cur.execute(f"""
+                WITH filtre AS (
+                    SELECT * FROM memories
+                    WHERE tenant_id = %s AND agent_id = %s {type_filter} AND status = 'active'
+                ),
+                vectoriel AS (
+                    SELECT id, row_number() OVER (ORDER BY embedding <=> %s::vector) AS rank_vec
+                    FROM filtre ORDER BY embedding <=> %s::vector LIMIT %s
+                ),
+                plein_texte AS (
+                    SELECT f.id,
+                           row_number() OVER (ORDER BY ts_rank(f.content_tsv, q.query) DESC) AS rank_fts
+                    FROM filtre f, websearch_to_tsquery('simple', %s) AS q(query)
+                    WHERE f.content_tsv @@ q.query
+                    ORDER BY ts_rank(f.content_tsv, q.query) DESC
+                    LIMIT %s
+                )
+                SELECT f.id, f.type, f.subtype, f.content, f.confidence, f.importance,
+                       f.last_accessed_at, f.occurred_at,
+                       (1 - (f.embedding <=> %s::vector)) AS similarity,
+                       v.rank_vec, t.rank_fts
+                FROM filtre f
+                LEFT JOIN vectoriel v ON v.id = f.id
+                LEFT JOIN plein_texte t ON t.id = f.id
+                WHERE v.rank_vec IS NOT NULL OR t.rank_fts IS NOT NULL;
+            """, (*filtre_params, vector_str, vector_str, pool_size,
+                  request.query, pool_size, vector_str))
+            rows = cur.fetchall()
+
+            par_id = {str(r["id"]): r for r in rows}
+            rang_vec = [str(r["id"]) for r in sorted(
+                (r for r in rows if r["rank_vec"] is not None), key=lambda r: r["rank_vec"])]
+            rang_fts = [str(r["id"]) for r in sorted(
+                (r for r in rows if r["rank_fts"] is not None), key=lambda r: r["rank_fts"])]
+            ordre = fuse_and_rank([rang_vec, rang_fts], k=RRF_K,
+                                  weights=[RRF_WEIGHT_VECTOR, RRF_WEIGHT_FTS],
+                                  limit=request.limit)
+            # `rank_vec`/`rank_fts` sont des détails d'implémentation : hors contrat public.
+            memoires = []
+            for mem_id in ordre:
+                row = dict(par_id[mem_id])
+                row.pop("rank_vec", None)
+                row.pop("rank_fts", None)
+                memoires.append(row)
+            return {"memories": memoires}
     except HTTPException:
         raise
     except Exception as e:

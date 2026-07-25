@@ -4,6 +4,8 @@ import json
 import time
 import logging
 import re
+import hashlib
+from datetime import datetime
 from psycopg2 import pool as pg_pool
 import redis
 import requests
@@ -55,12 +57,37 @@ LLM_RETRY_BACKOFF_S = float(os.getenv("LLM_RETRY_BACKOFF_S", "2.0"))
 # Seuil de similarité cosinus au-delà duquel deux mémoires sont automatiquement intriquées.
 QEM_ENTANGLE_THRESHOLD = float(os.getenv("QEM_ENTANGLE_THRESHOLD", "0.7"))
 
+# Types de mémoire éligibles à l'intrication automatique (liste séparée par des virgules).
+# Défaut 'procedural,semantic' : les souvenirs DURABLES (règles, erreurs, bonnes pratiques,
+# faits, préférences) tissent le graphe exploité par le multi-hop de build_context.
+# `episodic` est exclu par défaut — les épisodes bruts sont nombreux et peu discriminants,
+# les intriquer densifie le graphe sans gain de pertinence. L'ajouter reste possible ici.
+QEM_ENTANGLE_TYPES = {
+    t.strip() for t in os.getenv("QEM_ENTANGLE_TYPES", "procedural,semantic").split(",") if t.strip()
+}
+
+
+def _is_entanglement_candidate(memory_data: dict) -> bool:
+    """Une mémoire doit-elle chercher des voisins à intriquer ?
+
+    Historiquement restreint à `procedural` + `semantic/preference`, ce qui laissait le
+    graphe VIDE dès que l'extraction retombait en `episodic/interaction` (cas du mode
+    d'extraction heuristique) : sans arêtes, la propagation d'activation de build_context
+    n'a rien à propager et Q-EM dégénère en simple top-k vectoriel.
+    """
+    return (
+        memory_data.get("type") in QEM_ENTANGLE_TYPES
+        or memory_data.get("subtype") == "preference"
+    )
+
 
 def _heuristic_extract(event_content: str) -> dict:
     """Extraction locale par heuristiques regex FR (hors-ligne / fallback).
 
     Fragile par nature (dépend de tournures françaises) : sert de repli quand le
     LLM est indisponible. La voie robuste est l'extraction LLM structurée.
+
+    Ne produit qu'UN fait, sans date : c'est précisément ce que le repli fait perdre.
     """
     # Erreurs de code et résolutions
     error_match = re.search(
@@ -103,6 +130,21 @@ def _heuristic_extract(event_content: str) -> dict:
     }
 
 
+# Plafond de faits retenus par événement. Un tour de dialogue en énonce rarement plus ;
+# la borne protège d'un modèle qui partirait en liste à rallonge.
+MAX_FACTS_PER_EVENT = int(os.getenv("MAX_FACTS_PER_EVENT", "5"))
+
+
+def content_hash(content: str) -> str:
+    """Empreinte du contenu normalisé, clé de déduplication des faits d'un événement.
+
+    Combinée à `source_event_id` dans un index unique, elle autorise plusieurs mémoires
+    par événement tout en garantissant qu'un replay ne duplique rien : les mêmes faits
+    produisent les mêmes empreintes.
+    """
+    return hashlib.sha256(" ".join(content.split()).strip().lower().encode("utf-8")).hexdigest()
+
+
 # Taxonomie autorisée (type -> subtypes valides) pour valider la sortie LLM.
 _VALID_SUBTYPES = {
     "procedural": {"code_error_resolution", "coding_best_practices", "rule"},
@@ -113,8 +155,25 @@ _VALID_SUBTYPES = {
 _DEFAULT_SUBTYPE = {"procedural": "rule", "semantic": "fact", "episodic": "interaction", "working": "scratch"}
 
 
+def _parse_occurred_at(value) -> "datetime | None":
+    """Interprète la date renvoyée par le LLM (ISO, éventuellement partielle).
+
+    Accepte 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM:SS' et les variantes avec 'Z'. Toute valeur
+    inexploitable rend None : une date fausse serait pire que pas de date.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    raw = value.strip().replace("Z", "+00:00")
+    for candidate in (raw, raw[:10]):
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+    return None
+
+
 def _validate_extraction(data: dict, event_content: str) -> dict:
-    """Normalise et valide la sortie LLM contre la taxonomie ; corrige les incohérences."""
+    """Normalise et valide UN fait de la sortie LLM ; corrige les incohérences."""
     mtype = data.get("type") if data.get("type") in _VALID_SUBTYPES else "semantic"
     subtype = data.get("subtype")
     if subtype not in _VALID_SUBTYPES[mtype]:
@@ -134,15 +193,99 @@ def _validate_extraction(data: dict, event_content: str) -> dict:
         "summary": (data.get("summary") or "Mémoire extraite").strip(),
         "confidence": _clamp(data.get("confidence"), 0.9),
         "importance": _clamp(data.get("importance"), 0.5),
+        "occurred_at": _parse_occurred_at(data.get("occurred_at")),
     }
 
 
-def call_llm_extractor(event_content: str) -> dict:
-    """Extrait une mémoire consolidée d'un événement brut.
+def _validate_extractions(payload, event_content: str) -> list:
+    """Normalise la sortie LLM en une LISTE de faits valides.
 
-    - Sans clé LLM (ou LLM_PROVIDER=mock) : heuristiques regex locales.
+    Tolère les trois formes rencontrées : {"memories": [...]}, une liste nue, ou un objet
+    unique (compatibilité avec les modèles qui ignorent la consigne multi-faits).
+    Les doublons de contenu au sein d'un même événement sont écartés — ils créeraient des
+    lignes en conflit sur (source_event_id, content_hash).
+    """
+    if isinstance(payload, dict):
+        items = payload.get("memories")
+        if not isinstance(items, list):
+            items = [payload]          # objet unique -> un seul fait
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        items = []
+
+    faits, vus = [], set()
+    for item in items[:MAX_FACTS_PER_EVENT]:
+        if not isinstance(item, dict):
+            continue
+        fait = _validate_extraction(item, event_content)
+        cle = fait["content"].strip().lower()
+        if not cle or cle in vus:
+            continue
+        vus.add(cle)
+        faits.append(fait)
+
+    # Aucun fait exploitable : on retombe sur l'heuristique plutôt que de perdre l'événement.
+    return faits or [_heuristic_extract(event_content)]
+
+
+# Schéma des mémoires extraites, pour les endpoints qui exigent `json_schema`.
+_MEMORY_JSON_SCHEMA = {
+    "name": "memories",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "memories": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string"},
+                        "subtype": {"type": "string"},
+                        "content": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "occurred_at": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "importance": {"type": "number"},
+                    },
+                    "required": ["type", "subtype", "content", "summary",
+                                 "occurred_at", "confidence", "importance"],
+                },
+            },
+        },
+        "required": ["memories"],
+    },
+}
+
+# Modes de sortie structurée, du plus au moins contraignant. Les endpoints
+# « OpenAI-compatibles » divergent : OpenAI/Groq/OpenRouter acceptent `json_object`,
+# tandis que LM Studio n'accepte QUE `json_schema` ou `text` et répond 400 sur
+# `json_object`. Sans négociation, la configuration LM Studio — pourtant celle que le
+# projet recommande par défaut — échouait à CHAQUE extraction et retombait
+# silencieusement sur les heuristiques regex.
+_RESPONSE_FORMAT_MODES = ("json_object", "json_schema", None)
+_negotiated_format_mode: str | None = None
+_format_negotiated = False
+
+
+def _response_format_for(mode: str | None) -> dict | None:
+    if mode == "json_object":
+        return {"type": "json_object"}
+    if mode == "json_schema":
+        return {"type": "json_schema", "json_schema": _MEMORY_JSON_SCHEMA}
+    return None
+
+
+def call_llm_extractor(event_content: str, occurred_at: str | None = None) -> list:
+    """Extrait les mémoires consolidées d'un événement brut. Retourne une LISTE de faits.
+
+    - Sans clé LLM (ou LLM_PROVIDER=mock) : heuristiques regex locales (un seul fait).
     - Avec LLM : extraction structurée (JSON natif) validée ; repli sur les
       heuristiques en cas d'échec réseau/parse.
+
+    `occurred_at` (ISO) est l'horodatage de l'événement : il sert de référence pour
+    convertir les expressions relatives (« yesterday », « last week ») en dates absolues.
     """
     # Un endpoint LOCAL (LM Studio, Ollama…) n'exige aucune clé API. On ne retombe donc
     # sur l'heuristique que si : provider=mock, OU provider distant sans clé valide.
@@ -150,21 +293,48 @@ def call_llm_extractor(event_content: str) -> dict:
     _no_valid_key = (not LLM_API_KEY) or ("your_api_key" in LLM_API_KEY)
     if LLM_PROVIDER == "mock" or (_no_valid_key and not _local_llm):
         logger.info("Extraction heuristique locale (sans LLM).")
-        return _heuristic_extract(event_content)
+        return [_heuristic_extract(event_content)]
 
     logger.info("Appel LLM (%s : %s) pour l'extraction de mémoire.", LLM_PROVIDER, LLM_MODEL)
+    # Prompt rédigé en ANGLAIS À DESSEIN. Un prompt en français conduit les modèles à
+    # traduire le souvenir en français quelle que soit la langue de l'interaction : mesuré
+    # à 2/6 de préservation de langue, contre 9/9 avec cette version. Une mémoire traduite
+    # perd la formulation d'origine et dégrade le rappel sémantique face à des requêtes
+    # posées dans la langue source.
+    # Deux exigences portées par ce prompt, issues de l'analyse du run LOCOMO du 25/07 :
+    #   - EXTRAIRE TOUS LES FAITS. Réclamer « une mémoire » poussait le modèle à résumer
+    #     un tour par une généralité ; le fait vérifiable (« Caroline est allée à un groupe
+    #     de soutien ») disparaissait, et 57 % des questions devenaient sans réponse.
+    #   - DATER. L'horodatage de l'événement est fourni ici pour que les expressions
+    #     relatives soient résolues en dates absolues : sans cela, 95 % des mémoires
+    #     naissaient sans date et toute question « quand… » était perdue d'avance.
+    reference = occurred_at or "unknown"
     prompt = (
-        "Analyse l'interaction suivante (quelle que soit sa langue) et extrais UNE mémoire "
-        "durable pour l'agent.\n\n"
-        f"Interaction :\n\"{event_content}\"\n\n"
-        "Classe-la :\n"
-        "- type 'procedural' : subtype 'code_error_resolution' (erreurs/tracebacks + résolution) "
-        "ou 'coding_best_practices' (règles d'archi, bonnes pratiques).\n"
-        "- type 'semantic' : subtype 'preference' (choix explicite utilisateur) ou 'fact' (fait stable).\n"
-        "- type 'episodic' : subtype 'interaction' (résumé d'une action/étape).\n\n"
-        "Réponds par un UNIQUE objet JSON : {\"type\":..., \"subtype\":..., "
-        "\"content\": \"souvenir clair, concis, 3e personne\", \"summary\": \"titre court\", "
-        "\"confidence\": float 0-1, \"importance\": float 0-1}."
+        "Extract EVERY durable fact stated in the following interaction.\n\n"
+        f"Interaction timestamp: {reference}\n"
+        f"Interaction:\n\"{event_content}\"\n\n"
+        "Rules:\n"
+        f"1. Extract 1 to {MAX_FACTS_PER_EVENT} SEPARATE facts — one JSON entry per fact. "
+        "A single turn often states several (an event, a preference, a relationship). "
+        "Prefer CONCRETE, VERIFIABLE facts (who did what, when, where) over feelings, "
+        "opinions or generalities. Do NOT merge unrelated facts into one entry.\n"
+        "2. Resolve EVERY relative time expression ('yesterday', 'last week', "
+        "'last Saturday', 'next month') into an ABSOLUTE date, computed from the "
+        "interaction timestamp above. Put it in `occurred_at` as ISO 'YYYY-MM-DD'. "
+        "Use an empty string only when the fact carries no date at all.\n"
+        "3. Classify each fact:\n"
+        "   - type 'procedural': subtype 'code_error_resolution' (errors/tracebacks and "
+        "their fix) or 'coding_best_practices' (architecture rules, conventions).\n"
+        "   - type 'semantic': subtype 'preference' (an explicit taste or choice) or "
+        "'fact' (a stable fact about a person, entity or the world).\n"
+        "   - type 'episodic': subtype 'interaction' (only when nothing durable is stated).\n"
+        "4. Write `content` and `summary` IN THE SAME LANGUAGE as the interaction. "
+        "Never translate.\n"
+        "5. Write `content` in the third person as a self-contained sentence, "
+        "understandable without the conversation (name people explicitly, never 'he'/'she').\n\n"
+        "Reply with a SINGLE JSON object: {\"memories\": [{\"type\":..., \"subtype\":..., "
+        "\"content\":..., \"summary\": \"short title\", \"occurred_at\": \"YYYY-MM-DD\", "
+        "\"confidence\": float 0-1, \"importance\": float 0-1}, ...]}."
     )
     try:
         headers = {"Content-Type": "application/json"}
@@ -173,17 +343,44 @@ def call_llm_extractor(event_content: str) -> dict:
         payload = {
             "model": LLM_MODEL,
             "messages": [
-                {"role": "system", "content": "Extracteur de mémoire de précision. Répond uniquement en JSON."},
+                {"role": "system", "content": "Precision memory extractor. Reply with JSON only."},
                 {"role": "user", "content": prompt},
             ],
-            "response_format": {"type": "json_object"},  # JSON natif garanti
             "temperature": 0,
         }
+
+        def _post(mode: str | None):
+            body = dict(payload)
+            fmt = _response_format_for(mode)
+            if fmt is not None:
+                body["response_format"] = fmt
+            return requests.post(f"{LLM_BASE_URL}/chat/completions",
+                                 headers=headers, json=body, timeout=30)
+
+        # Négociation du mode de sortie structurée, une seule fois par process : on retient
+        # le premier mode que l'endpoint accepte. Un 400 signale un mode non supporté (et
+        # non une panne), on passe donc au suivant sans consommer de tentative de retry.
+        global _negotiated_format_mode, _format_negotiated
+        if not _format_negotiated:
+            for mode in _RESPONSE_FORMAT_MODES:
+                probe = _post(mode)
+                if probe.status_code != 400:
+                    _negotiated_format_mode = mode
+                    _format_negotiated = True
+                    logger.info("Sortie structurée négociée avec %s : mode=%s.",
+                                LLM_BASE_URL, mode or "aucun (texte libre)")
+                    break
+            else:
+                _negotiated_format_mode = None
+                _format_negotiated = True
+                logger.warning("Aucun mode de sortie structurée accepté par %s : texte libre.",
+                               LLM_BASE_URL)
+
         # Retry avec backoff sur les erreurs transitoires (429 rate-limit fréquent sur les
         # modèles :free d'OpenRouter ; 5xx). On respecte l'en-tête Retry-After si présent.
         response = None
         for attempt in range(LLM_MAX_RETRIES):
-            response = requests.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=30)
+            response = _post(_negotiated_format_mode)
             if response.status_code in (429, 500, 502, 503, 504) and attempt < LLM_MAX_RETRIES - 1:
                 retry_after = response.headers.get("Retry-After")
                 delay = float(retry_after) if (retry_after or "").isdigit() else LLM_RETRY_BACKOFF_S * (2 ** attempt)
@@ -197,122 +394,117 @@ def call_llm_extractor(event_content: str) -> dict:
         # Tolérance : certains modèles encadrent le JSON en markdown malgré response_format
         if "```" in raw:
             raw = raw[raw.find("{"): raw.rfind("}") + 1]
-        return _validate_extraction(json.loads(raw), event_content)
+        faits = _validate_extractions(json.loads(raw), event_content)
+        logger.info("%d fait(s) extrait(s) de l'événement.", len(faits))
+        return faits
     except Exception as e:
         logger.error("Échec de l'extraction LLM : %s. Repli sur les heuristiques regex.", e)
-        return _heuristic_extract(event_content)
+        return [_heuristic_extract(event_content)]
+
+
+_INSERT_MEMORY = """
+    INSERT INTO memories (tenant_id, agent_id, type, subtype, content, summary, embedding,
+                          confidence, importance, provenance, source_event_id,
+                          occurred_at, content_hash)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (source_event_id, content_hash) WHERE source_event_id IS NOT NULL DO NOTHING
+    RETURNING id;
+"""
+
+
+def _entangle(cur, tenant_id: str, agent_id: str, new_mem_id, fact: dict, embedding) -> None:
+    """Relie un souvenir à ses plus proches voisins sémantiques (graphe Q-EM)."""
+    embedding_str = to_pgvector(embedding)
+    cur.execute("""
+        SELECT id, type, subtype, (1 - (embedding <=> %s::vector)) AS similarity
+        FROM memories
+        WHERE tenant_id = %s AND agent_id = %s AND id != %s AND status = 'active'
+        ORDER BY similarity DESC
+        LIMIT 3;
+    """, (embedding_str, tenant_id, agent_id, new_mem_id))
+
+    for rel_row in cur.fetchall():
+        similarity = float(rel_row[3] or 0.0)
+        if similarity <= QEM_ENTANGLE_THRESHOLD:
+            continue
+        target_id, target_subtype = rel_row[0], rel_row[2]
+        relation_type = "entangled_with"
+        inverse = False
+        # Une bonne pratique résout/remplace l'erreur associée (et réciproquement).
+        if fact['subtype'] == 'coding_best_practices' and target_subtype == 'code_error_resolution':
+            relation_type = "supersedes_by"
+        elif fact['subtype'] == 'code_error_resolution' and target_subtype == 'coding_best_practices':
+            relation_type, inverse = "supersedes_by", True
+
+        insert_rel = """
+            INSERT INTO relationships (source_memory_id, target_memory_id, relation_type, weight)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (source_memory_id, target_memory_id) DO NOTHING;
+        """
+        pair = (target_id, new_mem_id) if inverse else (new_mem_id, target_id)
+        cur.execute(insert_rel, (*pair, relation_type, similarity))
+        logger.info("Intrication Q-EM : %s --(%s)--> %s (sim=%.2f)",
+                    pair[0], relation_type, pair[1], similarity)
 
 
 def process_event(event: dict) -> bool:
-    """
-    Traite un événement brut extrait de Redis.
+    """Traite un événement brut : extraction des faits, consolidation, intrication.
+
+    Un événement produit désormais PLUSIEURS mémoires (un tour de dialogue énonce souvent
+    plusieurs faits). Le tout est écrit dans une transaction unique : soit l'événement est
+    entièrement consolidé, soit il sera rejoué intégralement.
     """
     tenant_id = event['tenant_id']
     agent_id = event['agent_id']
     content = event['content']
     event_id = event['id']
-    
+    # Horodatage de l'événement : référence pour résoudre les dates relatives. Fourni par
+    # l'API dans le payload outbox ; absent, le LLM ne pourra simplement pas dater.
+    event_time = event.get('created_at')
+
     logger.info(f"Traitement de l'événement {event_id} pour l'agent {agent_id}...")
-    
-    # 1. Extraction de la mémoire
-    memory_data = call_llm_extractor(content)
-    
-    # 2. Génération d'embedding (fournisseur réel configuré : LM Studio par défaut)
-    embedding = get_embedder().embed_one(memory_data['content'])
-    
-    # 3. Écriture en base de données avec gestion des contradictions et des intrications
+
+    # 1. Extraction : 1 à N faits, datés quand l'interaction le permet
+    facts = call_llm_extractor(content, occurred_at=event_time)
+
+    # 2. Embeddings en UN SEUL appel pour tous les faits (l'interface Embedder est batch)
+    embeddings = get_embedder().embed([f['content'] for f in facts])
+
+    # 3. Écriture en base : contradictions, insertion, intrication
     pool = get_db_pool()
     conn = pool.getconn()
     broken = False
     try:
+        created = 0
         with conn.cursor() as cur:
-            # Gestion des contradictions (archivage scopé sémantiquement)
-            handle_contradictions(cur, tenant_id, agent_id, memory_data, embedding)
-            
-            # Insertion de la nouvelle mémoire
-            insert_query = """
-                INSERT INTO memories (tenant_id, agent_id, type, subtype, content, summary, embedding, confidence, importance, provenance, source_event_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (source_event_id) WHERE source_event_id IS NOT NULL DO NOTHING
-                RETURNING id;
-            """
-            
-            provenance = {
-                "source": "event",
-                "event_id": event_id
-            }
-            
-            cur.execute(insert_query, (
-                tenant_id,
-                agent_id,
-                memory_data['type'],
-                memory_data['subtype'],
-                memory_data['content'],
-                memory_data['summary'],
-                embedding,
-                memory_data['confidence'],
-                memory_data['importance'],
-                json.dumps(provenance),
-                event_id,
-            ))
-            row = cur.fetchone()
-            if row is None:
-                conn.commit()
-                logger.info("Événement %s déjà consolidé; ACK sans duplication.", event_id)
-                return True
-            new_mem_id = row[0]
-            logger.info(f"Nouvelle mémoire consolidée créée avec l'ID {new_mem_id} ({memory_data['type']}/{memory_data['subtype']}).")
-            
-            # 4. Graphe d'intrication sémantique automatique (Q-EM)
-            # Si c'est une règle, une erreur ou une bonne pratique, on cherche sémantiquement des souvenirs associés pour créer des liaisons
-            if memory_data['type'] == 'procedural' or memory_data['subtype'] == 'preference':
-                embedding_str = to_pgvector(embedding)
-                find_rel_query = """
-                    SELECT id, type, subtype, (1 - (embedding <=> %s::vector)) AS similarity
-                    FROM memories
-                    WHERE tenant_id = %s
-                      AND agent_id = %s
-                      AND id != %s
-                      AND status = 'active'
-                    ORDER BY similarity DESC
-                    LIMIT 3;
-                """
-                cur.execute(find_rel_query, (
-                    embedding_str,
-                    tenant_id,
-                    agent_id,
-                    new_mem_id
+            for fact, embedding in zip(facts, embeddings):
+                # Contradictions (archivage scopé sémantiquement) avant insertion.
+                handle_contradictions(cur, tenant_id, agent_id, fact, embedding)
+
+                provenance = {"source": "event", "event_id": event_id}
+                cur.execute(_INSERT_MEMORY, (
+                    tenant_id, agent_id, fact['type'], fact['subtype'], fact['content'],
+                    fact['summary'], embedding, fact['confidence'], fact['importance'],
+                    json.dumps(provenance), event_id,
+                    fact.get('occurred_at'), content_hash(fact['content']),
                 ))
-                related_rows = cur.fetchall()
-                for rel_row in related_rows:
-                    similarity = float(rel_row[3] or 0.0)
-                    if similarity > QEM_ENTANGLE_THRESHOLD:  # Seuil d'intrication sémantique
-                        target_id = rel_row[0]
-                        relation_type = "entangled_with"
-                        
-                        # Règle d'intrication : une bonne pratique résout/remplace une erreur associée
-                        if memory_data['subtype'] == 'coding_best_practices' and rel_row[2] == 'code_error_resolution':
-                            relation_type = "supersedes_by"
-                        elif memory_data['subtype'] == 'code_error_resolution' and rel_row[2] == 'coding_best_practices':
-                            # Inverser la relation : la cible remplace la source
-                            relation_type = "supersedes_by"
-                            
-                        # Insérer la relation
-                        insert_rel_query = """
-                            INSERT INTO relationships (source_memory_id, target_memory_id, relation_type, weight)
-                            VALUES (%s, %s, %s, %s)
-                            ON CONFLICT (source_memory_id, target_memory_id) DO NOTHING;
-                        """
-                        # Si relation inversée, inverser les arguments
-                        if relation_type == "supersedes_by" and memory_data['subtype'] == 'code_error_resolution':
-                            cur.execute(insert_rel_query, (target_id, new_mem_id, relation_type, similarity))
-                        else:
-                            cur.execute(insert_rel_query, (new_mem_id, target_id, relation_type, similarity))
-                        
-                        logger.info(f"Intrication Q-EM établie : {new_mem_id} --({relation_type})--> {target_id} (sim={similarity:.2f})")
-            
-            conn.commit()
-            return True
+                row = cur.fetchone()
+                if row is None:
+                    # Ce fait précis a déjà été consolidé (replay) : rien à refaire.
+                    continue
+                created += 1
+                new_mem_id = row[0]
+                logger.info("Mémoire %s créée (%s/%s, date=%s).", new_mem_id,
+                            fact['type'], fact['subtype'], fact.get('occurred_at') or "—")
+
+                # 4. Graphe d'intrication : seuls les souvenirs durables le tissent.
+                if _is_entanglement_candidate(fact):
+                    _entangle(cur, tenant_id, agent_id, new_mem_id, fact, embedding)
+
+        conn.commit()
+        if created == 0:
+            logger.info("Événement %s déjà consolidé; ACK sans duplication.", event_id)
+        return True
 
     except Exception as e:
         broken = True

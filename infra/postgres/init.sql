@@ -38,10 +38,19 @@ CREATE TABLE IF NOT EXISTS memories (
     status VARCHAR(20) DEFAULT 'active', -- active, archived, disputed
     version INTEGER DEFAULT 1,
     provenance JSONB DEFAULT '{}'::jsonb,
-    source_event_id UUID
+    source_event_id UUID,
+    -- Date à laquelle le FAIT s'est produit, résolue à l'extraction (« yesterday » ->
+    -- date absolue). À distinguer de created_at, qui date l'écriture de la ligne.
+    occurred_at TIMESTAMP WITH TIME ZONE,
+    -- SHA256 du contenu : discrimine les faits multiples issus d'un même événement.
+    content_hash VARCHAR(64)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_source_event
-    ON memories(source_event_id) WHERE source_event_id IS NOT NULL;
+-- Un événement peut produire PLUSIEURS faits ; le replay du même événement reste
+-- dédupliqué car les mêmes faits produisent les mêmes hachages (idempotence).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_event_fact
+    ON memories(source_event_id, content_hash) WHERE source_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memories_occurred
+    ON memories(tenant_id, agent_id, occurred_at) WHERE occurred_at IS NOT NULL;
 ALTER TABLE memories ADD CONSTRAINT fk_memories_source_event
     FOREIGN KEY (source_event_id) REFERENCES events(id) ON DELETE SET NULL;
 
@@ -54,6 +63,14 @@ CREATE INDEX IF NOT EXISTS idx_memories_embedding_hnsw
 
 -- Index B-tree pour le filtrage (tenant/agent/type/status) appliqué avant/avec la recherche vectorielle.
 CREATE INDEX IF NOT EXISTS idx_memories_lookup ON memories(tenant_id, agent_id, type, status);
+
+-- Recherche hybride : le plein texte rattrape les correspondances LITTÉRALES (noms propres,
+-- dates, identifiants) que la similarité vectorielle manque. Config 'simple' car le corpus
+-- d'une instance est souvent multilingue et l'on cherche ici l'exactitude, pas la
+-- généralisation (déjà couverte par le vecteur).
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS content_tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('simple', coalesce(content, ''))) STORED;
+CREATE INDEX IF NOT EXISTS idx_memories_content_tsv ON memories USING GIN (content_tsv);
 
 -- Table des clés API (auth + scoping multi-tenant, Phase 3)
 CREATE TABLE IF NOT EXISTS api_keys (

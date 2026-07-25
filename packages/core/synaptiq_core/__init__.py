@@ -17,9 +17,15 @@ from synaptiq_core.qem import (
     compute_recency_factor,
     estimate_tokens,
     filter_redundancy,
+    format_entry,
     initial_score,
     propagate_entanglement,
     route_memory,
+)
+from synaptiq_core.retrieval import (
+    DEFAULT_RRF_K,
+    fuse_and_rank,
+    reciprocal_rank_fusion,
 )
 
 __all__ = [
@@ -41,4 +47,9 @@ __all__ = [
     "collapse_by_utility",
     "route_memory",
     "estimate_tokens",
+    "format_entry",
+    # Recherche hybride : fusion de classements (vectoriel + plein texte)
+    "reciprocal_rank_fusion",
+    "fuse_and_rank",
+    "DEFAULT_RRF_K",
 ]

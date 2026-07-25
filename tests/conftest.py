@@ -20,3 +20,23 @@ def pytest_collection_modifyitems(config, items):
         path = str(item.fspath).replace("\\", "/")
         if "/tests/unit/" not in path:
             item.add_marker(pytest.mark.integration)
+
+
+def purge_tenants(conn, *tenants: str) -> None:
+    """Vide les données des tenants indiqués, et EUX SEULS.
+
+    Les tests d'intégration faisaient auparavant `TRUNCATE TABLE memories/events CASCADE`,
+    qui efface TOUTE la base : lancer la suite sur une instance contenant des données
+    réelles les détruisait sans avertissement (corpus de benchmark, données de démo…).
+    Comme la base de développement est souvent aussi celle qui sert aux essais, le nettoyage
+    est désormais borné au périmètre du test.
+
+    `relationships` n'a pas de `tenant_id` : ses lignes partent en cascade avec les mémoires
+    (`ON DELETE CASCADE`). Les mémoires sont supprimées avant les événements, faute de quoi
+    `memories.source_event_id` serait simplement mis à NULL et les mémoires subsisteraient.
+    """
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM memories WHERE tenant_id = ANY(%s)", (list(tenants),))
+        cur.execute("DELETE FROM events WHERE tenant_id = ANY(%s)", (list(tenants),))
+        cur.execute("DELETE FROM api_keys WHERE tenant_id = ANY(%s)", (list(tenants),))
+        conn.commit()

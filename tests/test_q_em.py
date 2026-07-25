@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 # Ajouter les chemins au sys.path pour pouvoir importer les modules
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
+from conftest import purge_tenants  # noqa: E402
+
 from apps.api.main import app as fastapi_app
 from apps.worker.worker import generate_mock_embedding
 
@@ -59,11 +61,9 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
 
     def setUp(self):
         # Nettoyer les tables de test avant chaque test
-        with self.db_conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE relationships CASCADE;")
-            cur.execute("TRUNCATE TABLE memories CASCADE;")
-            cur.execute("TRUNCATE TABLE events CASCADE;")
-            self.db_conn.commit()
+        # Purge bornée au tenant du test : un TRUNCATE global effacerait aussi les
+        # données réelles de l'instance (cf. conftest.purge_tenants).
+        purge_tenants(self.db_conn, "tenant_quantum")
 
     def test_q_em_entanglement_propagation(self):
         """

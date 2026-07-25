@@ -14,6 +14,7 @@ import os
 
 import psycopg2
 import pytest
+from conftest import purge_tenants
 from fastapi.testclient import TestClient
 
 import apps.api.main as main
@@ -49,13 +50,20 @@ def db():
 
 @pytest.fixture(autouse=True)
 def _clean(db):
-    def _truncate():
-        with db.cursor() as cur:
-            cur.execute("TRUNCATE TABLE relationships, memories, events, api_keys CASCADE;")
-            db.commit()
-    _truncate()
+    """Purge bornée aux tenants du test.
+
+    Un TRUNCATE global effacerait aussi les données réelles de l'instance — la base de
+    développement sert souvent aussi aux essais (cf. conftest.purge_tenants).
+    """
+    # Tous les périmètres touchés par ce fichier, y compris ceux créés via des clés API
+    # (`tenantX`/`tenantY`) : en oublier un laisse une clé en base et fait échouer le
+    # run suivant sur la contrainte d'unicité de `key_hash`.
+    def _purge():
+        purge_tenants(db, INSTANCE_TENANT, "autre_tenant", "test_tenant",
+                      "tenantX", "tenantY", "tenant_pirate")
+    _purge()
     yield
-    _truncate()
+    _purge()
 
 
 @pytest.fixture
@@ -123,11 +131,14 @@ def test_body_ne_peut_pas_changer_le_tenant(client, db):
                                           "tenant_id": "tenant_pirate"})
     assert resp.status_code == 200
     assert [m["content"] for m in resp.json()["memories"]] == ["pref de A"]
-    # Confirme que tout est bien stocké sous le tenant d'instance, pas ailleurs.
+    # Confirme que rien n'a été écrit sous le tenant injecté : la vérification porte sur
+    # l'absence du faux tenant, et non sur la liste complète des tenants de la base —
+    # celle-ci contient légitimement d'autres périmètres (la purge est bornée au test).
     with db.cursor() as cur:
-        cur.execute("SELECT DISTINCT tenant_id FROM memories")
-        tenants = [row[0] for row in cur.fetchall()]
-    assert tenants == [INSTANCE_TENANT]
+        cur.execute("SELECT count(*) FROM memories WHERE tenant_id = %s", ("tenant_pirate",))
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT count(*) FROM memories WHERE tenant_id = %s", (INSTANCE_TENANT,))
+        assert cur.fetchone()[0] == 1
 
 
 # ─── 2. Authentification par clé API ─────────────────────────────────────────

@@ -81,6 +81,10 @@ services:
       DATABASE_URL: postgresql://synaptiq:synaptiq_password@postgres:5432/synaptiq_db
       REDIS_URL: redis://redis:6379/0
       EMBEDDING_BASE_URL: http://host.docker.internal:1234/v1
+      # LM Studio (embeddings ET extraction LLM) tourne sur l'hôte : sans cette
+      # surcharge, 'localhost' désignerait le conteneur worker lui-même et
+      # l'extraction retomberait silencieusement sur les heuristiques regex.
+      LLM_BASE_URL: ${LLM_BASE_URL_DOCKER:-http://host.docker.internal:1234/v1}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
