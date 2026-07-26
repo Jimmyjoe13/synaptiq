@@ -32,19 +32,19 @@ export class SynaptiqClient {
   }
 
   capture(agent_id: string, session_id: string, content: string, metadata: Record<string, unknown> = {}, idempotency_key?: string) {
-    return this.post<{ status: string; event_id: string }>("/events", { agent_id, session_id, content, metadata, idempotency_key });
+    return this.post<{ status: string; event_id: string }>("/v1/events", { agent_id, session_id, content, metadata, idempotency_key });
   }
 
   storeMemory(agent_id: string, type: MemoryType, content: string, subtype?: string, confidence = 1, importance = 0.5) {
-    return this.post<{ status: string; memory_id: string }>("/memories", { agent_id, type, content, subtype, confidence, importance });
+    return this.post<{ status: string; memory_id: string }>("/v1/memories", { agent_id, type, content, subtype, confidence, importance });
   }
 
   retrieve(agent_id: string, query: string, limit = 5, memory_type?: MemoryType) {
-    return this.post<{ memories: unknown[] }>("/retrieve", { agent_id, query, limit, memory_type });
+    return this.post<{ memories: unknown[] }>("/v1/retrieve", { agent_id, query, limit, memory_type });
   }
 
   buildContext(agent_id: string, session_id: string, task: string, query: string, options: { maxTokens?: number; memoryTypes?: MemoryType[]; explain?: boolean } = {}) {
-    return this.post<ContextResult>("/context/build", {
+    return this.post<ContextResult>("/v1/context/build", {
       agent_id, session_id, task, query, explain: options.explain ?? false,
       constraints: { max_tokens: options.maxTokens ?? 1200, memory_types: options.memoryTypes ?? ["semantic", "episodic", "procedural", "working"] },
     });

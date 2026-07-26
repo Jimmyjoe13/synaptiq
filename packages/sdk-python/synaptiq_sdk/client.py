@@ -17,7 +17,7 @@ class SynaptiqClient:
         Vérifie l'état des services de SynaptiQ.
         """
         try:
-            response = requests.get(f"{self.base_url}/health", headers=self.headers, timeout=5)
+            response = requests.get(f"{self.base_url}/v1/health", headers=self.headers, timeout=5)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -29,7 +29,7 @@ class SynaptiqClient:
         Enregistre un événement ou une interaction brute dans SynaptiQ.
         Cet événement sera classifié et extrait en arrière-plan de manière asynchrone.
         """
-        url = f"{self.base_url}/events"
+        url = f"{self.base_url}/v1/events"
         payload = {
             "agent_id": agent_id,
             "session_id": session_id,
@@ -49,7 +49,7 @@ class SynaptiqClient:
         """
         Récupère un paquet de contexte structuré et minimaliste pour alimenter le prompt du LLM.
         """
-        url = f"{self.base_url}/context/build"
+        url = f"{self.base_url}/v1/context/build"
         payload = {
             "agent_id": agent_id,
             "session_id": session_id,
@@ -73,7 +73,7 @@ class SynaptiqClient:
         Permet à l'agent IA d'enregistrer de lui-même une information sémantique,
         procédurale ou épisodique dans sa mémoire à long terme.
         """
-        url = f"{self.base_url}/memories"
+        url = f"{self.base_url}/v1/memories"
         payload = {
             "agent_id": agent_id,
             "type": memory_type,
@@ -93,7 +93,7 @@ class SynaptiqClient:
         """
         Permet à l'agent IA de rechercher sémantiquement dans ses souvenirs.
         """
-        url = f"{self.base_url}/retrieve"
+        url = f"{self.base_url}/v1/retrieve"
         payload = {
             "agent_id": agent_id,
             "query": query,
@@ -106,4 +106,3 @@ class SynaptiqClient:
             return response.json()
         except Exception as e:
             raise RuntimeError(f"Échec de la récupération des souvenirs : {e}")
-

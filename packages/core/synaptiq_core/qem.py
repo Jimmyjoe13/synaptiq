@@ -246,7 +246,6 @@ def format_entry(content: str, occurred_at) -> str:
 def collapse_by_utility(
     candidates: Dict[str, dict],
     max_tokens: int,
-    min_score_ratio: float = 0.0,
 ) -> Tuple[Dict[str, list], List[str], int]:
     """Collapse glouton : maximise l'utilité/token sous contrainte `max_tokens`.
 
@@ -258,22 +257,11 @@ def collapse_by_utility(
     `episodic/*` -> episodes, `procedural/coding_best_practices` -> best_practices,
     `procedural/code_error_resolution` -> errors, `procedural/*` -> rules,
     `working/*` -> examples. Le sous-type est propagé dans l'entrée collapsée.
-
-    `min_score_ratio` fixe un PLANCHER DE PERTINENCE relatif au meilleur candidat :
-    tout souvenir sous `ratio * meilleur_score` est écarté, même s'il reste de la place
-    dans le budget. Sans ce plancher, le remplissage glouton absorbait toute la longue
-    traîne d'activations faibles produite par `propagate_entanglement` — mesuré à 2,7x
-    plus de contexte que le top-k vectoriel pour une exactitude identique.
-    Le seuil porte sur le SCORE (pertinence) et non sur la densité score/token, sinon un
-    souvenir très court mais hors sujet resterait prioritaire. 0.0 désactive le plancher.
     """
-    scores = [c['score'] for c in candidates.values() if c['score'] > 0.0]
-    floor = max(scores) * min_score_ratio if (scores and min_score_ratio > 0.0) else 0.0
-
     # Sélection des candidats survivants + densité d'utilité par token.
     collapsed_candidates = []
     for mem_id, c in candidates.items():
-        if c['score'] > 0.0 and c['score'] >= floor:
+        if c['score'] > 0.0:
             entry = format_entry(c['content'], c.get('occurred_at'))
             tokens = estimate_tokens(entry)
             utility_density = c['score'] / tokens

@@ -280,55 +280,16 @@ def test_collapse_routage_par_soustype():
     assert packet["rules"] == []
 
 
-# ─── Plancher de pertinence du collapse ───
+# ─── Selection sous max_tokens ───
 
-def test_plancher_ecarte_la_traine_faible():
-    """Sans plancher, le budget se remplissait d'activations résiduelles sans valeur.
-
-    Mesuré sur LOCOMO : 1347 tokens de contexte contre 499 pour un top-k vectoriel,
-    pour une exactitude identique.
-    """
-    candidates = {
-        "fort": _cand("fort", content="le souvenir pertinent", score=1.0),
-        "moyen": _cand("moyen", content="un souvenir moyennement lie", score=0.4),
-        "traine": _cand("traine", content="bruit ramene par la propagation", score=0.05),
-    }
-    packet, ids, tokens = collapse_by_utility(candidates, max_tokens=10_000, min_score_ratio=0.25)
-
-    assert "fort" in ids and "moyen" in ids
-    assert "traine" not in ids          # 0.05 < 0.25 * 1.0
-    assert all("bruit" not in c for c in packet["facts"])
-
-
-def test_plancher_desactive_par_defaut():
-    """Rétrocompatibilité : sans paramètre, le comportement historique est conservé."""
+def test_collapse_conserve_candidats_sous_max_tokens():
+    """Tant que max_tokens le permet, tous les candidats actifs sont conservés."""
     candidates = {
         "fort": _cand("fort", score=1.0),
         "traine": _cand("traine", score=0.01),
     }
     _, ids, _ = collapse_by_utility(candidates, max_tokens=10_000)
     assert set(ids) == {"fort", "traine"}
-
-
-def test_plancher_conserve_toujours_le_meilleur():
-    """Même à ratio maximal, le meilleur candidat ne peut pas être écarté."""
-    candidates = {"seul": _cand("seul", score=0.001)}
-    _, ids, _ = collapse_by_utility(candidates, max_tokens=10_000, min_score_ratio=1.0)
-    assert ids == ["seul"]
-
-
-def test_plancher_porte_sur_le_score_pas_sur_la_densite():
-    """Un souvenir court mais hors sujet ne doit pas survivre grâce à sa densité.
-
-    `traine` est très courte, donc sa densité score/token est élevée ; c'est bien son
-    score brut qui doit la disqualifier.
-    """
-    candidates = {
-        "fort": _cand("fort", content=" ".join(["mot"] * 50), score=1.0),
-        "traine": _cand("traine", content="bref", score=0.05),
-    }
-    _, ids, _ = collapse_by_utility(candidates, max_tokens=10_000, min_score_ratio=0.25)
-    assert ids == ["fort"]
 
 
 # ─── Datation du contexte ───

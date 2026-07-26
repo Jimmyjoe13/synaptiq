@@ -31,7 +31,7 @@ def store_memory(content: str, memory_type: str, subtype: Optional[str] = None, 
         subtype: Precision optionnelle (ex: 'preference', 'rule', 'error_resolution').
         agent_id: Identifiant de l'agent qui ecrit (default: 'qwen_code_agent').
     """
-    url = f"{SYNAPTIQ_API_URL}/memories"
+    url = f"{SYNAPTIQ_API_URL}/v1/memories"
     payload = {
         "agent_id": agent_id,
         "type": memory_type,
@@ -59,7 +59,7 @@ def recall_memories(query: str, limit: int = 5, memory_type: Optional[str] = Non
         memory_type: Filtrer par type de memoire ('semantic', 'procedural', 'episodic').
         agent_id: Identifiant de l'agent.
     """
-    url = f"{SYNAPTIQ_API_URL}/retrieve"
+    url = f"{SYNAPTIQ_API_URL}/v1/retrieve"
     payload = {
         "agent_id": agent_id,
         "query": query,
@@ -95,7 +95,7 @@ def build_context(task: str, query: str, max_tokens: int = 1200,
         max_tokens: Budget de tokens du contexte (default: 1200).
         agent_id: Identifiant de l'agent.
     """
-    url = f"{SYNAPTIQ_API_URL}/context/build"
+    url = f"{SYNAPTIQ_API_URL}/v1/context/build"
     payload = {
         "agent_id": agent_id,
         "session_id": "mcp-session",
@@ -124,8 +124,6 @@ def build_context(task: str, query: str, max_tokens: int = 1200,
 
 
 if __name__ == "__main__":
-    # Transport configurable : stdio par défaut (Claude Desktop / Cursor),
-    # sse / streamable-http pour un déploiement conteneurisé joignable en réseau.
     transport = os.getenv("MCP_TRANSPORT", "stdio")
     if transport != "stdio" and not SYNAPTIQ_API_KEY:
         raise RuntimeError("SYNAPTIQ_API_KEY est obligatoire pour exposer MCP en réseau.")

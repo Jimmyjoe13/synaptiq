@@ -14,8 +14,10 @@ import time
 from contextlib import contextmanager, asynccontextmanager
 from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Depends, Header, Response
+from fastapi import FastAPI, HTTPException, Depends, Header, Response, APIRouter
 from pydantic import BaseModel, Field
+
+v1_router = APIRouter()
 from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor
 import redis
@@ -67,12 +69,6 @@ QEM_REDUNDANCY_THRESHOLD = float(os.getenv("QEM_REDUNDANCY_THRESHOLD", "0.75"))
 # Décroissance temporelle : demi-vie (en jours) du score de récence. Une mémoire non
 # ré-accédée voit sa pertinence divisée par 2 tous les N jours. 0 (ou négatif) = désactivé.
 QEM_RECENCY_HALFLIFE_DAYS = float(os.getenv("QEM_RECENCY_HALFLIFE_DAYS", "90"))
-# Plancher de pertinence du collapse, relatif au meilleur candidat : un souvenir dont le
-# score est sous `ratio * meilleur` est écarté même s'il reste du budget. Sans lui, le
-# remplissage glouton absorbait la longue traîne d'activations faibles (mesuré à 2,7x plus
-# de contexte que le top-k vectoriel, sans gain d'exactitude). 0 = désactivé.
-QEM_MIN_SCORE_RATIO = float(os.getenv("QEM_MIN_SCORE_RATIO", "0.25"))
-
 # ─── Recherche hybride (vectoriel + plein texte) ───
 # Le vecteur ramène le « sémantiquement proche », le plein texte les correspondances
 # littérales (noms propres, dates, identifiants). Désactivable pour mesurer son apport.
@@ -171,7 +167,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
 # ─── Authentification par clé API + scoping tenant ───
-AUTH_REQUIRED = os.getenv("SYNAPTIQ_AUTH_REQUIRED", "false").lower() in ("1", "true", "yes")
+AUTH_REQUIRED = os.getenv("SYNAPTIQ_AUTH_REQUIRED", "true").lower() in ("1", "true", "yes")
 
 
 def _instance_tenant() -> str:
@@ -340,7 +336,7 @@ class ContextRequest(BaseModel):
     constraints: ContextConstraints = Field(default_factory=ContextConstraints)
     explain: bool = False
 
-@app.get("/health")
+@v1_router.get("/health")
 def health_check():
     db_status = "healthy"
     redis_status = "healthy"
@@ -372,7 +368,7 @@ def metrics() -> Response:
     """Prometheus metrics. The reference Compose profile binds this endpoint to localhost."""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-@app.post("/events", status_code=201)
+@v1_router.post("/events", status_code=201)
 def capture_event(event: EventInput, auth: Optional[AuthContext] = Depends(get_auth)):
     """
     Enregistre un événement brut et le publie dans le stream Redis (traitement asynchrone).
@@ -429,7 +425,7 @@ def capture_event(event: EventInput, auth: Optional[AuthContext] = Depends(get_a
         logger.error(f"Erreur lors de la capture de l'événement : {e}")
         raise HTTPException(status_code=500, detail="Erreur interne du serveur.")
 
-@app.post("/context/build")
+@v1_router.post("/context/build")
 def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends(get_auth)):
     """
     Assemble un paquet de contexte compact pour le LLM en fonction de la tâche.
@@ -579,10 +575,9 @@ def build_context(request: ContextRequest, auth: Optional[AuthContext] = Depends
             #    B. Redondances sémantiques (cosinus des embeddings > seuil)
             filter_redundancy(candidates, QEM_REDUNDANCY_THRESHOLD)
 
-            # 6. Mesure : collapse glouton par densité d'utilité/token + routage 7 clés,
-            #    sous plancher de pertinence (évite de remplir le budget avec du bruit).
+            # 6. Mesure : collapse glouton par densité d'utilité/token + routage 7 clés.
             context_packet, selected_ids, token_count = collapse_by_utility(
-                candidates, request.constraints.max_tokens, QEM_MIN_SCORE_RATIO
+                candidates, request.constraints.max_tokens
             )
             max_tokens = request.constraints.max_tokens
 
@@ -638,7 +633,7 @@ class MemoryInput(BaseModel):
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     importance: float = Field(default=0.5, ge=0.0, le=1.0)
 
-@app.post("/memories", status_code=201)
+@v1_router.post("/memories", status_code=201)
 def create_memory(memory: MemoryInput, auth: Optional[AuthContext] = Depends(get_auth)):
     """
     Permet à un agent IA d'enregistrer directement un souvenir consolidé.
@@ -697,7 +692,7 @@ class RetrieveRequest(BaseModel):
     limit: int = Field(default=5, ge=1, le=100)
     memory_type: Optional[MemoryType] = None
 
-@app.post("/retrieve")
+@v1_router.post("/retrieve")
 def retrieve_memories(request: RetrieveRequest, auth: Optional[AuthContext] = Depends(get_auth)):
     """
     Recherche HYBRIDE : similarité vectorielle (pgvector) fusionnée par RRF avec une
@@ -788,7 +783,7 @@ def retrieve_memories(request: RetrieveRequest, auth: Optional[AuthContext] = De
         db_pool.putconn(conn)
 
 
-@app.delete("/memories")
+@v1_router.delete("/memories")
 def purge_memories(
     agent_id: Optional[str] = None,
     auth: Optional[AuthContext] = Depends(get_auth),
@@ -832,4 +827,9 @@ def purge_memories(
         raise HTTPException(status_code=500, detail="Erreur interne du serveur.")
     finally:
         db_pool.putconn(conn)
+
+
+app.include_router(v1_router, prefix="/v1", tags=["v1"])
+app.include_router(v1_router, include_in_schema=False)
+
 

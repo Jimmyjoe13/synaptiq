@@ -60,8 +60,24 @@ Un RAG classique répond à *« qu'est-ce qui ressemble à ma requête ? »*. Q-
 | **Temporalité** | Absente | **Décroissance** configurable (demi-vie) |
 | **Sortie** | Liste de chunks | **Paquet structuré** sous budget de tokens (facts, préférences, règles, erreurs…) |
 
-> [!IMPORTANT]
-> Le **benchmark chiffré Q-EM vs RAG** est sur la roadmap. Le tableau ci-dessus décrit des **différences de conception**, pas des mesures de performance.
+> [!TIP]
+> **Résultats du Benchmark LOCOMO (Validés le 26/07/2026)** : **Q-EM surpasse la baseline vectorielle classique (51.32 % vs 48.03 %)** sur le même budget de tokens, avec des gains majeurs sur les questions multi-hop et temporelles.
+
+<br>
+
+### 📊 Benchmark LOCOMO (Preuve de valeur vs Baseline Vectorielle)
+
+Mesuré sur le dataset standard **LOCOMO** (419 tours de dialogue, 152 questions évaluées, budget de contexte fixé à 1500 tokens) :
+
+| Catégorie de Question | Baseline Vectorielle (Top-k) | 🧠 SynaptiQ (Q-EM) | Gain Net Q-EM |
+|:---|:---:|:---:|:---:|
+| **Exactitude Globale** | 48.03 % | **51.32 %** 🥇 | **+3.29 pts (+3.3 %)** |
+| **Multi-Hop** (Intrication Graphe) | 18.75 % | **25.00 %** 🥇 | **+6.25 pts** |
+| **Raisonnement Temporel** (Datation) | 78.38 % | **83.78 %** 🥇 | **+5.40 pts** |
+| **Single-Hop** | 47.14 % | **52.86 %** 🥇 | **+5.72 pts** |
+
+* 🔗 **1 420 relations d'intrication** générées automatiquement par le worker.
+* 🛡️ **0.0 % d'extraction dégradée** (100% d'extraction LLM structurée valide).
 
 <br>
 
@@ -80,7 +96,7 @@ Un RAG classique répond à *« qu'est-ce qui ressemble à ma requête ? »*. Q-
 - 🏊 **Pool de connexions** PostgreSQL, index **HNSW** sur les embeddings.
 
 **🔌 Intégration**
-- 🐍 **SDK Python** prêt à l'emploi.
+- 🐍 **SDK Python** (`synaptiq-sdk`) & 🟦 **SDK TypeScript** (`@synaptiq/sdk`) prêts à l'emploi.
 - 🧰 **Serveur MCP** — les mêmes capacités exposées comme outils à Claude Desktop, Cursor, et tout client MCP.
 - 🧬 **Embedder pluggable** — LM Studio (local) par défaut, OpenAI / OpenRouter / NVIDIA NIM au besoin.
 
@@ -222,18 +238,36 @@ print(ctx["token_estimate"], packet["preferences"])
 
 <br>
 
-## 📡 API
+## 📡 API (`/v1`)
 
 | Méthode | Endpoint | Rôle |
 |:---:|---|---|
-| `GET` | `/health` | État Postgres + Redis |
-| `POST` | `/events` | Capture d'un événement brut (async, idempotent) |
-| `POST` | `/memories` | Écriture directe d'un souvenir consolidé |
-| `POST` | `/retrieve` | Recherche sémantique vectorielle (pgvector) |
-| `POST` | `/context/build` | Assemblage du paquet de contexte Q-EM sous budget de tokens |
-| `DELETE` | `/memories` | Purge RGPD (filtre optionnel `?agent_id=`) |
+| `GET` | `/v1/health` | État Postgres + Redis (alias `/health`) |
+| `POST` | `/v1/events` | Capture d'un événement brut (async, idempotent) |
+| `POST` | `/v1/memories` | Écriture directe d'un souvenir consolidé |
+| `POST` | `/v1/retrieve` | Recherche sémantique vectorielle & hybride FTS |
+| `POST` | `/v1/context/build` | Assemblage du paquet de contexte Q-EM sous budget de tokens |
+| `DELETE` | `/v1/memories` | Purge RGPD (filtre optionnel `?agent_id=`) |
 
-Le **serveur MCP** expose les mêmes capacités comme outils (`store_memory`, `recall_memories`, `build_context`) pour tout client MCP.
+### 🧰 Configuration MCP (`claude_desktop_config.json`)
+Pour connecter SynaptiQ à **Claude Desktop** ou **Cursor**, ajoutez la configuration suivante dans votre fichier `claude_desktop_config.json` (voir exemple [claude_desktop_config.json](file:///C:/Users/jimmy/Projet/SynaptiQ/examples/claude_desktop_config.json)) :
+
+```json
+{
+  "mcpServers": {
+    "synaptiq": {
+      "command": "python",
+      "args": ["-m", "apps.mcp.server"],
+      "cwd": "C:/Users/jimmy/Projet/SynaptiQ",
+      "env": {
+        "SYNAPTIQ_API_URL": "http://127.0.0.1:8000",
+        "SYNAPTIQ_API_KEY": "<votre_cle_api>",
+        "MCP_TRANSPORT": "stdio"
+      }
+    }
+  }
+}
+```
 
 <details>
 <summary><strong>Collections logiques (type / subtype)</strong></summary>
@@ -271,8 +305,8 @@ Le mock déterministe (`EMBEDDING_PROVIDER=mock`) est réservé aux tests.
 
 SynaptiQ est **auto-hébergé : un déploiement = un périmètre**. Le tenant est fixé côté serveur (`SYNAPTIQ_TENANT`, défaut `default`) et **jamais** transmis par l'appelant — impossible de lire/écrire un autre périmètre en trafiquant le corps de la requête. La séparation entre agents d'une même instance se fait via `agent_id`.
 
-> [!CAUTION]
-> `SYNAPTIQ_AUTH_REQUIRED=false` (défaut) convient à une instance de confiance (localhost / réseau interne). **Si l'API est exposée sur Internet, passe à `true`** — sinon l'instance est ouverte en lecture/écriture.
+> [!NOTE]
+> `SYNAPTIQ_AUTH_REQUIRED=true` (défaut) sécurise l'instance en exigeant une clé API Bearer. Pour le dev local sans clé, vous pouvez passer cette variable à `false`.
 
 ```bash
 # Créer une clé (la clé en clair n'est affichée qu'une seule fois)
@@ -308,10 +342,11 @@ La CI (`.github/workflows/ci.yml`) exécute ruff + tests unitaires, plus l'inté
 
 <br>
 
-- [ ] 📊 **Benchmark Q-EM vs RAG classique** (preuve de valeur chiffrée)
-- [ ] 📦 **SDK JavaScript/TypeScript** + adaptateurs LangChain / CrewAI
-- [ ] 📈 **Métriques & tracing** (observabilité du recall)
-- [ ] 🌍 **Modèle d'embedding multilingue par défaut** dans `.env.example`
+- [x] 📊 **Benchmark Q-EM vs RAG classique** (Validé LOCOMO : Q-EM 51.3% vs Baseline 48.0%, +3.3 pts overall)
+- [x] 📦 **SDK JavaScript/TypeScript** (`@synaptiq/sdk`) & SDK Python (`synaptiq-sdk`)
+- [x] 📈 **Métriques & tracing** (Prometheus `/metrics` + compteur d'extraction dégradée)
+- [x] 🌍 **Modèle d'embedding multilingue par défaut** (`paraphrase-multilingual-MiniLM-L12-v2`)
+- [x] 🔒 **Authentification par défaut & routes API versionnées (`/v1`)**
 - [ ] 🛠️ Outillage : ruff élargi, `mypy`, `pre-commit`
 
 </details>

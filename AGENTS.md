@@ -11,4 +11,4 @@ Ce document répertorie l'ensemble des agents virtuels créés et mobilisés pou
 | **Agent_Developpeur_Backend** | Développement backend Python, gestion des dépendances et résolution d'imports. | Programmation Python, FastAPI, gestion des environnements et modularité. | Actif (Créé le 08/07/2026) |
 
 ---
-*Note : Ce fichier est mis à jour périodiquement lors du recrutement de nouveaux agents spécialisés ou de l'évolution de leurs rôles.*
+*Note : Mis à jour le 26/07/2026 suite à la reprise du projet (Audit complet, validation environnement, suppression QEM_MIN_SCORE_RATIO, métrique Prometheus, hardening sécurité SYNAPTIQ_AUTH_REQUIRED=true, versioning routes /v1 et révision README/MCP).*

@@ -10,6 +10,7 @@ from psycopg2 import pool as pg_pool
 import redis
 import requests
 from dotenv import load_dotenv
+from prometheus_client import Counter
 
 # Rendre le package partagé packages/core importable (dev local hors conteneur)
 _root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -23,6 +24,11 @@ from synaptiq_core.embeddings import generate_mock_embedding  # noqa: F401 (comp
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("synaptiq-worker")
+
+EXTRACTION_DEGRADED_COUNTER = Counter(
+    "synaptiq_extraction_degraded_total",
+    "Nombre d'extractions de mémoire ayant replié sur les heuristiques regex suite à un échec LLM",
+)
 
 # Chargement des variables d'environnement depuis le .env RACINE (source unique)
 load_dotenv(os.path.join(_root, ".env"))
@@ -399,6 +405,7 @@ def call_llm_extractor(event_content: str, occurred_at: str | None = None) -> li
         return faits
     except Exception as e:
         logger.error("Échec de l'extraction LLM : %s. Repli sur les heuristiques regex.", e)
+        EXTRACTION_DEGRADED_COUNTER.inc()
         return [_heuristic_extract(event_content)]
 
 
