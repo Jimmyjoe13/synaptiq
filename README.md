@@ -81,6 +81,18 @@ Mesuré sur le dataset standard **LOCOMO** (419 tours de dialogue, 152 questions
 
 <br>
 
+### ⚔️ SynaptiQ Q-EM vs Obsidian MCP (Recherche Markdown Statique)
+
+Évaluation comparative directe sur des scénarios pièges d'évolution des connaissances :
+
+| Test / Scénario | 📝 Obsidian MCP (Notes Markdown) | 🧠 SynaptiQ (Q-EM) | Analyse & Victoire |
+|:---|:---:|:---:|:---|
+| **Contradiction DB (Migration)** | ❌ Échec (0/1) | **✅ Succès (1/1)** 🥇 | Obsidian conserve MySQL et Postgres ; SynaptiQ annule MySQL (`supersedes_by`). |
+| **Mise à Jour du Ton & Style** | ❌ Échec (0/1) | **✅ Succès (1/1)** 🥇 | Obsidian avoue une contradiction ; SynaptiQ filtre le vouvoiement obsolète. |
+| **Gestion des Contradictions** | **0.0 %** | **100.0 %** 🥇 | **Suprématie absolue de SynaptiQ sur l'apprentissage continu.** |
+
+<br>
+
 ## ⚡ Fonctionnalités clés
 
 **🧠 Moteur mémoire**

@@ -1,0 +1,111 @@
+{
+  "benchmark_name": "SynaptiQ Q-EM vs Obsidian MCP Benchmark",
+  "description": "Évaluation comparative entre le moteur SynaptiQ Q-EM et une approche Obsidian MCP classique (fichiers Markdown / Cosinus brut)",
+  "scenarios": [
+    {
+      "id": "scenario_1_contradiction_db",
+      "category": "contradiction_resolution",
+      "title": "Résolution de contradiction sur la base de données",
+      "events": [
+        {
+          "id": "00000000-0000-0000-0000-000000000001",
+          "timestamp": "2026-07-01T10:00:00Z",
+          "content": "Pour le stockage du projet SynaptiQ, nous utilisons la base MySQL 8.0 avec l'ORM SQLAlchemy."
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000002",
+          "timestamp": "2026-07-15T14:30:00Z",
+          "content": "Décision d'architecture majeure : Nous abandonnons MySQL et migrons exclusivement sur PostgreSQL 16 avec l'extension pgvector pour la mémoire vectorielle."
+        }
+      ],
+      "question": "Quelle base de données est actuellement utilisée par SynaptiQ ?",
+      "gold_answer": "PostgreSQL 16 avec pgvector (MySQL a été abandonné lors de la migration du 15 juillet)."
+    },
+    {
+      "id": "scenario_2_contradiction_style",
+      "category": "contradiction_resolution",
+      "title": "Mise à jour des règles de ton et style d'agent",
+      "events": [
+        {
+          "id": "00000000-0000-0000-0000-000000000003",
+          "timestamp": "2026-07-05T09:00:00Z",
+          "content": "Règle de communication : L'agent doit toujours s'exprimer en français très formel et vouvoyer l'utilisateur dans toutes ses réponses."
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000004",
+          "timestamp": "2026-07-20T16:00:00Z",
+          "content": "Mise à jour de la charte : L'agent doit désormais tutoyer l'utilisateur et adopter un ton direct, concis et technique sans fioritures."
+        }
+      ],
+      "question": "Quel est le ton et le style de communication requis pour l'agent ?",
+      "gold_answer": "Tutoyer l'utilisateur avec un ton direct, concis et technique."
+    },
+    {
+      "id": "scenario_3_multihop_error",
+      "category": "multi_hop_entanglement",
+      "title": "Résolution de panne par intrication de faits distants",
+      "events": [
+        {
+          "id": "00000000-0000-0000-0000-000000000005",
+          "timestamp": "2026-07-10T11:00:00Z",
+          "content": "Le worker de SynaptiQ consomme la file d'attente Redis Streams 'synaptiq:events' pour extraire les mémoires."
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000006",
+          "timestamp": "2026-07-12T15:00:00Z",
+          "content": "Lorsque la mémoire RAM du serveur dépasse 90%, le serveur Redis rejette toutes les écritures avec l'erreur 'OOM command not allowed'."
+        }
+      ],
+      "question": "Pourquoi la consolidation des événements par le worker s'arrête-t-elle lors des pics de RAM du serveur ?",
+      "gold_answer": "Car Redis bloque les opérations d'écriture Streams avec l'erreur OOM dès que la RAM dépasse 90%."
+    },
+    {
+      "id": "scenario_4_multihop_location",
+      "category": "multi_hop_entanglement",
+      "title": "Liaison d'informations personnelles sans lien écrit manuel",
+      "events": [
+        {
+          "id": "00000000-0000-0000-0000-000000000007",
+          "timestamp": "2026-07-02T08:30:00Z",
+          "content": "Caroline s'est inscrite au club de poterie du quartier de la Guillotière à Lyon."
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000008",
+          "timestamp": "2026-07-18T17:00:00Z",
+          "content": "Le club de poterie de la Guillotière se réunit tous les samedis après-midi au 12 rue Mazenod."
+        }
+      ],
+      "question": "Où et quand Caroline se rend-elle pour son activité de poterie ?",
+      "gold_answer": "Au 12 rue Mazenod à la Guillotière (Lyon), les samedis après-midi."
+    },
+    {
+      "id": "scenario_5_budget_density",
+      "category": "budget_density",
+      "title": "Sélection sous budget de tokens strict",
+      "events": [
+        {
+          "id": "00000000-0000-0000-0000-000000000009",
+          "timestamp": "2026-07-01T10:00:00Z",
+          "content": "Discussion générale sur les vacances d'été à la montagne et le choix des chaussures de rando."
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000010",
+          "timestamp": "2026-07-03T11:00:00Z",
+          "content": "Configuration réseau SynaptiQ : L'API FastAPI écoute sur le port 8000, Postgres sur le port 5435 et Redis sur le port 6399."
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000011",
+          "timestamp": "2026-07-04T12:00:00Z",
+          "content": "Remarque informelle : L'équipe apprécie les cafés purs arabica le matin."
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000012",
+          "timestamp": "2026-07-08T14:00:00Z",
+          "content": "Sécurité SynaptiQ : La variable SYNAPTIQ_AUTH_REQUIRED=true exige une clé API Bearer sur chaque requête HTTP."
+        }
+      ],
+      "question": "Quels sont les ports réseau et la variable de sécurité essentiels pour la stack SynaptiQ ?",
+      "gold_answer": "API port 8000, Postgres port 5435, Redis port 6399, et SYNAPTIQ_AUTH_REQUIRED=true pour l'authentification Bearer."
+    }
+  ]
+}
