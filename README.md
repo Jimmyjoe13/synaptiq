@@ -6,10 +6,10 @@
 
 <h1>🧠 SynaptiQ</h1>
 
-<h3><em>Le second cerveau vectoriel des agents IA — mémoire à long terme, sémantique et temporelle.</em></h3>
+<h3><em>The vector second brain for AI agents — long-term, semantic, and temporal memory.</em></h3>
 
 <p>
-  <strong>Q-EM</strong> · <em>Quantum-like Entanglement Memory</em> — une mémoire qui relie les souvenirs par le <strong>sens</strong>, pas par des liens écrits à la main.
+  <strong>Q-EM</strong> · <em>Quantum-like Entanglement Memory</em> — a memory engine that connects memories by <strong>meaning</strong>, not manually written wikilinks.
 </p>
 
 <p>
@@ -25,244 +25,265 @@
 </p>
 
 <p>
-  <a href="#-pourquoi-q-em">Pourquoi Q-EM</a> ·
-  <a href="#-fonctionnalités-clés">Fonctionnalités</a> ·
+  <a href="#-why-q-em">Why Q-EM</a> ·
+  <a href="#-key-features">Key Features</a> ·
   <a href="#-architecture">Architecture</a> ·
-  <a href="#-démarrage-rapide">Démarrage</a> ·
-  <a href="#-le-moteur-q-em-en-4-phases">Le moteur Q-EM</a> ·
-  <a href="#-sdk-python">SDK</a> ·
-  <a href="#-api">API</a> ·
-  <a href="#-sécurité">Sécurité</a>
+  <a href="#-quickstart">Quickstart</a> ·
+  <a href="#-the-q-em-engine-in-4-phases">Q-EM Engine</a> ·
+  <a href="#-sdk">SDKs</a> ·
+  <a href="#-api-v1">API</a> ·
+  <a href="#-security">Security</a>
 </p>
 
 </div>
 
 ---
 
-**SynaptiQ** est une infrastructure de mémoire à long terme (LTM) pour agents IA autonomes. Au lieu d'un RAG « top-k plat » qui ressort les 5 chunks les plus proches, SynaptiQ **consolide** le flux d'expérience de l'agent, **relie** les souvenirs par intrication sémantique, **élague** les contradictions et les redondances, puis **assemble** un paquet de contexte compact taillé pour ton budget de tokens.
+**SynaptiQ** is a production-grade Long-Term Memory (LTM) infrastructure for autonomous AI agents. Unlike standard "flat top-k" RAG systems that simply retrieve the 5 nearest raw document chunks, SynaptiQ **consolidates** the agent's stream of experience, **entangles** memories semantically, **prunes** contradictions and redundancies, and **assembles** a compact context packet perfectly tailored to your token budget.
 
 > [!NOTE]
-> **Auto-hébergé : 1 déploiement = 1 client.** Le périmètre (tenant) est décidé côté serveur, jamais transmis dans l'appel. Tu gardes tes données chez toi ; l'agent, lui, gagne une mémoire qui apprend de ses erreurs.
+> **Self-hosted: 1 deployment = 1 security perimeter.** The tenant boundary is enforced server-side and never trusted from request payloads. Keep your data on-premise while giving your agents a memory that learns from its mistakes.
 
 <br>
 
-## 💡 Pourquoi Q-EM
+## 💡 Why Q-EM
 
-Un RAG classique répond à *« qu'est-ce qui ressemble à ma requête ? »*. Q-EM répond à *« de quoi l'agent a réellement besoin, maintenant, pour agir sans se répéter ? »*.
+Standard RAG answers: *"Which chunks look similar to my query text?"*  
+Q-EM answers: *"What exact context does the agent actually need right now to act without repeating itself?"*
 
-| | 🗂️ RAG classique | 🧠 SynaptiQ (Q-EM) |
+| Feature / Dimension | 🗂️ Standard RAG | 🧠 SynaptiQ (Q-EM) |
 |---|:---|:---|
-| **Unité stockée** | Chunks de documents | Souvenirs consolidés (fait, préférence, règle, erreur…) |
-| **Sélection** | Top-k similarité cosinus | Superposition → **intrication** → interférence → mesure |
-| **Souvenirs liés** | Ignorés s'ils ne matchent pas la requête | **Ramenés par activation** le long des liens `entangled_with` |
-| **Contradictions** | Ressorties telles quelles | **Filtrées** (la version obsolète est annulée) |
-| **Redondances** | Occupent le contexte | **Élaguées** (cosinus > seuil → une seule survit) |
-| **Temporalité** | Absente | **Décroissance** configurable (demi-vie) |
-| **Sortie** | Liste de chunks | **Paquet structuré** sous budget de tokens (facts, préférences, règles, erreurs…) |
-
-> [!TIP]
-> **Résultats du Benchmark LOCOMO (Validés le 26/07/2026)** : **Q-EM surpasse la baseline vectorielle classique (51.32 % vs 48.03 %)** sur le même budget de tokens, avec des gains majeurs sur les questions multi-hop et temporelles.
+| **Stored Unit** | Raw document chunks | Consolidated memories (facts, preferences, rules, errors…) |
+| **Selection Algorithm** | Top-k cosine similarity | Superposition → **entanglement** → interference → measurement |
+| **Related Memories** | Ignored if they don't match query text | **Retrieved via activation** along `entangled_with` graph edges |
+| **Contradictions** | Returned side-by-side | **Filtered out** (obsolete versions are superseded) |
+| **Redundancies** | Fill up context budget | **Pruned** (cosine > threshold → only one survives) |
+| **Temporality** | Missing or naive | Configurable **temporal decay** (half-life, recency boost) |
+| **Output** | Unstructured list of chunks | **Structured packet** under token budget (facts, preferences, rules, errors…) |
 
 <br>
 
-### 📊 Benchmark LOCOMO (Preuve de valeur vs Baseline Vectorielle)
+### 📊 LOCOMO Benchmark (Proof of Value vs Vector Baseline)
 
-Mesuré sur le dataset standard **LOCOMO** (419 tours de dialogue, 152 questions évaluées, budget de contexte fixé à 1500 tokens) :
+Validated on the benchmark dataset **LOCOMO** (419 dialogue turns, 152 evaluated questions, fixed context budget of 1500 tokens):
 
-| Catégorie de Question | Baseline Vectorielle (Top-k) | 🧠 SynaptiQ (Q-EM) | Gain Net Q-EM |
+| Question Category | Standard Vector Baseline (Top-k) | 🧠 SynaptiQ (Q-EM) | Net Gain (Q-EM) |
 |:---|:---:|:---:|:---:|
-| **Exactitude Globale** | 48.03 % | **51.32 %** 🥇 | **+3.29 pts (+3.3 %)** |
-| **Multi-Hop** (Intrication Graphe) | 18.75 % | **25.00 %** 🥇 | **+6.25 pts** |
-| **Raisonnement Temporel** (Datation) | 78.38 % | **83.78 %** 🥇 | **+5.40 pts** |
-| **Single-Hop** | 47.14 % | **52.86 %** 🥇 | **+5.72 pts** |
+| **Overall Accuracy** | 48.03 % | **51.32 %** 🥇 | **+3.29 pts (+3.3 %)** |
+| **Multi-Hop Questions** (Graph Entanglement) | 18.75 % | **25.00 %** 🥇 | **+6.25 pts** |
+| **Temporal Reasoning** (Timestamping) | 78.38 % | **83.78 %** 🥇 | **+5.40 pts** |
+| **Single-Hop Questions** | 47.14 % | **52.86 %** 🥇 | **+5.72 pts** |
 
-* 🔗 **1 420 relations d'intrication** générées automatiquement par le worker.
-* 🛡️ **0.0 % d'extraction dégradée** (100% d'extraction LLM structurée valide).
+* 🔗 **1,420 entanglement relations** automatically generated by the background worker.
+* 🛡️ **0.0% degraded extractions** (100% valid structured LLM memory extractions).
 
 <br>
 
-### ⚔️ SynaptiQ Q-EM vs Obsidian MCP (Recherche Markdown Statique)
+### ⚔️ SynaptiQ Q-EM vs Obsidian MCP (Static Markdown Search)
 
-Évaluation comparative directe sur des scénarios pièges d'évolution des connaissances :
+Comparative evaluation on knowledge evolution & contradiction resolution scenarios:
 
-| Test / Scénario | 📝 Obsidian MCP (Notes Markdown) | 🧠 SynaptiQ (Q-EM) | Analyse & Victoire |
+| Test / Scenario | 📝 Obsidian MCP (Markdown Notes) | 🧠 SynaptiQ (Q-EM) | Analysis & Victory |
 |:---|:---:|:---:|:---|
-| **Contradiction DB (Migration)** | ❌ Échec (0/1) | **✅ Succès (1/1)** 🥇 | Obsidian conserve MySQL et Postgres ; SynaptiQ annule MySQL (`supersedes_by`). |
-| **Mise à Jour du Ton & Style** | ❌ Échec (0/1) | **✅ Succès (1/1)** 🥇 | Obsidian avoue une contradiction ; SynaptiQ filtre le vouvoiement obsolète. |
-| **Gestion des Contradictions** | **0.0 %** | **100.0 %** 🥇 | **Suprématie absolue de SynaptiQ sur l'apprentissage continu.** |
+| **DB Migration Contradiction** | ❌ Failed (0/1) | **✅ Passed (1/1)** 🥇 | Obsidian keeps MySQL & Postgres; SynaptiQ supersedes MySQL (`supersedes_by`). |
+| **Style & Tone Rule Update** | ❌ Failed (0/1) | **✅ Passed (1/1)** 🥇 | Obsidian outputs contradictory advice; SynaptiQ filters out obsolete rules. |
+| **Contradiction Resolution Rate** | **0.0 %** | **100.0 %** 🥇 | **Absolute supremacy of SynaptiQ on continuous learning.** |
 
 <br>
 
-## ⚡ Fonctionnalités clés
+## ⚡ Key Features
 
-**🧠 Moteur mémoire**
-- 🌌 **Q-EM** — superposition sémantique, intrication conceptuelle, interférence destructive, collapse par densité d'utilité/token.
-- 🔗 **Intrication automatique** — le worker crée les liens `entangled_with` / `supersedes_by` / `contradicts` sans intervention manuelle.
-- ⏳ **Décroissance temporelle** — les souvenirs non ré-accédés perdent en pertinence (demi-vie configurable), réactivés à chaque accès.
-- 🗃️ **Collections logiques** — routage automatique par `type`/`subtype` : faits, préférences, règles, bonnes pratiques, résolutions d'erreurs, épisodes.
+**🧠 Memory Engine**
+- 🌌 **Q-EM Core** — semantic superposition, concept entanglement, destructive interference, greedy collapse by utility density.
+- 🔗 **Automatic Entanglement** — worker automatically builds `entangled_with`, `supersedes_by`, and `contradicts` edges.
+- ⏳ **Temporal Decay** — unaccessed memories decay over time (configurable half-life) and reactivate upon retrieval.
+- 🗃️ **Logical Collections** — automatic routing by `type`/`subtype`: facts, preferences, rules, coding best practices, error resolutions, episodes.
 
-**🛰️ Pipeline & fiabilité**
-- 📡 **Capture asynchrone** — Redis Streams (consumer group, ACK, retry borné, dead-letter queue) : zéro latence côté agent.
-- 🧩 **Extraction LLM structurée** — classification des souvenirs en JSON validé, avec fallback regex.
-- 🪪 **Idempotence** — `idempotency_key` : deux fois le même événement = un seul souvenir.
-- 🏊 **Pool de connexions** PostgreSQL, index **HNSW** sur les embeddings.
+**🛰️ Pipeline & Reliability**
+- 📡 **Asynchronous Ingestion** — Redis Streams (consumer groups, ACK, bounded retries, dead-letter queue): zero latency for the calling agent.
+- 🧩 **Structured LLM Extraction** — memory classification into validated JSON schemas, with regex fallback heuristics.
+- 🪪 **Idempotency** — `idempotency_key`: submitting the same event twice results in a single consolidated memory.
+- 🏊 **PostgreSQL Connection Pooling** & **HNSW Indexing** for ultra-fast vector search.
 
-**🔌 Intégration**
-- 🐍 **SDK Python** (`synaptiq-sdk`) & 🟦 **SDK TypeScript** (`@synaptiq/sdk`) prêts à l'emploi.
-- 🧰 **Serveur MCP** — les mêmes capacités exposées comme outils à Claude Desktop, Cursor, et tout client MCP.
-- 🧬 **Embedder pluggable** — LM Studio (local) par défaut, OpenAI / OpenRouter / NVIDIA NIM au besoin.
+**🔌 Integrations**
+- 🐍 **Python SDK** (`synaptiq-sdk`) & 🟦 **TypeScript SDK** (`@synaptiq/sdk`) out of the box.
+- 🧰 **MCP Server** — native FastMCP tools (`store_memory`, `recall_memories`, `build_context`) for Claude Desktop, Cursor, and any MCP client.
+- 🧬 **Pluggable Embeddings** — LM Studio (local) by default, OpenRouter, OpenAI, or NVIDIA NIM on demand.
 
-**🔐 Sécurité**
-- 🏰 **Isolation multi-tenant** décidée côté serveur, auth par clé API optionnelle, rate limiting, CORS, **purge RGPD**.
+**🔐 Security**
+- 🏰 **Multi-Tenant Isolation** enforced server-side, Bearer API key authentication, rate limiting, CORS configuration, **GDPR purge endpoint**.
 
 <br>
 
 ## 🏗️ Architecture
 
-Architecture modulaire asynchrone : l'agent n'attend jamais un traitement lourd, tout est déporté sur le worker.
+Modular async architecture: the agent never waits for heavy processing, all extraction and graph building is offloaded to background workers.
 
 ```mermaid
 graph LR
-    A[🤖 Agent IA] -->|1. events| API[⚙️ API FastAPI]
+    A[🤖 AI Agent] -->|1. events| API[⚙️ FastAPI Server]
     API -->|2. push job| R[(📨 Redis Streams)]
-    R -->|3. pull job| W[🧠 Worker de consolidation]
-    W -->|4. embedding + intrication| DB[(🗄️ PostgreSQL + pgvector)]
+    R -->|3. pull job| W[🧠 Consolidation Worker]
+    W -->|4. embedding + entanglement| DB[(🗄️ PostgreSQL + pgvector)]
     A -->|5. context/build| API
     API -->|6. Q-EM recall| DB
-    DB -->|7. paquet de contexte| API
-    API -->|8. prompt réhydraté| A
+    DB -->|7. context packet| API
+    API -->|8. rehydrated prompt| A
 ```
 
-| Composant | Rôle |
+| Component | Role |
 |---|---|
-| **API** (`apps/api`) | Ingestion (`/events`), recall (`/context/build`, `/retrieve`), écriture directe (`/memories`). |
-| **Worker** (`apps/worker`) | Consomme le stream, classe → embed → intrique les souvenirs. |
-| **Core** (`packages/core`) | Logique partagée : `Embedder` pluggable, gouvernance, cœur Q-EM pur. |
-| **SDK** (`packages/sdk-python`) | Client Python. |
-| **MCP** (`apps/mcp`) | Outils exposés aux agents via Model Context Protocol. |
+| **API** (`apps/api`) | Event ingestion (`/events`), context assembly (`/context/build`, `/retrieve`), direct memory writing (`/memories`). |
+| **Worker** (`apps/worker`) | Consumes stream, classifies → embeds → entangles memories in graph. |
+| **Core** (`packages/core`) | Shared logic: pluggable `Embedder`, governance, pure Q-EM mathematical engine. |
+| **SDKs** (`packages/sdk-python`, `packages/sdk-typescript`) | Native client libraries for Python & TypeScript/JavaScript. |
+| **MCP** (`apps/mcp`) | Exposed tools for AI agents via Model Context Protocol (`stdio` & `http`). |
 
 <br>
 
-## 🚀 Démarrage rapide
+## 🚀 Quickstart
 
-### Prérequis
+### Prerequisites
 - **Docker** & Docker Compose
-- **LM Studio** avec un modèle d'embedding chargé et le serveur local sur `:1234` (voir [Embeddings](#-embeddings))
-- Python **3.11+** (dev hors conteneur uniquement)
+- **LM Studio** (local) or an **OpenRouter / OpenAI API Key** (see [Embeddings](#-embeddings))
+- Python **3.11+** (for non-container local development)
 
-### Option A — Stack complète en Docker (recommandé)
+### Option A — Full Stack via Docker (Recommended)
 
 ```bash
 git clone https://github.com/Jimmyjoe13/synaptiq.git
 cd synaptiq
-cp .env.example .env          # ajuste EMBEDDING_MODEL au nom exact affiché par LM Studio
-docker compose up --build     # Postgres + Redis + API + Worker + MCP
+cp .env.example .env          # Adjust EMBEDDING_PROVIDER & API keys as needed
+docker compose up --build     # Starts Postgres + Redis + API + Worker + MCP
 ```
 
-Quand `synaptiq-api` est `healthy` :
+Once `synaptiq-api` reports `healthy`:
 
 ```bash
-curl http://127.0.0.1:8000/health   # -> {"status":"ok", ...}
+curl http://127.0.0.1:8000/v1/health   # -> {"status":"ok", ...}
 ```
 
-| Service | URL |
+| Service | Endpoint |
 |---|---|
-| API | `http://127.0.0.1:8000` |
+| API (`v1`) | `http://127.0.0.1:8000` |
 | MCP (SSE) | `http://127.0.0.1:8765` |
 | PostgreSQL | `127.0.0.1:5435` |
 | Redis | `127.0.0.1:6399` |
 
-> [!TIP]
-> Depuis un conteneur, LM Studio est joignable via `host.docker.internal:1234` (déjà configuré dans `docker-compose.yml`).
-
 <details>
-<summary><strong>Option B — Dev local (hors conteneur)</strong></summary>
+<summary><strong>Option B — Local Dev (Without Docker Containers for Python)</strong></summary>
 
 <br>
 
 ```bash
-# 1. Infra de données uniquement
+# 1. Start database infrastructure only
 docker compose up -d postgres redis
 
-# 2. Dépendances
+# 2. Install dependencies
 pip install -r requirements-dev.txt
 pip install -e packages/core -e packages/sdk-python
 
-# 3. API (port 8000)
+# 3. Start FastAPI server (port 8000)
 python -m uvicorn apps.api.main:app --reload --port 8000
 
-# 4. Worker de consolidation (autre terminal)
+# 4. Start Consolidation Worker (separate terminal)
 python apps/worker/worker.py
 ```
-
-En local, `EMBEDDING_BASE_URL` pointe vers `http://localhost:1234/v1` (défaut de `.env.example`).
 
 </details>
 
 <br>
 
-## 🌌 Le moteur Q-EM en 4 phases
+## 🌌 The Q-EM Engine in 4 Phases
 
-Une métaphore quantique, une mécanique déterministe. À chaque `/context/build` :
+A quantum-inspired metaphor, a deterministic algorithmic pipeline. On every `/v1/context/build`:
 
 ```
-  1. SUPERPOSITION      Recherche vectorielle (pgvector) → candidats scorés
-        │               score = similarité × facteur_de_récence
+  1. SUPERPOSITION      Vector similarity search (pgvector) → scored memory candidates
+        │               score = cosine_similarity × recency_factor
         ▼
-  2. INTRICATION        Propagation d'activation amortie le long des liens
-        │               'entangled_with' → des souvenirs liés remontent
-        ▼               même sans matcher la requête
-  3. INTERFÉRENCE       Filtrage destructif :
-        │                 • contradictions → la version obsolète est annulée
-        ▼                 • redondances (cosinus > seuil) → une seule survit
-  4. MESURE             Collapse glouton par densité d'utilité/token,
-                        routé vers les 7 collections du paquet de contexte
+  2. ENTANGLEMENT       Damped activation spreading along 'entangled_with' graph edges
+        │               → related memories surface even if they don't match query keywords
+        ▼
+  3. INTERFERENCE       Destructive filtering:
+        │                 • contradictions → obsolete versions are superseded
+        ▼                 • redundancies (cosine > threshold) → only one survives
+  4. MEASUREMENT        Greedy collapse by utility density per token,
+                        routed into the 7 context packet collections
 ```
 
-Le cœur algorithmique vit dans `packages/core/synaptiq_core/qem.py` — **fonctions pures, sans I/O, entièrement testées unitairement**. Les seuils sont externalisés en variables d'environnement (`QEM_ENTANGLE_DAMPING`, `QEM_REDUNDANCY_THRESHOLD`, `QEM_RECENCY_HALFLIFE_DAYS`).
+The algorithmic core lives in `packages/core/synaptiq_core/qem.py` — **pure functions, zero I/O, 100% unit tested**.
 
 <br>
 
-## 🐍 SDK Python
+## 🐍 SDK Usage
+
+### Python (`synaptiq-sdk`)
 
 ```python
 from synaptiq_sdk import SynaptiqClient
 
-# api_key optionnelle : requise seulement si SYNAPTIQ_AUTH_REQUIRED=true
-client = SynaptiqClient("http://127.0.0.1:8000", api_key=None)
+client = SynaptiqClient("http://127.0.0.1:8000", api_key="your_api_key")
 
-# 1. Capturer une interaction (classée et consolidée en asynchrone par le worker)
+# 1. Capture raw agent interaction (async consolidation by worker)
 client.capture(
-    agent_id="george", session_id="sess_1",
-    content="L'utilisateur préfère des rapports courts en français.",
+    agent_id="george",
+    session_id="sess_1",
+    content="User prefers concise progress reports in English.",
 )
 
-# 2. Réhydrater un contexte compact avant d'appeler le LLM
+# 2. Rehydrate compact context packet before calling LLM
 ctx = client.build_context(
-    agent_id="george", session_id="sess_1",
-    task="Rédiger un rapport de suivi",
-    query="préférences de style et de format",
+    agent_id="george",
+    session_id="sess_1",
+    task="Draft weekly status update",
+    query="format and language preferences",
 )
 
-packet = ctx["context_packet"]                 # facts / preferences / rules / errors / ...
+packet = ctx["context_packet"]                 # facts / preferences / rules / errors...
 print(ctx["token_estimate"], packet["preferences"])
+```
+
+### TypeScript (`@synaptiq/sdk`)
+
+```typescript
+import { SynaptiqClient } from "@synaptiq/sdk";
+
+const client = new SynaptiqClient({
+  baseUrl: "http://127.0.0.1:8000",
+  apiKey: "your_api_key",
+});
+
+await client.capture({
+  agentId: "george",
+  sessionId: "sess_1",
+  content: "User prefers concise progress reports in English.",
+});
+
+const ctx = await client.buildContext({
+  agentId: "george",
+  sessionId: "sess_1",
+  task: "Draft weekly status update",
+  query: "format and language preferences",
+});
 ```
 
 <br>
 
-## 📡 API (`/v1`)
+## 📡 API Reference (`/v1`)
 
-| Méthode | Endpoint | Rôle |
+| Method | Endpoint | Role |
 |:---:|---|---|
-| `GET` | `/v1/health` | État Postgres + Redis (alias `/health`) |
-| `POST` | `/v1/events` | Capture d'un événement brut (async, idempotent) |
-| `POST` | `/v1/memories` | Écriture directe d'un souvenir consolidé |
-| `POST` | `/v1/retrieve` | Recherche sémantique vectorielle & hybride FTS |
-| `POST` | `/v1/context/build` | Assemblage du paquet de contexte Q-EM sous budget de tokens |
-| `DELETE` | `/v1/memories` | Purge RGPD (filtre optionnel `?agent_id=`) |
+| `GET` | `/v1/health` | Service health status (Postgres + Redis) |
+| `POST` | `/v1/events` | Async event ingestion (idempotent, queued to Redis Streams) |
+| `POST` | `/v1/memories` | Direct write of pre-consolidated memory |
+| `POST` | `/v1/retrieve` | Semantic vector search + Full-Text Search (FTS) |
+| `POST` | `/v1/context/build` | Q-EM context packet assembly under token budget |
+| `DELETE` | `/v1/memories` | GDPR purge endpoint (optional `?agent_id=` filter) |
 
-### 🧰 Configuration MCP (`claude_desktop_config.json`)
-Pour connecter SynaptiQ à **Claude Desktop** ou **Cursor**, ajoutez la configuration suivante dans votre fichier `claude_desktop_config.json` (voir exemple [claude_desktop_config.json](file:///C:/Users/jimmy/Projet/SynaptiQ/examples/claude_desktop_config.json)) :
+### 🧰 MCP Configuration (`claude_desktop_config.json`)
+
+To connect SynaptiQ to **Claude Desktop** or **Cursor**, add the following snippet to your `claude_desktop_config.json` (see [examples/claude_desktop_config.json](file:///C:/Users/jimmy/Projet/SynaptiQ/examples/claude_desktop_config.json)):
 
 ```json
 {
@@ -270,10 +291,10 @@ Pour connecter SynaptiQ à **Claude Desktop** ou **Cursor**, ajoutez la configur
     "synaptiq": {
       "command": "python",
       "args": ["-m", "apps.mcp.server"],
-      "cwd": "C:/Users/jimmy/Projet/SynaptiQ",
+      "cwd": "/path/to/synaptiq",
       "env": {
         "SYNAPTIQ_API_URL": "http://127.0.0.1:8000",
-        "SYNAPTIQ_API_KEY": "<votre_cle_api>",
+        "SYNAPTIQ_API_KEY": "<your_api_key>",
         "MCP_TRANSPORT": "stdio"
       }
     }
@@ -281,87 +302,54 @@ Pour connecter SynaptiQ à **Claude Desktop** ou **Cursor**, ajoutez la configur
 }
 ```
 
-<details>
-<summary><strong>Collections logiques (type / subtype)</strong></summary>
-
 <br>
 
-Il n'existe pas de table « collection » : une collection = un regroupement par `type`/`subtype`, routé automatiquement dans le paquet de contexte.
+## 🧬 Embedding Providers
 
-| `type` | `subtype` | Clé du paquet |
-|---|---|---|
-| `semantic` | `preference` | `preferences` |
-| `semantic` | `fact` | `facts` |
-| `procedural` | `coding_best_practices` | `best_practices` |
-| `procedural` | `code_error_resolution` | `errors` |
-| `procedural` | *(autre)* | `rules` |
-| `episodic` | `interaction` | `episodes` |
-| `working` | — | `examples` |
+Configurable via `EMBEDDING_PROVIDER` (`lmstudio` by default, `openrouter`, `openai`, `mock`).
 
-</details>
+```env
+# Local LM Studio (default)
+EMBEDDING_PROVIDER=lmstudio
+EMBEDDING_BASE_URL=http://localhost:1234/v1
+EMBEDDING_MODEL=text-embedding-paraphrase-multilingual-minilm-l12-v2.gguf
+EMBEDDING_DIM=384
 
-<br>
-
-## 🧬 Embeddings
-
-Fournisseur configurable via `EMBEDDING_PROVIDER` (`lmstudio` par défaut). La dimension du schéma est `VECTOR(384)`.
-
-> [!IMPORTANT]
-> `all-MiniLM-L6-v2` est optimisé pour l'**anglais** : le ranking de contenu **francophone** abstrait est médiocre. Pour du FR, utilise un modèle multilingue **384-dim** comme **`paraphrase-multilingual-MiniLM-L12-v2`** — meilleur ranking, **aucune migration de schéma** (même dimension).
-
-Le mock déterministe (`EMBEDDING_PROVIDER=mock`) est réservé aux tests.
-
-<br>
-
-## 🔐 Sécurité
-
-SynaptiQ est **auto-hébergé : un déploiement = un périmètre**. Le tenant est fixé côté serveur (`SYNAPTIQ_TENANT`, défaut `default`) et **jamais** transmis par l'appelant — impossible de lire/écrire un autre périmètre en trafiquant le corps de la requête. La séparation entre agents d'une même instance se fait via `agent_id`.
-
-> [!NOTE]
-> `SYNAPTIQ_AUTH_REQUIRED=true` (défaut) sécurise l'instance en exigeant une clé API Bearer. Pour le dev local sans clé, vous pouvez passer cette variable à `false`.
-
-```bash
-# Créer une clé (la clé en clair n'est affichée qu'une seule fois)
-python scripts/create_api_key.py --name "agent-prod"
-# Puis envoyer :  Authorization: Bearer <clé>
+# OpenRouter (Cloud)
+EMBEDDING_PROVIDER=openrouter
+EMBEDDING_API_KEY=sk-or-v1-your_openrouter_key
+EMBEDDING_MODEL=openai/text-embedding-3-small
+EMBEDDING_DIM=1536
 ```
 
-Les origines CORS d'un front navigateur se déclarent explicitement dans `CORS_ORIGINS` (vide par défaut ; le SDK/MCP server-à-serveur n'est pas concerné).
+<br>
 
-Les profils de référence exposent les ports seulement sur `127.0.0.1`. Le serveur MCP est prévu en `stdio`; le profil HTTP optionnel (`docker compose --profile mcp-http up`) reste local et exige `SYNAPTIQ_API_KEY`.
+## 🔐 Security
+
+SynaptiQ is **self-hosted: 1 deployment = 1 security boundary**. Tenant scoping is server-side (`SYNAPTIQ_TENANT`) and **never** trusted from client payloads. Agent separation within a tenant is isolated via `agent_id`.
+
+```bash
+# Generate a new Bearer API Key
+python scripts/create_api_key.py --name "agent-prod"
+# Include in HTTP requests: Authorization: Bearer <key>
+```
+
+`SYNAPTIQ_AUTH_REQUIRED=true` (default) ensures secure endpoints out of the box.
 
 <br>
 
-## 🧪 Tests & CI
+## 🧪 Testing & CI
 
 ```bash
-# Unitaires (sans infra, embeddings mockés)
+# Unit tests (no external services needed)
 pytest tests/unit
 
-# Intégration (nécessitent Postgres + Redis)
+# Full test suite (requires Postgres + Redis running)
 docker compose up -d postgres redis
-EMBEDDING_PROVIDER=mock pytest -m integration
+pytest tests/
 ```
 
-La CI (`.github/workflows/ci.yml`) exécute ruff + tests unitaires, plus l'intégration sur des services Postgres/Redis éphémères.
-
-<br>
-
-## 🗺️ Roadmap
-
-<details>
-<summary><strong>Voir la feuille de route</strong></summary>
-
-<br>
-
-- [x] 📊 **Benchmark Q-EM vs RAG classique** (Validé LOCOMO : Q-EM 51.3% vs Baseline 48.0%, +3.3 pts overall)
-- [x] 📦 **SDK JavaScript/TypeScript** (`@synaptiq/sdk`) & SDK Python (`synaptiq-sdk`)
-- [x] 📈 **Métriques & tracing** (Prometheus `/metrics` + compteur d'extraction dégradée)
-- [x] 🌍 **Modèle d'embedding multilingue par défaut** (`paraphrase-multilingual-MiniLM-L12-v2`)
-- [x] 🔒 **Authentification par défaut & routes API versionnées (`/v1`)**
-- [ ] 🛠️ Outillage : ruff élargi, `mypy`, `pre-commit`
-
-</details>
+CI workflows (`.github/workflows/ci.yml`) run `ruff` linting and test execution on every commit.
 
 <br>
 
@@ -369,8 +357,8 @@ La CI (`.github/workflows/ci.yml`) exécute ruff + tests unitaires, plus l'inté
 
 <div align="center">
 
-**Licence MIT** — voir [`LICENSE`](LICENSE).
+**MIT License** — see [`LICENSE`](LICENSE).
 
-<sub>Construit pour les agents qui n'ont pas le droit d'oublier. 🧠</sub>
+<sub>Built for AI agents that cannot afford to forget. 🧠</sub>
 
 </div>
