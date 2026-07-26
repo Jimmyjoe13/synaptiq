@@ -100,3 +100,17 @@ def test_openai_compat_normalise_l2(monkeypatch):
     (vec,) = e.embed(["texte"])
     assert abs((vec[0] ** 2 + vec[1] ** 2) ** 0.5 - 1.0) < 1e-9  # norme == 1
     assert vec == [0.6, 0.8]
+
+
+def test_factory_mode_openrouter(monkeypatch):
+    from synaptiq_core.embeddings import OpenRouterEmbedder
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test")
+    get_embedder.cache_clear()
+    e = get_embedder()
+    get_embedder.cache_clear()
+    assert isinstance(e, OpenRouterEmbedder)
+    assert e.base_url == "https://openrouter.ai/api/v1"
+    assert e.model == "openai/text-embedding-3-small"
+    assert e.api_key == "sk-or-v1-test"
+
