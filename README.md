@@ -4,7 +4,11 @@
 
 <div align="center">
 
-<h1>🧠 SynaptiQ</h1>
+<br>
+<img src="logo-synaptiq.png" alt="SynaptiQ — The vector second brain for AI agents" width="280">
+<br><br>
+
+<h1>SynaptiQ</h1>
 
 <h3><em>The vector second brain for AI agents — long-term, semantic, and temporal memory.</em></h3>
 
