@@ -5,7 +5,7 @@
 <div align="center">
 
 <p align="center">
-  <img src="logo-synaptiq.png" alt="SynaptiQ Logo" width="" />
+  <img src="logo-synaptiq2.png" alt="SynaptiQ Logo" width="" />
 
 
 <h3><em>The vector second brain for AI agents — long-term, semantic, and temporal memory.</em></h3>
