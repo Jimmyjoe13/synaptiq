@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.5 - Unreleased — l'API plantait au demarrage sur un .env non-ASCII (Windows)
+
+Trouve en montant une instance de production sur Windows : `cp .env.example .env` puis
+lancement local de l'API echouait sur un `UnicodeDecodeError` opaque, tres loin de sa cause.
+
+`slowapi` relit `.env` de son cote, via `starlette.config.Config`, **sans specifier
+d'encodage** : sur Windows c'est donc cp1252, et un seul octet UTF-8 non representable fait
+tomber l'import. Un emoji suffit — l'octet `0x8f` du selecteur de variante `U+FE0F` — et le
+`.env.example` livre en contient. Les accents seuls passent (mal decodes mais sans erreur),
+ce qui rend le probleme d'autant plus deroutant.
+
+Correctif a la racine : `Limiter(..., config_filename="")` empeche cette relecture, qui etait
+de toute facon redondante — SynaptiQ charge sa configuration via `load_dotenv` (UTF-8) et
+passe `default_limits` explicitement. Verifie avec un `.env` contenant un emoji : l'import
+passe, sans avertissement.
+
 ## 0.2.4 - Unreleased — transport MCP : stdio vs HTTP
 
 ### Limite mesurée du transport stdio avec antigravity CLI

@@ -13,6 +13,7 @@ import logging
 import threading
 import time
 import uuid
+import warnings
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any, Literal
 
@@ -178,7 +179,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-limiter = Limiter(key_func=get_remote_address, default_limits=[os.getenv("RATE_LIMIT", "120/minute")])
+with warnings.catch_warnings():
+    # slowapi avertit qu'il n'a pas trouvé le fichier de configuration qu'on lui demande
+    # justement d'ignorer : bruit pur, à chaque démarrage.
+    warnings.filterwarnings("ignore", message="Config file '' not found",
+                            category=UserWarning)
+    limiter = Limiter(
+        key_func=get_remote_address,
+        default_limits=[os.getenv("RATE_LIMIT", "120/minute")],
+        # `config_filename=""` empêche slowapi de relire `.env` de son côté.
+    #
+        # Il l'ouvre via `starlette.config.Config`, SANS spécifier d'encodage : sur Windows
+        # c'est donc cp1252, et un seul octet UTF-8 non représentable y fait planter l'API au
+        # démarrage sur un `UnicodeDecodeError` opaque, très loin de sa cause. Un emoji suffit
+        # (l'octet 0x8f du sélecteur de variante U+FE0F) — et le `.env.example` livré en
+        # contient, donc le quickstart documenté `cp .env.example .env` suivi d'un lancement
+        # local sur Windows échouait.
+        #
+        # Cette relecture est de toute façon redondante : SynaptiQ charge sa configuration
+        # via `load_dotenv` (qui lit en UTF-8) et passe ici `default_limits` explicitement.
+        config_filename="",
+    )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
