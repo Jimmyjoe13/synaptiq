@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.4 - Unreleased — transport MCP : stdio vs HTTP
+
+### Limite mesurée du transport stdio avec antigravity CLI
+
+Après fermeture de stdin, `mcp.run()` met **141 à 250 ms** (médiane 157) à se dénouer. Le
+temps est passé dans la boucle anyio de fastmcp, **pas** dans l'arrêt de l'interpréteur : un
+`os._exit()` en sortie de `mcp.run()` n'y change rien (vérifié, puis retiré).
+
+Or antigravity CLI n'accorde qu'une fenêtre de grâce d'environ 100 ms avant d'appeler
+`Kill()`. Sur Windows, `TerminateProcess(handle, 1)` se lit `exit status 1`, et son
+gestionnaire abandonne alors le rechargement de **tous** ses serveurs MCP. Les serveurs Node
+passent sous cette limite, Python non.
+
+Conséquence documentée : avec ce client, exposer le serveur en **HTTP** et le déclarer par
+`serverUrl` côté client. Il n'y a alors plus de processus enfant à arrêter, donc plus de
+fenêtre de grâce à respecter. C'est exactement ce qui a réglé le même symptôme sur le
+serveur Obsidian, dont le pont `npx mcp-remote` ne terminait jamais son handshake.
+
+`scripts/start_services.ps1` démarre l'API et le serveur MCP HTTP de façon idempotente
+(`-Status`, `-Stop`), en attendant l'écoute effective plutôt qu'en annonçant un démarrage
+optimiste.
+
 ## 0.2.3 - Unreleased — suites d'un incident de production
 
 Trois correctifs issus d'une panne constatée le 29/07 sur une instance réelle : le serveur

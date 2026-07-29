@@ -302,6 +302,19 @@ if __name__ == "__main__":
         ensure_api_running()
 
     if transport == "stdio":
+        # ⚠️ Limite CONNUE du transport stdio avec ce client.
+        #
+        # Apres fermeture de stdin, `mcp.run()` met 141 a 250 ms (mediane 157) a se
+        # denouer — le temps est passe dans la boucle anyio de fastmcp, pas dans l'arret de
+        # l'interpreteur : un `os._exit()` en sortie de `mcp.run()` n'y change donc RIEN
+        # (verifie). Or antigravity CLI n'accorde qu'une fenetre de grace de l'ordre de
+        # 100 ms avant d'appeler Kill() ; sur Windows, TerminateProcess(handle, 1) se lit
+        # « exit status 1 », et son gestionnaire abandonne alors le rechargement de TOUS ses
+        # serveurs. Les serveurs Node passent sous cette limite, Python non.
+        #
+        # Contournement recommande avec ce client : exposer ce serveur en HTTP/SSE et le
+        # declarer avec `serverUrl` cote client. Il n'y a alors plus de processus enfant a
+        # arreter, donc plus de fenetre de grace a respecter (cf. README, section MCP).
         mcp.run()
     else:
         # 0.0.0.0 est intentionnel : en conteneur, se lier a 127.0.0.1 rendrait le serveur
