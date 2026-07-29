@@ -34,7 +34,12 @@ class _Reponse:
 
 @pytest.fixture
 def appels(monkeypatch):
-    """Intercepte les appels HTTP sortants et rejoue une réponse contrôlée."""
+    """Intercepte les appels HTTP sortants et rejoue une réponse contrôlée.
+
+    Fixe aussi une identité : `SYNAPTIQ_AGENT_ID` n'a plus de défaut, les outils refusent
+    donc de partir sans elle (c'est le correctif de l'incident du 29/07).
+    """
+    monkeypatch.setattr(mcp_server, "SYNAPTIQ_AGENT_ID", "agent_de_test")
     enregistres = []
     reponse = {"charge": {"memory_id": "mem-1", "memories": [], "context_packet": {}}}
 
@@ -68,6 +73,83 @@ def test_l_identite_vient_de_l_environnement(appels, monkeypatch):
     monkeypatch.setattr(mcp_server, "SYNAPTIQ_AGENT_ID", "agent_configure")
     mcp_server.store_memory.fn(content="un fait", memory_type="semantic")
     assert enregistres[0]["payload"]["agent_id"] == "agent_configure"
+
+
+# ─── Identité obligatoire (incident de production du 29/07) ───────────────────
+
+def test_aucun_defaut_d_identite():
+    """RÉGRESSION : le défaut `qwen_code_agent` a causé une panne en production.
+
+    Le serveur lisait une partition vide et répondait « aucun souvenir trouvé », sans
+    erreur — symptôme indiscernable d'une mémoire réellement vide.
+    """
+    import inspect
+    source = inspect.getsource(mcp_server)
+    assert 'os.getenv("SYNAPTIQ_AGENT_ID", "qwen_code_agent")' not in source
+
+
+def test_require_agent_id_echoue_avec_un_message_actionnable(monkeypatch):
+    monkeypatch.setattr(mcp_server, "SYNAPTIQ_AGENT_ID", "")
+    with pytest.raises(RuntimeError) as exc:
+        mcp_server.require_agent_id()
+    message = str(exc.value)
+    assert "SYNAPTIQ_AGENT_ID" in message
+    # Le message doit dire QUOI faire, pas seulement ce qui manque.
+    assert "env" in message
+    assert "agent_id FROM memories" in message
+
+
+@pytest.mark.parametrize("outil", ["store_memory", "recall_memories", "build_context"])
+def test_sans_identite_les_outils_refusent_plutot_que_de_lire_a_cote(outil, monkeypatch):
+    """Aucune requête ne doit partir sans identité : mieux vaut une erreur qu'un vide."""
+    monkeypatch.setattr(mcp_server, "SYNAPTIQ_AGENT_ID", "")
+    partis = []
+    monkeypatch.setattr(mcp_server.requests, "post",
+                        lambda *a, **kw: partis.append(kw) or _Reponse({}))
+
+    fonction = getattr(mcp_server, outil).fn
+    arguments = {
+        "store_memory": {"content": "x", "memory_type": "semantic"},
+        "recall_memories": {"query": "x"},
+        "build_context": {"task": "t", "query": "q"},
+    }[outil]
+    resultat = fonction(**arguments)
+    assert resultat.startswith("[ERROR]")
+    assert "SYNAPTIQ_AGENT_ID" in resultat
+    assert partis == []          # rien n'a été envoyé à l'API
+
+
+# ─── Aucun effet de bord à l'import ──────────────────────────────────────────
+
+def test_l_import_ne_demarre_aucun_serveur():
+    """RÉGRESSION : `ensure_api_running()` était appelée au niveau module.
+
+    Importer ce module lançait donc un uvicorn — y compris depuis la suite de tests, où
+    cela ajoutait plusieurs secondes d'attente et laissait un processus orphelin.
+    """
+    import inspect
+    lignes = inspect.getsource(mcp_server).splitlines()
+    # Un appel au niveau module (colonne 0), hors du bloc __main__.
+    appels_module = [n for n, ligne in enumerate(lignes)
+                     if ligne.startswith("ensure_api_running(")]
+    assert appels_module == [], f"appel à l'import en ligne(s) {appels_module}"
+
+
+def test_le_sous_processus_ne_pollue_pas_stdout():
+    """En transport stdio, stdout porte le JSON-RPC : uvicorn ne doit pas y écrire."""
+    import inspect
+    source = inspect.getsource(mcp_server.ensure_api_running)
+    assert "stdout=sortie" in source
+    assert "stderr=sortie" in source
+
+
+def test_ensure_api_running_ne_lance_rien_si_l_api_repond(monkeypatch):
+    lances = []
+    monkeypatch.setattr(mcp_server.requests, "get", lambda *a, **kw: _Reponse({}, 200))
+    monkeypatch.setattr(mcp_server.subprocess, "Popen",
+                        lambda *a, **kw: lances.append(a) or None)
+    assert mcp_server.ensure_api_running() is True
+    assert lances == []
 
 
 # ─── Contrats d'appel ────────────────────────────────────────────────────────
@@ -118,6 +200,8 @@ def test_build_context_aplati_les_7_collections(appels):
 
 def test_erreur_reseau_rendue_lisible_pour_l_agent(monkeypatch):
     """Un outil MCP ne doit pas lever : l'agent doit recevoir un message exploitable."""
+    monkeypatch.setattr(mcp_server, "SYNAPTIQ_AGENT_ID", "agent_de_test")
+
     def _post_casse(*a, **kw):
         raise ConnectionError("API injoignable")
 

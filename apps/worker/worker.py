@@ -22,6 +22,7 @@ for _p in (_root, os.path.join(_root, "packages", "core")):
 from synaptiq_core import get_embedder, handle_contradictions, link_supersedes, to_pgvector
 from synaptiq_core.embeddings import generate_mock_embedding  # noqa: F401 (compat rétro tests)
 from synaptiq_core.observability import configure_logging, set_trace_id
+from synaptiq_core.taxonomy import DEFAULT_SUBTYPE, VALID_SUBTYPES, normalize_extraction
 
 # Configuration du logging
 configure_logging("synaptiq-worker")
@@ -153,14 +154,11 @@ def content_hash(content: str) -> str:
     return hashlib.sha256(" ".join(content.split()).strip().lower().encode("utf-8")).hexdigest()
 
 
-# Taxonomie autorisée (type -> subtypes valides) pour valider la sortie LLM.
-_VALID_SUBTYPES = {
-    "procedural": {"code_error_resolution", "coding_best_practices", "rule"},
-    "semantic": {"preference", "fact"},
-    "episodic": {"interaction"},
-    "working": {"scratch"},
-}
-_DEFAULT_SUBTYPE = {"procedural": "rule", "semantic": "fact", "episodic": "interaction", "working": "scratch"}
+# Taxonomie PARTAGÉE avec l'API (packages/core/synaptiq_core/taxonomy.py). Elle vivait ici,
+# donc elle n'était appliquée que sur ce chemin d'extraction : l'écriture directe
+# `POST /v1/memories` acceptait n'importe quel sous-type. Deux chemins, deux règles.
+_VALID_SUBTYPES = VALID_SUBTYPES      # conservés comme alias : lisibilité locale du module
+_DEFAULT_SUBTYPE = DEFAULT_SUBTYPE
 
 
 def _parse_occurred_at(value) -> "datetime | None":
@@ -181,11 +179,12 @@ def _parse_occurred_at(value) -> "datetime | None":
 
 
 def _validate_extraction(data: dict, event_content: str) -> dict:
-    """Normalise et valide UN fait de la sortie LLM ; corrige les incohérences."""
-    mtype = data.get("type") if data.get("type") in _VALID_SUBTYPES else "semantic"
-    subtype = data.get("subtype")
-    if subtype not in _VALID_SUBTYPES[mtype]:
-        subtype = _DEFAULT_SUBTYPE[mtype]
+    """Normalise et valide UN fait de la sortie LLM ; corrige les incohérences.
+
+    Ne lève jamais : un modèle qui hallucine un type doit produire une mémoire dégradée,
+    pas faire perdre l'événement (cf. `taxonomy.normalize_extraction`).
+    """
+    mtype, subtype = normalize_extraction(data.get("type"), data.get("subtype"))
 
     def _clamp(value, default):
         try:

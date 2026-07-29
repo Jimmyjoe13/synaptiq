@@ -96,17 +96,22 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(charge, ensure_ascii=False, default=str)
 
 
-def configure_logging(service: str, level: str | None = None) -> None:
+def configure_logging(service: str, level: str | None = None, stream=None) -> None:
     """Configure la journalisation du process (idempotent).
 
     `LOG_FORMAT=json` (défaut) produit une ligne JSON par enregistrement ; `text` conserve
     le format lisible à l'œil, utile en développement local.
     `LOG_LEVEL` accepte les niveaux usuels (INFO par défaut).
+
+    ⚠️ `stream` vaut `sys.stdout` par défaut (convention des conteneurs : les logs vont sur
+    la sortie standard, le collecteur s'en charge). **Un process qui utilise stdout comme
+    canal de protocole doit passer `sys.stderr`** — c'est le cas du serveur MCP en transport
+    `stdio`, où stdout porte le JSON-RPC : y écrire une ligne de log corrompt la session.
     """
     niveau = (level or os.getenv("LOG_LEVEL") or "INFO").upper()
     format_choisi = os.getenv("LOG_FORMAT", "json").lower()
 
-    handler = logging.StreamHandler(sys.stdout)
+    handler = logging.StreamHandler(stream if stream is not None else sys.stdout)
     if format_choisi == "json":
         handler.setFormatter(JsonFormatter())
     else:

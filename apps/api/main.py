@@ -18,7 +18,7 @@ from typing import Any, Literal
 
 import numpy as np
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 v1_router = APIRouter()
 import redis
@@ -36,8 +36,12 @@ from synaptiq_core.context_builder import RetrievalConfig, build_context_packet
 # Journalisation structurée + corrélation par trace_id
 from synaptiq_core.observability import configure_logging, set_trace_id
 
+# Taxonomie partagée avec le worker : les DEUX chemins d'écriture appliquent la même règle
+from synaptiq_core.qem import route_memory
+
 # Fusion de classements pour la recherche hybride (fonctions pures, cf. retrieval.py)
 from synaptiq_core.retrieval import DEFAULT_RRF_K, fuse_and_rank
+from synaptiq_core.taxonomy import SubtypeMismatch, is_canonical, validate_subtype
 
 # Configuration du logging
 configure_logging("synaptiq-api")
@@ -790,6 +794,23 @@ class MemoryInput(BaseModel):
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     importance: float = Field(default=0.5, ge=0.0, le=1.0)
 
+    @model_validator(mode="after")
+    def _verifier_la_taxonomie(self):
+        """Refuse un sous-type canonique rattaché au mauvais type.
+
+        Jusqu'au 29/07, la taxonomie n'était appliquée que sur le chemin d'extraction du
+        worker : cet endpoint acceptait n'importe quel sous-type. Un sous-type LIBRE reste
+        accepté (le routage retombe sur la collection du type, et un libellé métier précis
+        est légitime), mais `type='semantic'` avec `subtype='coding_best_practices'` est une
+        erreur démontrable de l'appelant : la mémoire irait dans `facts` alors qu'elle visait
+        `best_practices`. Voir `synaptiq_core.taxonomy`.
+        """
+        try:
+            validate_subtype(self.type, self.subtype)
+        except SubtypeMismatch as e:
+            raise ValueError(str(e)) from e
+        return self
+
 @v1_router.post("/memories", status_code=201)
 def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_auth)):
     """
@@ -835,10 +856,18 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                 link_supersedes(cur, new_id, superseded)
             conn.commit()
 
-            logger.info(f"Mémoire créée en direct par l'agent : {new_id}")
+            logger.info("Mémoire créée en direct par l'agent : %s", new_id,
+                        extra={"agent_id": memory.agent_id, "memory_type": memory.type,
+                               "subtype": memory.subtype})
             return {
                 "status": "created",
-                "memory_id": str(new_id)
+                "memory_id": str(new_id),
+                # Collection du context_packet où ce souvenir sera servi. Rendue explicite
+                # parce qu'un sous-type libre retombe sur la collection du TYPE : sans cette
+                # information, l'appelant ne peut pas savoir que son libellé métier n'a pas
+                # produit le routage fin qu'il imaginait.
+                "collection": route_memory(memory.type, memory.subtype),
+                "canonical_subtype": is_canonical(memory.type, memory.subtype),
             }
     except HTTPException:
         raise

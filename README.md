@@ -301,7 +301,7 @@ const ctx = await client.buildContext({
 |:---:|---|---|
 | `GET` | `/v1/health` | Service health status (Postgres + Redis) |
 | `POST` | `/v1/events` | Async event ingestion (idempotent, queued to Redis Streams) |
-| `POST` | `/v1/memories` | Direct write of pre-consolidated memory |
+| `POST` | `/v1/memories` | Direct write of pre-consolidated memory (returns the target `collection`) |
 | `POST` | `/v1/retrieve` | Semantic vector search + Full-Text Search (FTS) |
 | `POST` | `/v1/context/build` | Q-EM context packet assembly under token budget |
 | `DELETE` | `/v1/memories` | GDPR purge — requires `admin` scope **and** `?confirm=<tenant_id>` (optional `?agent_id=` filter) |
@@ -383,6 +383,17 @@ agent whitelist. Two consequences worth knowing:
 
 The MCP server's agent identity comes from `SYNAPTIQ_AGENT_ID` in its environment — it is no
 longer a tool parameter, so no prompt can make the model act as another agent.
+
+**`SYNAPTIQ_AGENT_ID` is required and has no default.** The server refuses to start without
+it. This is deliberate: it used to default to a fixed value, and a deployment whose memories
+had been written under a different identity would read an empty partition and answer *"no
+memory found"* — with no error. For a memory engine that symptom is indistinguishable from an
+genuinely empty store, so it is undebuggable from the outside. A server that refuses to boot
+is strictly better. Find the identity of existing memories with:
+
+```sql
+SELECT agent_id, count(*) FROM memories GROUP BY 1;
+```
 
 <br>
 

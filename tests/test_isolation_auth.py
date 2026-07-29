@@ -250,6 +250,49 @@ def test_events_signale_503_quand_la_base_est_absente(client, monkeypatch):
     assert resp.status_code == 503
 
 
+# ─── Taxonomie appliquée à l'écriture directe (incident du 29/07) ─────────────
+
+def test_sous_type_libre_accepte_et_routage_annonce(client):
+    """Un libellé métier reste accepté, et la réponse dit OÙ le souvenir sera servi.
+
+    Constaté en prod : des mémoires écrites via cet endpoint portaient des sous-types hors
+    taxonomie (`nana_intelligence_lead_webhook`). C'est légitime, mais l'appelant ne pouvait
+    pas savoir que son libellé ne produisait pas le routage fin qu'il imaginait.
+    """
+    resp = client.post("/memories", json={
+        "agent_id": "agentA", "type": "semantic",
+        "subtype": "nana_intelligence_lead_webhook", "content": "un webhook n8n",
+    })
+    assert resp.status_code == 201
+    corps = resp.json()
+    assert corps["collection"] == "facts"          # retombe sur la collection du type
+    assert corps["canonical_subtype"] is False     # dit explicitement que c'est un libellé libre
+
+
+def test_sous_type_canonique_annonce_sa_collection_fine(client):
+    resp = client.post("/memories", json={
+        "agent_id": "agentA", "type": "semantic",
+        "subtype": "preference", "content": "Jimmy préfère les mails courts",
+    })
+    assert resp.status_code == 201
+    assert resp.json()["collection"] == "preferences"
+    assert resp.json()["canonical_subtype"] is True
+
+
+def test_sous_type_du_mauvais_type_refuse_en_422(client):
+    """Seule erreur démontrable : un sous-type canonique rattaché au mauvais type.
+
+    `semantic` + `coding_best_practices` partirait dans `facts` alors que l'auteur visait
+    `best_practices`. Avant le 29/07, l'API l'acceptait sans broncher.
+    """
+    resp = client.post("/memories", json={
+        "agent_id": "agentA", "type": "semantic",
+        "subtype": "coding_best_practices", "content": "toujours borner les requêtes",
+    })
+    assert resp.status_code == 422
+    assert "procedural" in resp.text     # le message indique le bon type
+
+
 def test_metrics_expose_les_jauges_du_pipeline(client):
     """Les deux métriques qui préviennent l'incident (audit F14) sont exposées et à jour."""
     corps = client.get("/metrics").text

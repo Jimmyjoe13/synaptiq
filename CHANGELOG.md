@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.2.3 - Unreleased — suites d'un incident de production
+
+Trois correctifs issus d'une panne constatée le 29/07 sur une instance réelle : le serveur
+MCP répondait « aucun souvenir trouvé » alors que la base en contenait.
+
+### `SYNAPTIQ_AGENT_ID` devient obligatoire (rupture)
+Cause racine de la panne. La variable valait `qwen_code_agent` par défaut, alors que les
+souvenirs de l'instance avaient été écrits sous un autre identifiant. Le serveur lisait donc
+une partition vide **sans lever d'erreur** — symptôme indiscernable d'une mémoire réellement
+vide, et donc indébuggable de l'extérieur.
+
+Elle n'a plus de défaut : le serveur MCP refuse de démarrer sans elle, avec un message qui
+indique quoi faire et comment retrouver l'identifiant des souvenirs existants. Les outils
+refusent aussi de partir sans identité plutôt que d'interroger une partition arbitraire.
+
+### Plus aucun effet de bord à l'import du serveur MCP
+`ensure_api_running()` était appelée au niveau module : importer `apps.mcp.server` démarrait
+un uvicorn — y compris depuis la suite de tests. Déplacée dans `__main__`, désactivable par
+`SYNAPTIQ_AUTOSTART_API=false`, et le sous-processus est maintenant détaché avec
+stdout/stderr redirigés vers `api.log`. Ce dernier point n'est pas cosmétique : en transport
+`stdio`, stdout porte le JSON-RPC du protocole MCP, et un uvicorn qui y écrit corrompt la
+session.
+
+Dans la même veine, `configure_logging()` accepte un `stream` : le serveur MCP journalise
+sur **stderr**, jamais stdout.
+
+### La taxonomie s'applique aux DEUX chemins d'écriture
+`VALID_SUBTYPES` vivait dans le worker, donc n'était appliquée qu'à l'extraction LLM :
+`POST /v1/memories` acceptait n'importe quel sous-type. Constaté en production, des mémoires
+portaient `seo_audit_july_2026`, `nana_intelligence_lead_webhook`… Déplacée dans
+`synaptiq_core.taxonomy`, partagée par les deux chemins.
+
+La règle retenue n'est **pas** un rejet strict : un sous-type libre reste accepté (le routage
+retombe proprement sur la collection du type, et des intégrations réelles en dépendent).
+Seul un sous-type canonique rattaché au mauvais type est refusé en 422 — `type=semantic` avec
+`subtype=coding_best_practices` irait dans `facts` alors que son auteur visait
+`best_practices`, c'est la seule erreur que la validation puisse démontrer.
+
+`POST /v1/memories` retourne désormais `collection` et `canonical_subtype`, pour que
+l'appelant sache où son souvenir sera servi au lieu de le supposer.
+
+
 ## 0.2.2 - Unreleased — performance, observabilité, outillage
 
 Lot P1 de l'audit du 28/07. Aucune rupture de compatibilité d'API.

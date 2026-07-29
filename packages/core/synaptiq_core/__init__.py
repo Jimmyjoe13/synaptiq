@@ -39,6 +39,13 @@ from synaptiq_core.retrieval import (
     fuse_and_rank,
     reciprocal_rank_fusion,
 )
+from synaptiq_core.taxonomy import (
+    DEFAULT_SUBTYPE,
+    VALID_SUBTYPES,
+    SubtypeMismatch,
+    normalize_extraction,
+    validate_subtype,
+)
 
 __all__ = [
     "Embedder",
@@ -71,6 +78,12 @@ __all__ = [
     "route_memory",
     "estimate_tokens",
     "format_entry",
+    # Taxonomie partagée par les DEUX chemins d'écriture (API directe et extraction worker)
+    "VALID_SUBTYPES",
+    "DEFAULT_SUBTYPE",
+    "SubtypeMismatch",
+    "validate_subtype",
+    "normalize_extraction",
     # Recherche hybride : fusion de classements (vectoriel + plein texte)
     "reciprocal_rank_fusion",
     "fuse_and_rank",
