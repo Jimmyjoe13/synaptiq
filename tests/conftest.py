@@ -31,6 +31,34 @@ def juge_de_contradiction_neutre():
     yield
 
 
+@pytest.fixture(autouse=True)
+def auth_desactivee_par_defaut(request):
+    """Fixe explicitement le mode d'authentification des tests d'intégration.
+
+    ## Pourquoi (job `integration` rouge en CI depuis plusieurs commits)
+
+    Les tests d'intégration appellent les endpoints SANS clé API. Cela ne fonctionnait que
+    parce que le `.env` LOCAL contient `SYNAPTIQ_AUTH_REQUIRED=false`. Or `.env` est
+    gitignoré : sur le runner GitHub, il n'existe pas, `main.AUTH_REQUIRED` reprend son
+    défaut (`true`) et 14 tests tombaient en 401.
+
+    L'échec était invisible parce que le job porte `continue-on-error: true` : le run
+    s'affichait vert. C'est précisément le risque que ce garde-fou fait courir.
+
+    La suite ne doit dépendre d'AUCUN fichier non versionné. Le mode est donc imposé ici,
+    et les tests qui vérifient l'authentification le remettent à `True` par monkeypatch —
+    ce qu'ils faisaient déjà.
+    """
+    if "integration" not in request.keywords:
+        yield
+        return
+    import apps.api.main as main
+    ancien = main.AUTH_REQUIRED
+    main.AUTH_REQUIRED = False
+    yield
+    main.AUTH_REQUIRED = ancien
+
+
 def pytest_collection_modifyitems(config, items):
     for item in items:
         path = str(item.fspath).replace("\\", "/")
