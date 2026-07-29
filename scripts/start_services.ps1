@@ -20,7 +20,15 @@
 
 param(
     [switch]$Status,
-    [switch]$Stop
+    [switch]$Stop,
+    # Secondes d'attente que PostgreSQL et Redis répondent avant de démarrer les services.
+    #
+    # Indispensable au démarrage de session : Docker Desktop met souvent 1 à 2 minutes à
+    # lever ses conteneurs, et une API démarrée avant eux garde un pool NULL et répond 503
+    # sur tout — sans jamais se rétablir d'elle-même.
+    # 0 pour un lancement manuel quand l'infra est déjà là (le test est de toute façon
+    # immédiat si les ports écoutent).
+    [int]$WaitForInfra = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,6 +74,36 @@ if ($Stop) {
         }
     }
     exit 0
+}
+
+# ─── Attente de l'infrastructure (PostgreSQL + Redis) ───
+# Les ports hôte exposés par docker compose. Sans eux, l'API démarre mais reste inutilisable.
+$Infra = @( @{ Nom = "PostgreSQL"; Port = 5435 }, @{ Nom = "Redis"; Port = 6399 } )
+
+$manquants = @($Infra | Where-Object { -not (Test-Port $_.Port) })
+if ($manquants.Count -gt 0) {
+    if ($WaitForInfra -le 0) {
+        foreach ($i in $manquants) {
+            Write-Host ("  {0,-10} port {1} : INJOIGNABLE" -f $i.Nom, $i.Port) -ForegroundColor Red
+        }
+        Write-Host "  Demarrer l'infra : docker compose up -d postgres redis" -ForegroundColor Yellow
+        Write-Host "  (ou relancer avec -WaitForInfra 300 pour patienter)" -ForegroundColor Yellow
+        exit 1
+    }
+    Write-Host ("  Attente de l'infrastructure (max {0} s)..." -f $WaitForInfra) -ForegroundColor Cyan
+    $limite = (Get-Date).AddSeconds($WaitForInfra)
+    while ((Get-Date) -lt $limite) {
+        if (-not @($Infra | Where-Object { -not (Test-Port $_.Port) })) { break }
+        Start-Sleep -Seconds 3
+    }
+    $encoreManquants = @($Infra | Where-Object { -not (Test-Port $_.Port) })
+    if ($encoreManquants.Count -gt 0) {
+        foreach ($i in $encoreManquants) {
+            Write-Host ("  {0,-10} port {1} : toujours injoignable apres {2} s" -f $i.Nom, $i.Port, $WaitForInfra) -ForegroundColor Red
+        }
+        exit 1
+    }
+    Write-Host "  Infrastructure prete." -ForegroundColor Green
 }
 
 foreach ($s in $Services) {

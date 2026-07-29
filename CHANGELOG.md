@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.6 - Unreleased — le lanceur attend son infrastructure
+
+`start_services.ps1 -WaitForInfra <secondes>` patiente que PostgreSQL (5435) et Redis (6399)
+repondent avant de demarrer l'API. Indispensable a l'ouverture de session : Docker Desktop met
+souvent une a deux minutes a lever ses conteneurs, et une API demarree avant eux garde un pool
+NULL et repond 503 sur tout — **sans jamais se retablir d'elle-meme**. Sans cette attente, un
+demarrage automatique produisait donc une instance en apparence lancee mais totalement muette.
+
+Sans le drapeau (lancement manuel), le comportement est inchange si l'infra est la, et un
+refus explicite sinon, avec la commande a lancer — plutot qu'un demarrage voue a l'echec.
+
 ## 0.2.5 - Unreleased — l'API plantait au demarrage sur un .env non-ASCII (Windows)
 
 Trouve en montant une instance de production sur Windows : `cp .env.example .env` puis
