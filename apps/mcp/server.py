@@ -65,12 +65,20 @@ def require_agent_id() -> str:
 mcp = FastMCP("SynaptiQ Memory Engine")
 
 
-def ensure_api_running(timeout_s: float = 10.0) -> bool:
+def ensure_api_running(timeout_s: float | None = None) -> bool:
     """Demarre l'API HTTP si elle ne repond pas. Retourne True si elle est joignable.
 
-    ⚠️ N'est PAS appelee a l'import. Un import qui demarre un serveur est un effet de bord
-    inacceptable : importer ce module depuis la suite de tests lancait un uvicorn et
-    attendait plusieurs secondes.
+    ⚠️ NE BLOQUE PAS par defaut (`SYNAPTIQ_AUTOSTART_WAIT_S=0`).
+
+    Version precedente : elle attendait jusqu'a 10 s que l'API reponde, AVANT `mcp.run()`.
+    Mesure : 14 s avant le handshake MCP quand l'API etait injoignable, contre 1,9 s
+    sinon. Or le client MCP a son propre delai d'initialisation, bien plus court : il tuait
+    le process, et sur Windows un TerminateProcess se lit `exit status 1` — ce qui faisait
+    echouer le rechargement de TOUS les serveurs du client.
+
+    Le handshake d'un protocole ne doit jamais attendre une tache annexe. On lance donc
+    uvicorn et on rend la main immediatement ; si le premier appel d'outil arrive avant que
+    l'API ecoute, `_poster()` reessaie une fois (cf. RETRY_DELAI_S).
 
     Deux precautions sur le sous-processus :
       - stdout/stderr rediriges vers un fichier. En transport `stdio`, le protocole MCP
@@ -78,9 +86,13 @@ def ensure_api_running(timeout_s: float = 10.0) -> bool:
       - processus detache, pour qu'il survive a l'arret du client MCP sans en heriter la
         console.
     """
+    if timeout_s is None:
+        timeout_s = float(os.getenv("SYNAPTIQ_AUTOSTART_WAIT_S", "0"))
     def _joignable() -> bool:
+        # Timeout court : c'est un appel local. Un port TENU par un process fige (plutot que
+        # ferme) ferait sinon patienter le handshake pour rien.
         try:
-            return requests.get(f"{SYNAPTIQ_API_URL}/health", timeout=2).status_code == 200
+            return requests.get(f"{SYNAPTIQ_API_URL}/health", timeout=1).status_code == 200
         except Exception:
             return False
 
@@ -111,14 +123,35 @@ def ensure_api_running(timeout_s: float = 10.0) -> bool:
         logger.error("Impossible de demarrer l'API automatiquement.", exc_info=True)
         return False
 
+    if timeout_s <= 0:
+        # Cas par defaut : on n'attend pas. Le handshake MCP passe immediatement.
+        logger.info("uvicorn lance en arriere-plan (pas d'attente, journal : %s).", journal)
+        return False
+
     echeance = time.monotonic() + timeout_s
     while time.monotonic() < echeance:
-        time.sleep(0.5)
+        time.sleep(0.25)
         if _joignable():
             logger.info("API SynaptiQ demarree.")
             return True
-    logger.warning("API toujours injoignable apres %.0f s : voir %s.", timeout_s, journal)
+    logger.warning("API toujours injoignable apres %.1f s : voir %s.", timeout_s, journal)
     return False
+
+# Delai avant l'unique nouvelle tentative quand l'API n'ecoute pas encore. Le demarrage
+# automatique d'uvicorn ne bloque plus le handshake : un premier appel d'outil peut donc
+# arriver pendant que l'API finit de demarrer.
+RETRY_DELAI_S = float(os.getenv("SYNAPTIQ_RETRY_DELAI_S", "2.0"))
+
+
+def _poster(url: str, payload: dict, timeout: int = 5):
+    """POST vers l'API, avec UNE nouvelle tentative si la connexion est refusee."""
+    try:
+        return requests.post(url, json=payload, headers=HEADERS, timeout=timeout)
+    except requests.ConnectionError:
+        logger.info("API pas encore joignable, nouvelle tentative dans %.1f s.", RETRY_DELAI_S)
+        time.sleep(RETRY_DELAI_S)
+        return requests.post(url, json=payload, headers=HEADERS, timeout=timeout)
+
 
 @mcp.tool()
 def store_memory(content: str, memory_type: str, subtype: str | None = None) -> str:
@@ -142,7 +175,7 @@ def store_memory(content: str, memory_type: str, subtype: str | None = None) -> 
             "confidence": 1.0,
             "importance": 0.5,
         }
-        response = requests.post(url, json=payload, headers=HEADERS, timeout=5)
+        response = _poster(url, payload)
         response.raise_for_status()
         res_data = response.json()
         return f"[SUCCESS] Memoire enregistree avec succes. ID: {res_data.get('memory_id')}"
@@ -167,7 +200,7 @@ def recall_memories(query: str, limit: int = 5, memory_type: str | None = None) 
             "limit": limit,
             "memory_type": memory_type,
         }
-        response = requests.post(url, json=payload, headers=HEADERS, timeout=5)
+        response = _poster(url, payload)
         response.raise_for_status()
         memories = response.json().get("memories", [])
 
@@ -203,7 +236,7 @@ def build_context(task: str, query: str, max_tokens: int = 1200) -> str:
             "constraints": {"max_tokens": max_tokens,
                             "memory_types": ["semantic", "episodic", "procedural", "working"]},
         }
-        response = requests.post(url, json=payload, headers=HEADERS, timeout=10)
+        response = _poster(url, payload, timeout=10)
         response.raise_for_status()
         data = response.json()
         packet = data.get("context_packet", {})

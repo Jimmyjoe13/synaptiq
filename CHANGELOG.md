@@ -26,6 +26,16 @@ session.
 Dans la même veine, `configure_logging()` accepte un `stream` : le serveur MCP journalise
 sur **stderr**, jamais stdout.
 
+**Correctif du correctif** : le déplacement dans `__main__` avait laissé l'attente de l'API
+*bloquer le handshake MCP*. Mesuré : 14,06 s avant le handshake quand l'API était injoignable,
+contre 1,9 s sinon. Le client MCP, dont le délai d'initialisation est bien plus court, tuait
+alors le serveur — `exit status 1` sur Windows — et **le rechargement de tous ses serveurs
+échouait**. Le démarrage de l'API ne bloque plus (`SYNAPTIQ_AUTOSTART_WAIT_S=0` par défaut) :
+2,84 s de handshake API injoignable, code de sortie 0. Si le premier appel d'outil arrive
+avant que l'API écoute, il réessaie une fois (`SYNAPTIQ_RETRY_DELAI_S`).
+
+Leçon générale : **le handshake d'un protocole ne doit jamais attendre une tâche annexe.**
+
 ### La taxonomie s'applique aux DEUX chemins d'écriture
 `VALID_SUBTYPES` vivait dans le worker, donc n'était appliquée qu'à l'extraction LLM :
 `POST /v1/memories` acceptait n'importe quel sous-type. Constaté en production, des mémoires

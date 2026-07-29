@@ -152,6 +152,76 @@ def test_ensure_api_running_ne_lance_rien_si_l_api_repond(monkeypatch):
     assert lances == []
 
 
+def test_le_demarrage_de_l_api_ne_bloque_pas_le_handshake(monkeypatch):
+    """RÉGRESSION : l'attente de l'API retardait le handshake MCP de 14 s.
+
+    Le client MCP a son propre délai d'initialisation, bien plus court : il tuait le
+    process, ce qui se lit `exit status 1` sur Windows et faisait échouer le rechargement
+    de TOUS les serveurs du client. Un handshake de protocole ne doit jamais attendre une
+    tâche annexe.
+    """
+    monkeypatch.delenv("SYNAPTIQ_AUTOSTART_WAIT_S", raising=False)
+    attentes = []
+
+    def _get_injoignable(*a, **kw):
+        raise ConnectionError("refuse")
+
+    monkeypatch.setattr(mcp_server.requests, "get", _get_injoignable)
+    monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **kw: None)
+    monkeypatch.setattr(mcp_server.time, "sleep", lambda s: attentes.append(s))
+
+    assert mcp_server.ensure_api_running() is False
+    assert attentes == [], f"a attendu {sum(attentes)} s au lieu de rendre la main"
+
+
+def test_l_attente_reste_possible_explicitement(monkeypatch):
+    """`SYNAPTIQ_AUTOSTART_WAIT_S` permet de la réactiver (scripts, mise au point)."""
+    monkeypatch.setattr(mcp_server.requests, "get",
+                        lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("refuse")))
+    monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **kw: None)
+    dormi = []
+    monkeypatch.setattr(mcp_server.time, "sleep", lambda s: dormi.append(s))
+
+    assert mcp_server.ensure_api_running(timeout_s=1.0) is False
+    assert sum(dormi) > 0      # il a bien patienté
+
+
+def test_un_premier_appel_trop_tot_reessaie_une_fois(monkeypatch):
+    """L'API peut ne pas encore écouter : `_poster` réessaie au lieu d'échouer."""
+    tentatives = []
+
+    def _post(url, **kw):
+        tentatives.append(url)
+        if len(tentatives) == 1:
+            raise mcp_server.requests.ConnectionError("pas encore d'ecoute")
+        return _Reponse({"memories": []})
+
+    monkeypatch.setattr(mcp_server.requests, "post", _post)
+    monkeypatch.setattr(mcp_server.time, "sleep", lambda s: None)
+    monkeypatch.setattr(mcp_server, "SYNAPTIQ_AGENT_ID", "agent_de_test")
+
+    resultat = mcp_server.recall_memories.fn(query="q")
+    assert len(tentatives) == 2
+    assert not resultat.startswith("[ERROR]")
+
+
+def test_le_retry_ne_masque_pas_une_panne_durable(monkeypatch):
+    """Deux échecs de connexion doivent remonter une erreur, pas boucler."""
+    tentatives = []
+
+    def _post(url, **kw):
+        tentatives.append(url)
+        raise mcp_server.requests.ConnectionError("API morte")
+
+    monkeypatch.setattr(mcp_server.requests, "post", _post)
+    monkeypatch.setattr(mcp_server.time, "sleep", lambda s: None)
+    monkeypatch.setattr(mcp_server, "SYNAPTIQ_AGENT_ID", "agent_de_test")
+
+    resultat = mcp_server.recall_memories.fn(query="q")
+    assert len(tentatives) == 2
+    assert resultat.startswith("[ERROR]")
+
+
 # ─── Contrats d'appel ────────────────────────────────────────────────────────
 
 def test_store_memory_appelle_le_bon_endpoint(appels):
