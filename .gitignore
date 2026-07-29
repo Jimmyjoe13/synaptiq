@@ -28,3 +28,9 @@ handoff.md
 CLAUDE.md
 conversation-codex.txt
 
+
+# Rapport de couverture (pytest-cov)
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/

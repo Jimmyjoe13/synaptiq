@@ -7,14 +7,13 @@ Ce script compare l'efficacité de SynaptiQ face à une approche Obsidian MCP cl
 
 Évaluation par un LLM-juge sur l'exactitude des réponses produites.
 """
+import hashlib
+import json
 import os
 import sys
-import json
-import time
-import requests
-import hashlib
+
 import psycopg2
-from typing import Dict, Any, List
+import requests
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -27,6 +26,7 @@ for _p in (_ROOT, os.path.join(_ROOT, "packages", "core")):
         sys.path.insert(0, _p)
 
 from dotenv import load_dotenv
+
 load_dotenv(os.path.join(_ROOT, ".env"))
 
 from apps.worker.worker import process_event
@@ -67,14 +67,14 @@ def _judge_answer(question: str, gold: str, hyp: str) -> bool:
 
 
 def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(v1, v2))
+    dot = sum(x * y for x, y in zip(v1, v2, strict=False))
     norm1 = sum(x * x for x in v1) ** 0.5
     norm2 = sum(y * y for y in v2) ** 0.5
     return dot / (norm1 * norm2) if (norm1 > 0 and norm2 > 0) else 0.0
 
 
 def run_benchmark(dataset_path: str) -> dict:
-    with open(dataset_path, "r", encoding="utf-8") as f:
+    with open(dataset_path, encoding="utf-8") as f:
         ds = json.load(f)
 
     embedder = get_embedder()
@@ -96,7 +96,7 @@ def run_benchmark(dataset_path: str) -> dict:
         conn.commit()
 
     print("[BENCHMARK START] SynaptiQ Q-EM vs Obsidian MCP")
-    
+
     obsidian_results = []
     synaptiq_results = []
 
@@ -122,7 +122,7 @@ def run_benchmark(dataset_path: str) -> dict:
         markdown_notes.sort(key=lambda n: _cosine_similarity(q_emb, n["embedding"]), reverse=True)
         top_obsidian_notes = markdown_notes[:2]
         obsidian_context = "\n".join([f"- Note Obsidian : {n['content']}" for n in top_obsidian_notes])
-        
+
         obsidian_prompt = (
             f"Contexte récupéré depuis le vault Obsidian :\n{obsidian_context}\n\n"
             f"Question : {question}\n\n"
@@ -173,7 +173,7 @@ def run_benchmark(dataset_path: str) -> dict:
         )
         syn_resp.raise_for_status()
         ctx_data = syn_resp.json()["context_packet"]
-        
+
         synaptiq_context_items = []
         for k, items in ctx_data.items():
             for item in items:
@@ -221,7 +221,7 @@ if __name__ == "__main__":
     print(f"SynaptiQ Q-EM Exactitude : {res['synaptiq_qem_accuracy']} %")
     print(f"Avantage SynaptiQ       : +{res['delta_points']} points")
     print("="*50)
-    
+
     out_file = os.path.join(_ROOT, "benchmarks", "results_obsidian_vs_synaptiq.json")
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(res, f, ensure_ascii=False, indent=2)

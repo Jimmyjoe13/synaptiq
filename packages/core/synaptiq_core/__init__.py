@@ -1,5 +1,17 @@
 """synaptiq_core — logique partagée entre l'API et le worker (embeddings, gouvernance)."""
 
+from synaptiq_core.context_builder import (
+    InMemoryStore,
+    MemoryStore,
+    RetrievalConfig,
+    build_context_packet,
+)
+from synaptiq_core.contradiction import (
+    ContradictionJudge,
+    LLMContradictionJudge,
+    get_contradiction_judge,
+    no_judge,
+)
 from synaptiq_core.embeddings import (
     Embedder,
     EmbeddingError,
@@ -10,7 +22,7 @@ from synaptiq_core.embeddings import (
     get_embedder,
     to_pgvector,
 )
-from synaptiq_core.governance import handle_contradictions
+from synaptiq_core.governance import handle_contradictions, link_supersedes
 from synaptiq_core.qem import (
     apply_contradictions,
     collapse_by_utility,
@@ -38,6 +50,17 @@ __all__ = [
     "generate_mock_embedding",
     "to_pgvector",
     "handle_contradictions",
+    "link_supersedes",
+    # Verdict de contradiction (archivage sur décision explicite, jamais sur similarité)
+    "ContradictionJudge",
+    "LLMContradictionJudge",
+    "get_contradiction_judge",
+    "no_judge",
+    # Orchestration des 4 phases (magasin injecté : testable sans SQL ni HTTP)
+    "build_context_packet",
+    "MemoryStore",
+    "InMemoryStore",
+    "RetrievalConfig",
     # Cœur algorithmique Q-EM (pur, testable sans infra)
     "compute_recency_factor",
     "initial_score",

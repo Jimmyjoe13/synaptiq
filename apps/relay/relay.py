@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import sys
 import time
 
 import redis
@@ -9,7 +10,12 @@ from dotenv import load_dotenv
 from psycopg2 import pool as pg_pool
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+for _p in (ROOT, os.path.join(ROOT, "packages", "core")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 load_dotenv(os.path.join(ROOT, ".env"))
+
+from synaptiq_core.observability import configure_logging
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6399/0")
@@ -44,7 +50,7 @@ def publish_pending(db_pool, redis_client) -> int:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    configure_logging("synaptiq-relay")
     db_pool = pg_pool.ThreadedConnectionPool(1, 4, dsn=DATABASE_URL)
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     while True:

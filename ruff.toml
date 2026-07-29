@@ -1,5 +1,55 @@
 line-length = 120
+target-version = "py311"
 
 [lint]
-# Erreurs de syntaxe (E9) + pyflakes (F : imports/variables inutilisés, noms indéfinis)
-select = ["E9", "F"]
+# Progression volontairement graduée (audit F18) : le dépôt ne sélectionnait que E9+F,
+# soit les erreurs de syntaxe et pyflakes. Les familles ajoutées ici sont celles qui
+# attrapent de vrais défauts sans imposer une réécriture cosmétique de tout le dépôt :
+#   E,W  : style pycodestyle
+#   I    : ordre des imports (déterministe, réduit le bruit des diffs)
+#   B    : bugbear — pièges réels (défaut mutable, boucles, except douteux)
+#   UP   : modernisation de syntaxe (3.11+)
+#   S    : bandit — sécurité (assert en prod, subprocess, hachages faibles…)
+#   C4   : compréhensions inutilement coûteuses
+#   RUF  : règles propres à ruff
+select = ["E", "W", "F", "I", "B", "UP", "S", "C4", "RUF"]
+
+ignore = [
+    # La longueur est déjà bornée par `line-length` ; E501 ne fait que doubler le signal.
+    "E501",
+    # Le code ET les commentaires sont en français : les caractères « ambigus » sont normaux.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[lint.per-file-ignores]
+# Les tests DOIVENT utiliser `assert` (S101) et manipulent des chaînes factices qui
+# ressemblent à des secrets (S105/S106).
+# E402 : les tests insèrent le monorepo dans sys.path avant d'importer.
+# S311 : l'aléatoire des tests est un générateur à graine fixe, pas de la cryptographie.
+# C408 : `dict(cle=...)` est plus lisible que le littéral pour construire des jeux de params.
+"tests/**" = ["S101", "S105", "S106", "B011", "E402", "S311", "C408"]
+# Les benchmarks sont du code de mesure : l'aléatoire non cryptographique (S311) y est un
+# choix délibéré (graine fixe = reproductibilité), et ils ajustent sys.path avant d'importer.
+"benchmarks/**" = ["S101", "S311", "E402", "S603"]
+"scripts/**" = ["S311"]
+# Imports placés après les hacks sys.path du monorepo (E402), volontaire.
+# B008 : `Depends(...)` en valeur par défaut est L'IDIOME FastAPI, pas un défaut.
+# S608 : deux requêtes sont assemblées par f-string. L'interpolation ne porte QUE sur des
+#   listes de colonnes constantes et un fragment de filtre choisi par le serveur parmi deux
+#   valeurs ; toute donnée d'appelant passe par un paramètre lié (%s). L'exemption est au
+#   niveau du fichier et non en `# noqa` de ligne, parce qu'un commentaire placé sur la
+#   ligne d'ouverture d'un littéral `f"""` finit DANS la chaîne SQL envoyée à PostgreSQL.
+"apps/api/main.py" = ["E402", "B008", "S608"]
+"apps/relay/relay.py" = ["E402"]
+"apps/worker/worker.py" = ["E402"]
+"apps/mcp/server.py" = ["E402"]
+"examples/**" = ["E402", "S101"]
+"migrations/**" = ["E402"]
+# RUF022 : `__all__` est groupé par thème avec des commentaires explicatifs. Un tri
+# alphabétique détruirait ce regroupement, qui porte plus d'information que l'ordre.
+"packages/core/synaptiq_core/__init__.py" = ["RUF022"]
+
+[lint.isort]
+known-first-party = ["synaptiq_core", "synaptiq_sdk", "apps"]

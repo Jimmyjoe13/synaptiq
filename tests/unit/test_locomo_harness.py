@@ -15,7 +15,7 @@ for _p in (ROOT, ROOT / "packages" / "core"):
         sys.path.insert(0, str(_p))
 
 locomo = pytest.importorskip("benchmarks.locomo_runner", reason="harness LOCOMO absent")
-from synaptiq_core.qem import estimate_tokens  # noqa: E402
+from synaptiq_core.qem import estimate_tokens
 
 
 class FakeResponse:

@@ -1,16 +1,17 @@
-import os
-import sys
-import json
-import time
-import logging
-import re
 import hashlib
+import json
+import logging
+import os
+import re
+import sys
+import time
 from datetime import datetime
-from psycopg2 import pool as pg_pool
+
 import redis
 import requests
 from dotenv import load_dotenv
 from prometheus_client import Counter
+from psycopg2 import pool as pg_pool
 
 # Rendre le package partagé packages/core importable (dev local hors conteneur)
 _root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -18,11 +19,12 @@ for _p in (_root, os.path.join(_root, "packages", "core")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from synaptiq_core import get_embedder, to_pgvector, handle_contradictions
+from synaptiq_core import get_embedder, handle_contradictions, link_supersedes, to_pgvector
 from synaptiq_core.embeddings import generate_mock_embedding  # noqa: F401 (compat rétro tests)
+from synaptiq_core.observability import configure_logging, set_trace_id
 
 # Configuration du logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+configure_logging("synaptiq-worker")
 logger = logging.getLogger("synaptiq-worker")
 
 EXTRACTION_DEGRADED_COUNTER = Counter(
@@ -403,8 +405,8 @@ def call_llm_extractor(event_content: str, occurred_at: str | None = None) -> li
         faits = _validate_extractions(json.loads(raw), event_content)
         logger.info("%d fait(s) extrait(s) de l'événement.", len(faits))
         return faits
-    except Exception as e:
-        logger.error("Échec de l'extraction LLM : %s. Repli sur les heuristiques regex.", e)
+    except Exception:
+        logger.error("Échec de l'extraction LLM, repli sur les heuristiques regex.", exc_info=True)
         EXTRACTION_DEGRADED_COUNTER.inc()
         return [_heuristic_extract(event_content)]
 
@@ -422,13 +424,17 @@ _INSERT_MEMORY = """
 def _entangle(cur, tenant_id: str, agent_id: str, new_mem_id, fact: dict, embedding) -> None:
     """Relie un souvenir à ses plus proches voisins sémantiques (graphe Q-EM)."""
     embedding_str = to_pgvector(embedding)
+    # `ORDER BY embedding <=> %s` et non `ORDER BY similarity DESC` : pgvector n'utilise
+    # l'index HNSW que sur l'opérateur de distance. Trier sur l'alias forçait un scan
+    # complet des mémoires de l'agent À CHAQUE fait extrait — le coût de l'intrication
+    # croissait donc linéairement avec la taille de la mémoire.
     cur.execute("""
         SELECT id, type, subtype, (1 - (embedding <=> %s::vector)) AS similarity
         FROM memories
         WHERE tenant_id = %s AND agent_id = %s AND id != %s AND status = 'active'
-        ORDER BY similarity DESC
+        ORDER BY embedding <=> %s::vector
         LIMIT 3;
-    """, (embedding_str, tenant_id, agent_id, new_mem_id))
+    """, (embedding_str, tenant_id, agent_id, new_mem_id, embedding_str))
 
     for rel_row in cur.fetchall():
         similarity = float(rel_row[3] or 0.0)
@@ -469,7 +475,11 @@ def process_event(event: dict) -> bool:
     # l'API dans le payload outbox ; absent, le LLM ne pourra simplement pas dater.
     event_time = event.get('created_at')
 
-    logger.info(f"Traitement de l'événement {event_id} pour l'agent {agent_id}...")
+    # Corrélation : tous les logs de la consolidation de cet événement porteront le même
+    # identifiant, y compris ceux émis depuis synaptiq_core (extraction, gouvernance).
+    set_trace_id(f"event_{event_id}")
+    logger.info("Traitement de l'événement %s pour l'agent %s.", event_id, agent_id,
+                extra={"event_id": str(event_id), "agent_id": agent_id, "tenant_id": tenant_id})
 
     # 1. Extraction : 1 à N faits, datés quand l'interaction le permet
     facts = call_llm_extractor(content, occurred_at=event_time)
@@ -484,9 +494,11 @@ def process_event(event: dict) -> bool:
     try:
         created = 0
         with conn.cursor() as cur:
-            for fact, embedding in zip(facts, embeddings):
-                # Contradictions (archivage scopé sémantiquement) avant insertion.
-                handle_contradictions(cur, tenant_id, agent_id, fact, embedding)
+            for fact, embedding in zip(facts, embeddings, strict=False):
+                # Contradictions : archivage sur verdict EXPLICITE seulement (jamais sur la
+                # seule similarité). Les ids retournés serviront à tisser l'arête de
+                # supersession, une fois le nouvel id connu.
+                superseded = handle_contradictions(cur, tenant_id, agent_id, fact, embedding)
 
                 provenance = {"source": "event", "event_id": event_id}
                 cur.execute(_INSERT_MEMORY, (
@@ -504,6 +516,12 @@ def process_event(event: dict) -> bool:
                 logger.info("Mémoire %s créée (%s/%s, date=%s).", new_mem_id,
                             fact['type'], fact['subtype'], fact.get('occurred_at') or "—")
 
+                # 3bis. Traçabilité de la supersession : sans cette arête, un archivage
+                # serait indiscernable d'une disparition (rien ne dirait par quoi la
+                # préférence a été remplacée).
+                if superseded:
+                    link_supersedes(cur, new_mem_id, superseded)
+
                 # 4. Graphe d'intrication : seuls les souvenirs durables le tissent.
                 if _is_entanglement_candidate(fact):
                     _entangle(cur, tenant_id, agent_id, new_mem_id, fact, embedding)
@@ -513,14 +531,18 @@ def process_event(event: dict) -> bool:
             logger.info("Événement %s déjà consolidé; ACK sans duplication.", event_id)
         return True
 
-    except Exception as e:
+    except Exception:
         broken = True
         try:
             conn.rollback()
             broken = False  # rollback réussi → connexion réutilisable
         except Exception:
-            pass
-        logger.error(f"Erreur SQL lors de l'enregistrement de la mémoire : {e}")
+            # Le rollback lui-même a échoué : la connexion est inutilisable et sera fermée
+            # par le `finally`. On journalise pour ne pas masquer une panne de connexion
+            # derrière l'erreur SQL d'origine, mais on ne relance pas : c'est cette dernière
+            # qui explique l'échec de l'événement.
+            logger.warning("Rollback impossible : la connexion sera fermée.", exc_info=True)
+        logger.error("Erreur SQL lors de l'enregistrement de la mémoire.", exc_info=True)
         return False
     finally:
         # Recycler la connexion ; la fermer si son état est douteux (rollback échoué).
@@ -633,8 +655,8 @@ def main():
         except KeyboardInterrupt:
             logger.info("Arrêt du worker par l'utilisateur.")
             break
-        except Exception as e:
-            logger.error(f"Erreur dans la boucle principale du worker : {e}")
+        except Exception:
+            logger.error("Erreur dans la boucle principale du worker.", exc_info=True)
             time.sleep(2)
 
 

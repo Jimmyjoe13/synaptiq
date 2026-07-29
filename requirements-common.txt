@@ -1,0 +1,32 @@
+# SynaptiQ — dépendances runtime COMMUNES à l'API, au worker et au relais.
+#
+# Pourquoi ce fichier existe (audit F19) : le worker avait son propre
+# `apps/worker/requirements.txt`, qui avait dérivé du code. Il ne listait ni
+# `prometheus-client` (importé depuis l'ajout du compteur d'extractions dégradées) ni
+# `numpy` : l'image worker échouait au démarrage sur
+# `ModuleNotFoundError: No module named 'prometheus_client'`.
+#
+# Deux options existaient : tout le monde installe le requirements.txt racine (plus de
+# dérive, mais le worker embarque FastAPI/uvicorn dont il n'a aucun besoin — 438 Mo contre
+# 198 Mo), ou bien ce socle commun. C'est celle-ci : une seule liste pour les dépendances
+# partagées, et chaque service n'ajoute que les siennes.
+
+# --- Stockage ---
+psycopg2-binary==2.9.10
+redis==5.2.1
+
+# --- HTTP / configuration (embeddings, extraction LLM, SDK) ---
+requests==2.32.3
+# NB : >=1.1.0 requis par fastmcp (serveur MCP, requirements-dev). Épingler 1.0.1
+# rendait requirements-dev.txt non résoluble.
+python-dotenv>=1.1.0,<2
+
+# --- Calcul vectoriel ---
+# Produits scalaires du filtre de redondance Q-EM (packages/core/synaptiq_core/qem.py) :
+# la double boucle Python coûtait ~470 k multiplications par construction de contexte
+# (33 ms), contre 0,94 ms avec un produit matriciel.
+numpy==2.2.1
+
+# --- Métriques ---
+# Importé par l'API (compteurs + jauges) ET par le worker (extractions dégradées).
+prometheus-client==0.21.1

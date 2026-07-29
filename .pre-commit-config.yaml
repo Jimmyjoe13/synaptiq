@@ -1,0 +1,41 @@
+# SynaptiQ — vérifications avant commit (audit F18).
+#
+# Installation (une fois) :  pre-commit install
+# Exécution sur tout le dépôt :  pre-commit run --all-files
+#
+# Volontairement RAPIDE : lint, types et hygiène de fichiers seulement. Les tests ne sont
+# pas dans les hooks — l'intégration exige Postgres et Redis, et un hook qui prend 20 s
+# finit systématiquement contourné par `--no-verify`. Les tests restent le travail de la CI.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+        # Formatage NON activé pour l'instant : reformater tout le dépôt d'un coup
+        # noierait l'historique. À activer lors d'un commit dédié.
+        stages: [manual]
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.14.1
+    hooks:
+      - id: mypy
+        # Périmètre aligné sur mypy.ini : packages/core uniquement.
+        files: ^packages/core/synaptiq_core/
+        additional_dependencies: [types-requests, numpy]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      # Garde-fou sur les secrets : un .env commité par accident est irréversible
+      # (l'historique public le conserve).
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: [--maxkb=512]

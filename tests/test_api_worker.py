@@ -1,19 +1,20 @@
+import json
 import os
 import sys
-import json
 import unittest
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import redis
 from unittest.mock import patch
+
+import psycopg2
+import redis
+from psycopg2.extras import RealDictCursor
 
 # Ajouter les chemins au sys.path pour pouvoir importer les modules
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from conftest import purge_tenants  # noqa: E402
+from conftest import purge_tenants
 
 from apps.api.main import app as fastapi_app
-from apps.worker.worker import process_event, generate_mock_embedding
+from apps.worker.worker import generate_mock_embedding, process_event
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6399/0")
@@ -33,7 +34,7 @@ class _ConstEmbedder:
         return self._v
 
 class TestSynaptiqIntegration(unittest.TestCase):
-    
+
     @classmethod
     def setUpClass(cls):
         # Le tenant est désormais résolu côté serveur (plus dans le body) : on aligne
@@ -67,17 +68,27 @@ class TestSynaptiqIntegration(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
+        # Juge de contradiction déterministe. Depuis le 29/07, l'archivage exige un verdict
+        # explicite (cf. synaptiq_core.contradiction) : la similarité seule n'archive plus
+        # rien. Les deux préférences de style de ce test sont réellement incompatibles, on
+        # simule donc le verdict positif que rendrait le LLM — sans quoi le test dépendrait
+        # d'un endpoint LLM joignable.
+        pj = patch("synaptiq_core.governance.get_contradiction_judge",
+                   return_value=lambda ancien, nouveau: True)
+        pj.start()
+        self.addCleanup(pj.stop)
+
         tenant_id = "test_tenant"
         agent_id = "test_agent"
         session_id = "test_session"
-        
+
         # --- Étape 1 : Simulation de l'appel API POST /events ---
         # Au lieu de démarrer uvicorn, nous testons directement la logique de main.py
         # en appelant la fonction ou via TestClient. Pour rester simple, nous insérons
         # l'événement et testons le traitement du worker.
-        
+
         event_content = "Je préfère les e-mails courts et concis de moins de 100 mots."
-        
+
         # Insertion manuelle comme le ferait l'API
         with self.db_conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -90,10 +101,10 @@ class TestSynaptiqIntegration(unittest.TestCase):
             )
             event_row = cur.fetchone()
             self.db_conn.commit()
-            
+
             event_id = str(event_row['id'])
             created_at = event_row['created_at'].isoformat()
-            
+
         event_payload = {
             "id": event_id,
             "tenant_id": tenant_id,
@@ -103,12 +114,12 @@ class TestSynaptiqIntegration(unittest.TestCase):
             "metadata": json.dumps({}),
             "created_at": created_at
         }
-        
+
         # --- Étape 2 : Traitement par le Worker ---
         # Exécution synchrone de la fonction de traitement du worker
         success = process_event(event_payload)
         self.assertTrue(success, "Le traitement de l'événement par le worker a échoué.")
-        
+
         # --- Étape 3 : Vérification de la création de la mémoire ---
         with self.db_conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -116,18 +127,18 @@ class TestSynaptiqIntegration(unittest.TestCase):
                 (tenant_id, agent_id)
             )
             memories = cur.fetchall()
-            
+
             self.assertEqual(len(memories), 1, "La mémoire aurait dû être créée.")
             memory = memories[0]
             self.assertEqual(memory['type'], 'semantic')
             self.assertEqual(memory['subtype'], 'preference')
             self.assertEqual(memory['status'], 'active')
             self.assertIn("courts et concis", memory['content'])
-            
+
         # --- Étape 4 : Gestion des Contradictions ---
         # Deuxième événement modifiant la préférence
         contradictory_content = "En fait, je préfère les e-mails très détaillés et formels à l'avenir."
-        
+
         with self.db_conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
@@ -141,7 +152,7 @@ class TestSynaptiqIntegration(unittest.TestCase):
             self.db_conn.commit()
             event_id_2 = str(event_row_2['id'])
             created_at_2 = event_row_2['created_at'].isoformat()
-            
+
         event_payload_2 = {
             "id": event_id_2,
             "tenant_id": tenant_id,
@@ -151,11 +162,11 @@ class TestSynaptiqIntegration(unittest.TestCase):
             "metadata": json.dumps({}),
             "created_at": created_at_2
         }
-        
+
         # Traitement du deuxième événement par le worker
         success_2 = process_event(event_payload_2)
         self.assertTrue(success_2)
-        
+
         # Vérification de l'archivage de l'ancienne mémoire et activation de la nouvelle
         with self.db_conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -163,14 +174,14 @@ class TestSynaptiqIntegration(unittest.TestCase):
                 (tenant_id, agent_id)
             )
             memories_after = cur.fetchall()
-            
+
             self.assertEqual(len(memories_after), 2, "Il devrait y avoir deux mémoires en base.")
-            
+
             # Première mémoire (doit être archivée)
             mem_1 = memories_after[0]
             self.assertEqual(mem_1['status'], 'archived', "L'ancienne mémoire de préférence aurait dû être archivée.")
             self.assertIn("courts et concis", mem_1['content'])
-            
+
             # Deuxième mémoire (doit être active)
             mem_2 = memories_after[1]
             self.assertEqual(mem_2['status'], 'active', "La nouvelle mémoire de préférence doit être active.")
@@ -182,7 +193,7 @@ class TestSynaptiqIntegration(unittest.TestCase):
         # TestClient en context manager pour déclencher le lifespan (init du pool PostgreSQL).
         client_ctx = TestClient(fastapi_app)
         client = client_ctx.__enter__()
-        
+
         response = client.post("/context/build", json={
             "tenant_id": tenant_id,
             "agent_id": agent_id,
@@ -194,17 +205,17 @@ class TestSynaptiqIntegration(unittest.TestCase):
                 "memory_types": ["semantic"]
             }
         })
-        
+
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        
+
         context_packet = data['context_packet']
         # La mémoire active est semantic/preference -> collection 'preferences'.
         # Elle ne doit contenir QUE la préférence active ("très détaillés et formels").
         self.assertEqual(len(context_packet['preferences']), 1)
         self.assertIn("détaillés et formels", context_packet['preferences'][0])
         self.assertNotIn("courts et concis", context_packet['preferences'][0])
-        
+
         client_ctx.__exit__(None, None, None)
         print("\n[SUCCESS] Test d'integration de bout en bout reussi avec succes !")
 

@@ -9,23 +9,23 @@ Ces invariants sont le cœur de la garantie « at-least-once sans duplication »
 
 Exige Postgres + Redis (marqué integration via conftest). Auth désactivée.
 """
+import json
 import os
 import sys
-import json
 import unittest
 
 import psycopg2
 import redis
+from fastapi.testclient import TestClient
 from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor
-from fastapi.testclient import TestClient
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from conftest import purge_tenants  # noqa: E402
+from conftest import purge_tenants
 
-from apps.api.main import app as fastapi_app  # noqa: E402
-from apps.relay.relay import publish_pending  # noqa: E402
+from apps.api.main import app as fastapi_app
+from apps.relay.relay import publish_pending
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6399/0")
@@ -139,7 +139,8 @@ class TestReliability(unittest.TestCase):
     def test_worker_dedupes_replayed_event(self):
         """Rejouer le même événement (même source_event_id) ne crée qu'une mémoire."""
         from unittest.mock import patch
-        from apps.worker.worker import process_event, generate_mock_embedding
+
+        from apps.worker.worker import generate_mock_embedding, process_event
 
         with self.db_conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -188,7 +189,8 @@ class TestReliability(unittest.TestCase):
         l'idempotence tout en autorisant plusieurs faits par événement.
         """
         from unittest.mock import patch
-        from apps.worker.worker import process_event, generate_mock_embedding
+
+        from apps.worker.worker import generate_mock_embedding, process_event
 
         with self.db_conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(

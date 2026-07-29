@@ -1,12 +1,44 @@
+# Contexte de build : les Dockerfiles font `COPY . .`, donc tout ce qui n'est pas exclu
+# ici finit DANS l'image. L'audit du 28/07 relevait des images inutilement grosses
+# embarquant le dataset de benchmark, les résultats de mesure et les visuels du README.
 .git
 .gitignore
+.gitattributes
+.github/
+
+# Secrets : ne jamais embarquer de .env dans une image (elle peut être poussée/partagée).
 **/.env
 !.env.example
-*.log
-**/__pycache__/
-*.pyc
+
+# Environnements et caches locaux
 .venv/
 venv/
+**/__pycache__/
+*.pyc
+*.egg-info/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 node_modules/
+
+# Journaux et données locales
+*.log
+data/
+db_data/
+postgres_data/
+redis_data/
+
+# Non nécessaires à l'exécution : tests, mesures, visuels, documentation.
+# `benchmarks/` embarquait notamment locomo10.json (plusieurs Mo) et les résultats de runs.
+tests/
+benchmarks/
+img/
+examples/
 *.md
+!README.md
+
+# Fichiers de travail locaux (non commités mais présents sur le poste)
+handoff.md
+conversation-codex.txt
+AGENTS.md
+CLAUDE.md

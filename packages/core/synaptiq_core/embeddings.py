@@ -15,7 +15,6 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from functools import lru_cache
-from typing import List
 
 import requests
 
@@ -26,13 +25,13 @@ class EmbeddingError(RuntimeError):
     """Erreur d'embedding (endpoint injoignable, dimension incohérente, etc.)."""
 
 
-def _l2_normalize(vec: List[float]) -> List[float]:
+def _l2_normalize(vec: list[float]) -> list[float]:
     """Normalise L2 pour que le produit scalaire == similarité cosinus."""
     norm = sum(x * x for x in vec) ** 0.5
     return [x / norm for x in vec] if norm > 0 else vec
 
 
-def to_pgvector(vec: List[float]) -> str:
+def to_pgvector(vec: list[float]) -> str:
     """Sérialise un vecteur au format littéral pgvector : '[0.1,0.2,...]'."""
     return "[" + ",".join(map(str, vec)) + "]"
 
@@ -43,10 +42,10 @@ class Embedder(ABC):
     dim: int
 
     @abstractmethod
-    def embed(self, texts: List[str]) -> List[List[float]]:
+    def embed(self, texts: list[str]) -> list[list[float]]:
         """Encode un lot de textes → liste de vecteurs (même ordre que l'entrée)."""
 
-    def embed_one(self, text: str) -> List[float]:
+    def embed_one(self, text: str) -> list[float]:
         """Encode un seul texte → un vecteur."""
         return self.embed([text])[0]
 
@@ -57,8 +56,8 @@ class MockEmbedder(Embedder):
     def __init__(self, dim: int = 384) -> None:
         self.dim = dim
 
-    def embed(self, texts: List[str]) -> List[List[float]]:
-        out: List[List[float]] = []
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        out: list[list[float]] = []
         for text in texts:
             sha = hashlib.sha256(text.encode("utf-8")).digest()
             vec = [(sha[i % len(sha)] / 127.5) - 1.0 for i in range(self.dim)]
@@ -89,7 +88,7 @@ class OpenAICompatEmbedder(Embedder):
         self.timeout = timeout
         self.extra_headers = extra_headers or {}
 
-    def embed(self, texts: List[str]) -> List[List[float]]:
+    def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
         headers = {"Content-Type": "application/json"}
@@ -213,6 +212,6 @@ def get_embedder() -> Embedder:
     raise EmbeddingError(f"EMBEDDING_PROVIDER inconnu : '{provider}'")
 
 
-def generate_mock_embedding(text: str, dim: int = 384) -> List[float]:
+def generate_mock_embedding(text: str, dim: int = 384) -> list[float]:
     """Compat rétro : conservé pour l'ancien code et les tests. Utiliser get_embedder() ailleurs."""
     return MockEmbedder(dim=dim).embed_one(text)

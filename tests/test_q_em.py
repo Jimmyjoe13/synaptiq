@@ -1,15 +1,16 @@
 import os
 import sys
 import unittest
+
 import psycopg2
-from psycopg2.extras import RealDictCursor
 import redis
 from fastapi.testclient import TestClient
+from psycopg2.extras import RealDictCursor
 
 # Ajouter les chemins au sys.path pour pouvoir importer les modules
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from conftest import purge_tenants  # noqa: E402
+from conftest import purge_tenants
 
 from apps.api.main import app as fastapi_app
 from apps.worker.worker import generate_mock_embedding
@@ -34,7 +35,7 @@ class _ConstEmbedder:
 
 
 class TestQuantumEntanglementMemory(unittest.TestCase):
-    
+
     @classmethod
     def setUpClass(cls):
         # Le tenant est désormais résolu côté serveur (plus dans le body) : on aligne
@@ -75,18 +76,18 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
         tenant_id = "tenant_quantum"
         agent_id = "agent_quantum"
         session_id = "session_quantum"
-        
+
         query_text = "Quelles sont les préférences de Jimmy pour le dev Python ?"
         query_embedding = generate_mock_embedding(query_text)
-        
+
         # 1. Insertion de M1 : Mémoire sémantique directement liée à la requête (partage son embedding)
         m1_content = "L'utilisateur Jimmy adore programmer des jeux vidéo en Python."
         m1_embedding = query_embedding
-        
+
         # 2. Insertion de M2 : Règle procédurale intriquée (qui ne mentionne pas Python ni Jimmy)
         m2_content = "Consigne de style : Toujours nommer les fonctions en snake_case et documenter avec des docstrings."
         m2_embedding = generate_mock_embedding(m2_content) # Embedding sémantiquement distant
-        
+
         with self.db_conn.cursor() as cur:
             # Insertion M1
             cur.execute(
@@ -98,7 +99,7 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
                 (tenant_id, agent_id, m1_content, m1_embedding)
             )
             m1_id = cur.fetchone()[0]
-            
+
             # Insertion M2
             cur.execute(
                 """
@@ -109,7 +110,7 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
                 (tenant_id, agent_id, m2_content, m2_embedding)
             )
             m2_id = cur.fetchone()[0]
-            
+
             # Création de la relation d'intrication quantique
             cur.execute(
                 """
@@ -132,12 +133,12 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
                 "memory_types": ["semantic", "procedural"]
             }
         })
-        
+
         self.assertEqual(response.status_code, 200)
         data = response.json()
         context_packet = data['context_packet']
         selected_ids = data['selected_memory_ids']
-        
+
         # M1 doit être présente
         self.assertIn(m1_content, context_packet['facts'])
         # M2 doit avoir été intriquée et donc ramenée dans les règles, malgré l'absence de similarité directe !
@@ -154,13 +155,13 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
         tenant_id = "tenant_quantum"
         agent_id = "agent_quantum"
         session_id = "session_quantum"
-        
+
         # Créer deux mémoires avec des embeddings identiques (redondance maximale de 1.0)
         m1_content = "Jimmy boit du thé vert sencha tous les matins au réveil."
         m2_content = "Jimmy prend une tasse de thé vert sencha au réveil chaque matin."
         # Pour forcer une similarité de 1.0 dans le test, on va leur donner le même embedding
         embedding = generate_mock_embedding(m1_content)
-        
+
         with self.db_conn.cursor() as cur:
             cur.execute(
                 """
@@ -190,12 +191,12 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
                 "memory_types": ["semantic"]
             }
         })
-        
+
         self.assertEqual(response.status_code, 200)
         data = response.json()
         context_packet = data['context_packet']
         selected_ids = data['selected_memory_ids']
-        
+
         # Le contexte ne doit contenir qu'UNE SEULE des deux mémoires (celle de plus forte importance, M1)
         # Mémoires semantic/preference -> routées dans la collection 'preferences'.
         self.assertEqual(len(selected_ids), 1, "L'interférence destructive de redondance aurait dû éliminer la mémoire en doublon.")
@@ -212,13 +213,13 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
         tenant_id = "tenant_quantum"
         agent_id = "agent_quantum"
         session_id = "session_quantum"
-        
+
         m1_content = "Le bureau de Paris ferme à 18h00."
         m2_content = "Le bureau de Paris ferme désormais à 19h30 à partir d'aujourd'hui."
-        
+
         emb1 = generate_mock_embedding(m1_content)
         emb2 = generate_mock_embedding(m2_content)
-        
+
         with self.db_conn.cursor() as cur:
             # Insérer M1 (créée en premier)
             cur.execute(
@@ -230,7 +231,7 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
                 (tenant_id, agent_id, m1_content, emb1)
             )
             m1_id = cur.fetchone()[0]
-            
+
             # Insérer M2 (créée après)
             cur.execute(
                 """
@@ -241,7 +242,7 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
                 (tenant_id, agent_id, m2_content, emb2)
             )
             m2_id = cur.fetchone()[0]
-            
+
             # Lier les deux mémoires par une relation de contradiction
             cur.execute(
                 """
@@ -264,12 +265,12 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
                 "memory_types": ["semantic"]
             }
         })
-        
+
         self.assertEqual(response.status_code, 200)
         data = response.json()
         context_packet = data['context_packet']
         selected_ids = data['selected_memory_ids']
-        
+
         # Le contexte ne doit contenir que M2 (la plus récente)
         self.assertEqual(len(selected_ids), 1, "La contradiction aurait dû éliminer la mémoire obsolète.")
         self.assertIn(m2_content, context_packet['facts'])
@@ -283,13 +284,14 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
         2. On simule une règle de bonne pratique de programmation proche sémantiquement -> classifiée en coding_best_practices.
         3. On vérifie qu'une relation d'intrication 'supersedes_by' a été créée automatiquement.
         """
-        from apps.worker.worker import process_event
         from unittest.mock import patch
-        
+
+        from apps.worker.worker import process_event
+
         tenant_id = "tenant_quantum"
         agent_id = "agent_quantum"
         session_id = "session_quantum"
-        
+
         # 1. Événement d'erreur (contenant le mot clé 'traceback' ou 'erreur')
         event_error = {
             "id": "e0000000-0000-0000-0000-000000000001",
@@ -298,7 +300,7 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             "session_id": session_id,
             "content": "Erreur critique : le script Python a crashé avec un traceback d'import de socket au démarrage sous Windows."
         }
-        
+
         # 2. Événement de bonne pratique proche sémantiquement (contenant 'bonne pratique' ou 'toujours')
         event_best_practice = {
             "id": "e0000000-0000-0000-0000-000000000002",
@@ -307,7 +309,7 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             "session_id": session_id,
             "content": "Bonne pratique : toujours importer de façon paresseuse les modules réseau sous Windows pour éviter les plantages."
         }
-        
+
         # Les événements doivent exister en base avant consolidation : le worker
         # écrit memories.source_event_id qui référence events(id) (FK). En prod,
         # l'API insère l'événement (outbox) avant que le worker ne le traite.
@@ -330,7 +332,7 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
 
             success2 = process_event(event_best_practice)
             self.assertTrue(success2)
-        
+
         # 3. Vérification en base de données
         with self.db_conn.cursor(cursor_factory=RealDictCursor) as cur:
             # Récupérer les souvenirs créés
@@ -340,17 +342,17 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             )
             rows = cur.fetchall()
             self.assertEqual(len(rows), 2)
-            
+
             err_mem = rows[0]
             bp_mem = rows[1]
-            
+
             # Vérifier la classification
             self.assertEqual(err_mem['type'], 'procedural')
             self.assertEqual(err_mem['subtype'], 'code_error_resolution')
-            
+
             self.assertEqual(bp_mem['type'], 'procedural')
             self.assertEqual(bp_mem['subtype'], 'coding_best_practices')
-            
+
             # Vérifier que la relation d'intrication 'supersedes_by' a été créée automatiquement !
             cur.execute(
                 "SELECT source_memory_id, target_memory_id, relation_type FROM relationships WHERE source_memory_id = %s OR target_memory_id = %s;",
@@ -358,13 +360,13 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             )
             rels = cur.fetchall()
             self.assertGreater(len(rels), 0, "Aucune relation d'intrication n'a été créée automatiquement !")
-            
+
             # La bonne pratique (bp_mem) remplace/résout l'erreur (err_mem), donc bp_mem --(supersedes_by)--> err_mem
             rel = rels[0]
             self.assertEqual(str(rel['source_memory_id']), str(bp_mem['id']))
             self.assertEqual(str(rel['target_memory_id']), str(err_mem['id']))
             self.assertEqual(rel['relation_type'], 'supersedes_by')
-            
+
             print("[SUCCESS] Classification de code et intrication automatique validées en BD !")
 
 if __name__ == '__main__':

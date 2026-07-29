@@ -1,23 +1,18 @@
-# SynaptiQ — dépendances runtime (API + worker + core + SDK)
-# NB : le serveur MCP a ses propres deps (fastmcp) dans apps/mcp/requirements.txt
+# SynaptiQ — dépendances runtime de l'API (et du service de migration).
+#
+# Le socle partagé avec le worker et le relais vit dans requirements-common.txt.
+# NB : le serveur MCP a ses propres deps (fastmcp) dans apps/mcp/requirements.txt.
 # Pour l'environnement de dev complet (tests, lint, mcp) : requirements-dev.txt
+
+-r requirements-common.txt
 
 # --- API FastAPI ---
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
 
-# --- Stockage ---
-psycopg2-binary==2.9.10
-redis==5.2.1
-
-# --- HTTP / config (worker, embeddings LM Studio, SDK) ---
-requests==2.32.3
-# NB : >=1.1.0 requis par fastmcp (serveur MCP, requirements-dev). Épingler 1.0.1
-# rendait requirements-dev.txt non résoluble.
-python-dotenv>=1.1.0,<2
-
-# --- Sécurité (Phase 3 : rate limiting) ---
+# --- Sécurité (rate limiting) ---
 slowapi==0.1.9
+
+# --- Migrations de schéma (Alembic est la seule autorité du schéma) ---
 alembic==1.14.1
-prometheus-client==0.21.1

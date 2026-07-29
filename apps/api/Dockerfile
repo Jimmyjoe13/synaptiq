@@ -19,5 +19,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copier le code (l'API importe apps.worker et packages/core)
 COPY . .
 
+# Utilisateur non privilégié : une exécution en root donnerait à une éventuelle exécution
+# de code arbitraire les pleins pouvoirs dans le conteneur (et sur les volumes montés).
+# `alembic` doit rester exécutable par cet utilisateur : le service Compose `migrate`
+# réutilise cette même image.
+RUN useradd --create-home --shell /usr/sbin/nologin synaptiq \
+    && chown -R synaptiq:synaptiq /app
+USER synaptiq
+
 EXPOSE 8000
 CMD ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

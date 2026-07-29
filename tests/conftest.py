@@ -15,6 +15,22 @@ for _p in (ROOT, os.path.join(ROOT, "packages", "core"), os.path.join(ROOT, "pac
         sys.path.insert(0, _p)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def juge_de_contradiction_neutre():
+    """Neutralise le juge de contradiction pour toute la suite (déterminisme).
+
+    Depuis le 29/07, l'archivage d'une préférence exige un verdict explicite, rendu par un
+    LLM quand il est configuré. Le `.env` local pointe un vrai fournisseur : sans ce
+    garde-fou, la suite émettrait des appels réseau et deviendrait lente et instable.
+    Les tests qui ont besoin d'un verdict injectent leur propre juge (`judge=...`) ou
+    patchent `get_contradiction_judge`.
+    """
+    os.environ["CONTRADICTION_JUDGE"] = "off"
+    from synaptiq_core.contradiction import get_contradiction_judge
+    get_contradiction_judge.cache_clear()
+    yield
+
+
 def pytest_collection_modifyitems(config, items):
     for item in items:
         path = str(item.fspath).replace("\\", "/")
@@ -39,4 +55,8 @@ def purge_tenants(conn, *tenants: str) -> None:
         cur.execute("DELETE FROM memories WHERE tenant_id = ANY(%s)", (list(tenants),))
         cur.execute("DELETE FROM events WHERE tenant_id = ANY(%s)", (list(tenants),))
         cur.execute("DELETE FROM api_keys WHERE tenant_id = ANY(%s)", (list(tenants),))
+        # `audit_log` n'est PAS supprimée par la purge RGPD de l'API (c'en est la trace) :
+        # il faut donc la nettoyer explicitement ici, sinon les lignes des tests
+        # s'accumulent et faussent les assertions de comptage du run suivant.
+        cur.execute("DELETE FROM audit_log WHERE tenant_id = ANY(%s)", (list(tenants),))
         conn.commit()

@@ -1,9 +1,9 @@
-import os
 import logging
-from typing import Optional
-from fastmcp import FastMCP
+import os
+
 import requests
 from dotenv import load_dotenv
+from fastmcp import FastMCP
 
 # Configurer le logging
 logging.basicConfig(level=logging.INFO)
@@ -14,6 +14,13 @@ load_dotenv()
 SYNAPTIQ_API_URL = os.getenv("SYNAPTIQ_API_URL", "http://127.0.0.1:8000")
 SYNAPTIQ_API_KEY = os.getenv("SYNAPTIQ_API_KEY", "")
 
+# Identite de l'agent, fixee par la CONFIGURATION du serveur MCP et non par l'appelant.
+# Jusqu'au 29/07, `agent_id` etait un parametre des outils : c'etait donc le LLM qui
+# choisissait sous quelle identite lire et ecrire, et il suffisait d'une autre chaine pour
+# atteindre la memoire d'un autre agent de l'instance. Une valeur d'environnement n'est
+# atteignable par aucun prompt.
+SYNAPTIQ_AGENT_ID = os.getenv("SYNAPTIQ_AGENT_ID", "qwen_code_agent")
+
 # En-tête d'auth propagé à l'API si une clé est configurée (Phase 3, multi-tenant)
 HEADERS = {"Authorization": f"Bearer {SYNAPTIQ_API_KEY}"} if SYNAPTIQ_API_KEY else {}
 
@@ -21,7 +28,7 @@ HEADERS = {"Authorization": f"Bearer {SYNAPTIQ_API_KEY}"} if SYNAPTIQ_API_KEY el
 mcp = FastMCP("SynaptiQ Memory Engine")
 
 @mcp.tool()
-def store_memory(content: str, memory_type: str, subtype: Optional[str] = None, agent_id: str = "qwen_code_agent") -> str:
+def store_memory(content: str, memory_type: str, subtype: str | None = None) -> str:
     """
     Enregistre de maniere autonome un fait, une preference, une regle ou un episode dans la memoire SynaptiQ.
 
@@ -29,11 +36,10 @@ def store_memory(content: str, memory_type: str, subtype: Optional[str] = None, 
         content: Le souvenir ou fait a retenir (ex: 'L'utilisateur prefere les rapports courts').
         memory_type: Le type de memoire ('semantic' pour les faits/preferences, 'procedural' pour les regles/playbooks, 'episodic' pour les actions/resultats).
         subtype: Precision optionnelle (ex: 'preference', 'rule', 'error_resolution').
-        agent_id: Identifiant de l'agent qui ecrit (default: 'qwen_code_agent').
     """
     url = f"{SYNAPTIQ_API_URL}/v1/memories"
     payload = {
-        "agent_id": agent_id,
+        "agent_id": SYNAPTIQ_AGENT_ID,
         "type": memory_type,
         "subtype": subtype,
         "content": content,
@@ -49,7 +55,7 @@ def store_memory(content: str, memory_type: str, subtype: Optional[str] = None, 
         return f"[ERROR] Echec de l'enregistrement de la memoire : {e}"
 
 @mcp.tool()
-def recall_memories(query: str, limit: int = 5, memory_type: Optional[str] = None, agent_id: str = "qwen_code_agent") -> str:
+def recall_memories(query: str, limit: int = 5, memory_type: str | None = None) -> str:
     """
     Recherche sementiquement des souvenirs ou regles dans la memoire SynaptiQ pour adapter les reponses ou actions de l'agent.
 
@@ -57,11 +63,10 @@ def recall_memories(query: str, limit: int = 5, memory_type: Optional[str] = Non
         query: Le sujet ou mot-cle a rechercher (ex: 'preferences style ecriture').
         limit: Nombre maximum de souvenirs a ramener (default: 5).
         memory_type: Filtrer par type de memoire ('semantic', 'procedural', 'episodic').
-        agent_id: Identifiant de l'agent.
     """
     url = f"{SYNAPTIQ_API_URL}/v1/retrieve"
     payload = {
-        "agent_id": agent_id,
+        "agent_id": SYNAPTIQ_AGENT_ID,
         "query": query,
         "limit": limit,
         "memory_type": memory_type
@@ -83,8 +88,7 @@ def recall_memories(query: str, limit: int = 5, memory_type: Optional[str] = Non
 
 
 @mcp.tool()
-def build_context(task: str, query: str, max_tokens: int = 1200,
-                  agent_id: str = "qwen_code_agent") -> str:
+def build_context(task: str, query: str, max_tokens: int = 1200) -> str:
     """
     Assemble un paquet de contexte compact (Q-EM) pret a injecter dans le prompt systeme
     de l'agent : faits, preferences, episodes, regles, bonnes pratiques, erreurs.
@@ -93,11 +97,10 @@ def build_context(task: str, query: str, max_tokens: int = 1200,
         task: La tache en cours (ex: 'Rediger un email de suivi B2B').
         query: La requete de rappel semantique (ex: 'style d'ecriture, preferences client').
         max_tokens: Budget de tokens du contexte (default: 1200).
-        agent_id: Identifiant de l'agent.
     """
     url = f"{SYNAPTIQ_API_URL}/v1/context/build"
     payload = {
-        "agent_id": agent_id,
+        "agent_id": SYNAPTIQ_AGENT_ID,
         "session_id": "mcp-session",
         "task": task,
         "query": query,
@@ -130,7 +133,10 @@ if __name__ == "__main__":
     if transport == "stdio":
         mcp.run()
     else:
-        host = os.getenv("MCP_HOST", "0.0.0.0")
+        # 0.0.0.0 est intentionnel : en conteneur, se lier a 127.0.0.1 rendrait le serveur
+        # injoignable depuis l'hote. Le port n'est publie que sur 127.0.0.1 par Compose,
+        # et ce transport exige SYNAPTIQ_API_KEY (verifie ci-dessus).
+        host = os.getenv("MCP_HOST", "0.0.0.0")  # noqa: S104
         port = int(os.getenv("MCP_PORT", "8765"))
         logger.info(f"Démarrage du serveur MCP en transport '{transport}' sur {host}:{port}")
         mcp.run(transport=transport, host=host, port=port)

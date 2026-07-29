@@ -14,7 +14,6 @@ from apps.worker.worker import (
     _validate_extraction,
 )
 
-
 # ─── Éligibilité à l'intrication ───
 
 @pytest.mark.parametrize("mtype,subtype", [
@@ -242,8 +241,9 @@ def test_un_evenement_produit_plusieurs_faits(monkeypatch):
 
 def test_date_relative_resolue_en_datetime(monkeypatch):
     """`occurred_at` ISO devient un datetime exploitable en base."""
-    import apps.worker.worker as worker
     from datetime import datetime
+
+    import apps.worker.worker as worker
     _reset_negociation(worker)
     monkeypatch.setattr(worker.requests, "post", lambda *a, **k: _payload([
         {"type": "semantic", "subtype": "fact", "content": "Caroline y est allée",

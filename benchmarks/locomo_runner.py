@@ -37,16 +37,22 @@ for _p in (_ROOT, os.path.join(_ROOT, "packages", "core")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from dotenv import load_dotenv  # noqa: E402
+from dotenv import load_dotenv
+
 load_dotenv(os.path.join(_ROOT, ".env"))
 
-from apps.worker import worker  # noqa: E402
-from apps.api import main as api  # noqa: E402
-from apps.api.main import app  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient
+
+from apps.api import main as api
+from apps.api.main import app
+from apps.worker import worker
+
 # Même estimateur de tokens que le collapse Q-EM : indispensable pour que les deux bras
 # soient comparés à budget de contexte réellement identique.
-from synaptiq_core.qem import estimate_tokens  # noqa: E402
+from synaptiq_core.qem import estimate_tokens
+
+# Intervalles de confiance : une exactitude sans incertitude n'est pas exploitable.
+from synaptiq_core.stats import Difference, Proportion, required_sample_size
 
 logging.getLogger("synaptiq-worker").setLevel(logging.WARNING)
 logging.getLogger("synaptiq-core.embeddings").setLevel(logging.WARNING)
@@ -366,11 +372,22 @@ def run(args) -> dict:
         qem_acc = report["arms"]["qem"]["accuracy_overall"]
         vec_acc = report["arms"]["vector"]["accuracy_overall"]
         report["delta_qem_minus_vector"] = round(qem_acc - vec_acc, 4)
+        # Le delta seul est trompeur : on publie son intervalle et un verdict explicite.
+        # Sur un run à une conversation (~152 questions), le verdict est « non significatif »
+        # — c'est une information, pas un échec : elle dit qu'il faut plus de questions.
+        difference = Difference(a=_proportion([r for r in results if r["arm"] == "qem"]),
+                                b=_proportion([r for r in results if r["arm"] == "vector"]))
+        report["delta_qem_minus_vector_ci"] = difference.as_dict()
+        report["sample_size_needed_for_2pts_margin"] = required_sample_size(2.0)
     return {"report": report, "results": results}
 
 
 def _accuracy(rows: list[dict]) -> float:
     return sum(r["correct"] for r in rows) / len(rows) if rows else 0.0
+
+
+def _proportion(rows: list[dict]) -> Proportion:
+    return Proportion(successes=sum(1 for r in rows if r["correct"]), total=len(rows))
 
 
 def _arm_report(rows: list[dict]) -> dict:
@@ -379,8 +396,16 @@ def _arm_report(rows: list[dict]) -> dict:
         by_cat.setdefault(r["category"], []).append(r["correct"])
     return {
         "accuracy_overall": round(_accuracy(rows), 4),
+        # L'exactitude est TOUJOURS accompagnée de son intervalle de confiance : une
+        # proportion sans incertitude ne permet à personne de décider quoi que ce soit,
+        # et sur 152 questions la marge à 95 % vaut ~±8 points.
+        "accuracy_overall_ci": _proportion(rows).as_dict(),
         "accuracy_by_category": {
             CATEGORY_NAMES.get(c, str(c)): round(sum(v) / len(v), 4) for c, v in sorted(by_cat.items())
+        },
+        "accuracy_by_category_ci": {
+            CATEGORY_NAMES.get(c, str(c)): Proportion(sum(v), len(v)).as_dict()
+            for c, v in sorted(by_cat.items())
         },
         # À exactitude comparable, le contexte le plus court gagne : c'est l'argument coût.
         "avg_context_tokens": round(sum(r["context_tokens"] for r in rows) / len(rows), 1) if rows else 0.0,

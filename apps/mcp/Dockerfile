@@ -12,5 +12,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Utilisateur non privilégié (cf. Dockerfile de l'API).
+RUN useradd --create-home --shell /usr/sbin/nologin synaptiq \
+    && chown -R synaptiq:synaptiq /app
+USER synaptiq
+
 EXPOSE 8765
 CMD ["python", "-u", "apps/mcp/server.py"]

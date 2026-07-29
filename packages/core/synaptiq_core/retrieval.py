@@ -13,7 +13,7 @@ hybrides de référence.
 """
 from __future__ import annotations
 
-from typing import Dict, Iterable, List
+from collections.abc import Iterable
 
 # Constante d'amortissement de la RRF. 60 est la valeur de la publication d'origine
 # (Cormack et al., 2009) et le défaut de la plupart des implémentations : elle empêche les
@@ -22,10 +22,10 @@ DEFAULT_RRF_K = 60
 
 
 def reciprocal_rank_fusion(
-    rankings: Iterable[List[str]],
+    rankings: Iterable[list[str]],
     k: int = DEFAULT_RRF_K,
     weights: Iterable[float] | None = None,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """Fusionne plusieurs classements en un score unique par identifiant.
 
     Chaque classement contribue `poids / (k + rang)`, le rang commençant à 1. Un document
@@ -48,8 +48,8 @@ def reciprocal_rank_fusion(
         if len(poids) != len(rankings):
             raise ValueError("weights doit avoir autant d'entrées que rankings")
 
-    scores: Dict[str, float] = {}
-    for ranking, poids_i in zip(rankings, poids):
+    scores: dict[str, float] = {}
+    for ranking, poids_i in zip(rankings, poids, strict=False):
         vus = set()
         for rang, doc_id in enumerate(ranking, start=1):
             if doc_id in vus:
@@ -60,11 +60,11 @@ def reciprocal_rank_fusion(
 
 
 def fuse_and_rank(
-    rankings: Iterable[List[str]],
+    rankings: Iterable[list[str]],
     k: int = DEFAULT_RRF_K,
     weights: Iterable[float] | None = None,
     limit: int | None = None,
-) -> List[str]:
+) -> list[str]:
     """`reciprocal_rank_fusion` suivie d'un tri décroissant, éventuellement tronqué.
 
     À score égal, l'ordre du premier classement fourni départage : le résultat reste
@@ -74,7 +74,7 @@ def fuse_and_rank(
     rankings = list(rankings)
     scores = reciprocal_rank_fusion(rankings, k=k, weights=weights)
 
-    ordre_reference = {}
+    ordre_reference: dict[str, int] = {}
     for ranking in rankings:
         for position, doc_id in enumerate(ranking):
             ordre_reference.setdefault(doc_id, position)

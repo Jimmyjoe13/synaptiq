@@ -192,6 +192,117 @@ def test_redondance_embeddings_distincts_conserves():
     assert candidates["B"]["score"] == 1.0
 
 
+# ─── Invariants de la version vectorisée du filtre de redondance (audit F9) ──
+
+def test_redondance_ne_propage_pas_en_chaine():
+    """Une mémoire ANNULÉE n'annule personne : la chaîne est rompue.
+
+    A et C sont orthogonaux (cosinus 0), mais B est proche des deux. B est annulé par A ;
+    il ne doit donc pas à son tour annuler C. Sans cette rupture, un maillon intermédiaire
+    propagerait des suppressions en cascade et viderait le contexte.
+    """
+    proche_de_a = [0.98, 0.199, 0.0]     # cos(A) ~0.98 > seuil
+    candidates = {
+        "A": _cand("A", importance=0.9, embedding=[1.0, 0.0, 0.0], score=1.0),
+        "B": _cand("B", importance=0.8, embedding=proche_de_a, score=1.0),
+        "C": _cand("C", importance=0.7, embedding=[0.0, 1.0, 0.0], score=1.0),
+    }
+    filter_redundancy(candidates, threshold=0.75)
+    assert candidates["A"]["score"] == 1.0
+    assert candidates["B"]["score"] == 0.0   # annulé par A
+    assert candidates["C"]["score"] == 1.0   # PAS annulé par B, qui est mort
+
+
+def test_redondance_compare_a_tous_les_conserves():
+    """Un candidat est annulé s'il est redondant avec N'IMPORTE lequel des conservés."""
+    candidates = {
+        "A": _cand("A", importance=0.9, embedding=[1.0, 0.0, 0.0], score=1.0),
+        "B": _cand("B", importance=0.8, embedding=[0.0, 1.0, 0.0], score=1.0),
+        # Orthogonal à A, mais quasi identique à B -> doit tomber.
+        "C": _cand("C", importance=0.7, embedding=[0.0, 0.99, 0.141], score=1.0),
+    }
+    filter_redundancy(candidates, threshold=0.75)
+    assert candidates["A"]["score"] == 1.0
+    assert candidates["B"]["score"] == 1.0
+    assert candidates["C"]["score"] == 0.0
+
+
+def test_redondance_ignore_les_candidats_sans_embedding():
+    """Sans vecteur, aucune redondance n'est démontrable : ni annulé, ni annulateur."""
+    candidates = {
+        "AVEC": _cand("AVEC", importance=0.9, embedding=[1.0, 0.0, 0.0], score=1.0),
+        "SANS": _cand("SANS", importance=0.8, embedding=[], score=1.0),
+        "COPIE": _cand("COPIE", importance=0.7, embedding=[1.0, 0.0, 0.0], score=1.0),
+    }
+    filter_redundancy(candidates, threshold=0.75)
+    assert candidates["AVEC"]["score"] == 1.0
+    assert candidates["SANS"]["score"] == 1.0    # conservé faute de vecteur
+    assert candidates["COPIE"]["score"] == 0.0   # annulé par AVEC malgré le trou
+
+
+def test_redondance_ecarte_les_dimensions_incoherentes():
+    """Un vecteur d'une autre dimension est écarté, jamais tronqué en silence."""
+    candidates = {
+        "REF": _cand("REF", importance=0.9, embedding=[1.0, 0.0, 0.0], score=1.0),
+        "AUTRE_DIM": _cand("AUTRE_DIM", importance=0.8, embedding=[1.0, 0.0], score=1.0),
+    }
+    filter_redundancy(candidates, threshold=0.75)
+    assert candidates["REF"]["score"] == 1.0
+    assert candidates["AUTRE_DIM"]["score"] == 1.0
+
+
+def test_redondance_accepte_les_tableaux_numpy():
+    """`parse_embedding` renvoie désormais un ndarray : le filtre doit l'accepter."""
+    import numpy as np
+    candidates = {
+        "HI": _cand("HI", importance=0.8, embedding=np.array([1.0, 0.0, 0.0]), score=1.0),
+        "LO": _cand("LO", importance=0.5, embedding=np.array([1.0, 0.0, 0.0]), score=1.0),
+    }
+    filter_redundancy(candidates, threshold=0.75)
+    assert candidates["HI"]["score"] == 1.0
+    assert candidates["LO"]["score"] == 0.0
+
+
+def test_redondance_equivalente_a_la_reference_naive():
+    """Équivalence avec l'implémentation de référence sur des données pseudo-aléatoires.
+
+    Garde-fou contre une divergence subtile introduite par la vectorisation : on rejoue
+    l'algorithme naïf (double boucle, rupture de chaîne) et on compare les scores.
+    """
+    import random
+    rng = random.Random(20260729)
+
+    def _reference(cands, seuil):
+        actifs = [c for c, v in cands.items() if v["score"] > 0.0]
+        actifs.sort(key=lambda c: (cands[c]["importance"], cands[c]["created_at"]), reverse=True)
+        for i in range(len(actifs)):
+            if cands[actifs[i]]["score"] == 0.0:
+                continue
+            for j in range(i + 1, len(actifs)):
+                if cands[actifs[j]]["score"] == 0.0:
+                    continue
+                cos = sum(x * y for x, y in zip(cands[actifs[i]]["embedding"],
+                                                cands[actifs[j]]["embedding"], strict=False))
+                if cos > seuil:
+                    cands[actifs[j]]["score"] = 0.0
+
+    for essai in range(30):
+        base = {}
+        for k in range(8):
+            vec = [rng.gauss(0, 1) for _ in range(6)]
+            norme = sum(x * x for x in vec) ** 0.5
+            base[f"m{k}"] = {"importance": round(rng.uniform(0, 1), 3),
+                             "embedding": [x / norme for x in vec]}
+        vectorise = {k: _cand(k, score=1.0, **v) for k, v in base.items()}
+        naif = {k: _cand(k, score=1.0, **v) for k, v in base.items()}
+
+        filter_redundancy(vectorise, threshold=0.3)
+        _reference(naif, 0.3)
+
+        assert {k: v["score"] for k, v in vectorise.items()} == \
+               {k: v["score"] for k, v in naif.items()}, f"divergence à l'essai {essai}"
+
+
 # ─── Phase 4 : mesure (collapse + routage) ───────────────────────────────────
 
 def test_collapse_respecte_budget():

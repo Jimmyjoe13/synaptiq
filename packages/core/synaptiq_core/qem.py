@@ -23,7 +23,8 @@ d'os.getenv ici, afin de tester chaque phase de manière déterministe.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Tuple
+
+import numpy as np
 
 logger = logging.getLogger("synaptiq-core.qem")
 
@@ -32,7 +33,7 @@ logger = logging.getLogger("synaptiq-core.qem")
 # Phase 1 — Superposition : scoring initial (similarité pondérée par la récence)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_recency_factor(age_seconds: float, halflife_days: float) -> float:
+def compute_recency_factor(age_seconds: float | None, halflife_days: float) -> float:
     """Facteur de décroissance temporelle (demi-vie exponentielle).
 
     - age_seconds : âge de la mémoire depuis son dernier accès (en secondes).
@@ -56,8 +57,8 @@ def initial_score(similarity: float, recency_factor: float) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def propagate_entanglement(
-    candidates: Dict[str, dict],
-    relationships: List[dict],
+    candidates: dict[str, dict],
+    relationships: list[dict],
     damping: float,
     max_hops: int = 2,
 ) -> None:
@@ -83,7 +84,7 @@ def propagate_entanglement(
         return
 
     # Adjacence bidirectionnelle limitée aux liens dont les 2 extrémités sont candidates.
-    adjacency: Dict[str, List[Tuple[str, float]]] = {}
+    adjacency: dict[str, list[tuple[str, float]]] = {}
     for rel in relationships:
         if rel['relation_type'] != 'entangled_with':
             continue
@@ -105,7 +106,7 @@ def propagate_entanglement(
     for _hop in range(max_hops):
         # Contributions du niveau courant, sommées AVANT de marquer `visited` :
         # un nœud atteint par plusieurs parents au même niveau cumule leurs apports.
-        level_contrib: Dict[str, float] = {}
+        level_contrib: dict[str, float] = {}
         for node in frontier:
             for neighbor, weight in adjacency.get(node, []):
                 if neighbor in visited:
@@ -128,8 +129,8 @@ def propagate_entanglement(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def apply_contradictions(
-    candidates: Dict[str, dict],
-    relationships: List[dict],
+    candidates: dict[str, dict],
+    relationships: list[dict],
 ) -> None:
     """Annule (score=0) la mémoire la plus ANCIENNE d'un couple en contradiction.
 
@@ -152,37 +153,78 @@ def apply_contradictions(
 
 
 def filter_redundancy(
-    candidates: Dict[str, dict],
+    candidates: dict[str, dict],
     threshold: float,
 ) -> None:
     """Filtre les redondances sémantiques par similarité cosinus des embeddings.
 
     Parmi les candidats encore actifs (score > 0), triés par (importance, created_at)
-    décroissants, deux mémoires dont le cosinus dépasse `threshold` sont jugées
-    redondantes : la moins prioritaire (celle qui vient après dans le tri) est annulée.
-    Les embeddings sont supposés normalisés (cosinus = produit scalaire).
+    décroissants, une mémoire dont le cosinus avec une mémoire CONSERVÉE dépasse
+    `threshold` est jugée redondante et annulée. Les embeddings sont supposés
+    L2-normalisés (cosinus = produit scalaire), garanti par la couche embeddings.
+
+    ## Pourquoi cette version est vectorisée
+
+    L'implémentation d'origine faisait une double boucle Python avec un
+    `sum(x*y for x, y in zip(...))` par paire. Avec `RETRIEVAL_CANDIDATES=50` et des
+    vecteurs de 384 dimensions, cela représente jusqu'à 1 225 paires x 384
+    multiplications, soit ~470 000 opérations en Python pur À CHAQUE construction de
+    contexte — le point chaud de latence de `build_context` en dehors du SQL. Les mêmes
+    produits scalaires tiennent ici en UN produit matriciel (`M @ M.T`).
+
+    La sémantique est strictement préservée, y compris la rupture de chaîne : seule une
+    mémoire CONSERVÉE peut en annuler une autre. Une mémoire annulée n'annule personne,
+    faute de quoi un maillon intermédiaire propagerait des suppressions en cascade.
+
+    Une mémoire sans embedding (ou de dimension incohérente) n'est ni annulée ni
+    annulatrice : sans vecteur, aucune redondance n'est démontrable.
     """
     active_ids = [cid for cid, c in candidates.items() if c['score'] > 0.0]
     # Conserver en priorité les plus importants / récents (annulera les suivants).
     active_ids.sort(key=lambda cid: (candidates[cid]['importance'], candidates[cid]['created_at']), reverse=True)
+    if len(active_ids) < 2:
+        return
 
-    for i in range(len(active_ids)):
-        id_i = active_ids[i]
-        if candidates[id_i]['score'] == 0.0:
+    # Ne comparer que les candidats porteurs d'un vecteur exploitable. Une dimension
+    # divergente (modèle changé sans migration) est écartée plutôt que tronquée
+    # silencieusement : un cosinus calculé sur un préfixe de vecteur n'a aucun sens.
+    vecteurs, ids_comparables = [], []
+    dim_reference = None
+    for cid in active_ids:
+        emb = candidates[cid].get('embedding')
+        taille = len(emb) if emb is not None else 0
+        if not taille:
             continue
-        emb_i = candidates[id_i]['embedding']
+        if dim_reference is None:
+            dim_reference = taille
+        elif taille != dim_reference:
+            logger.warning("Q-EM: %s ignoré par le filtre de redondance (dimension %d != %d).",
+                           cid, taille, dim_reference)
+            continue
+        vecteurs.append(emb)
+        ids_comparables.append(cid)
 
-        for j in range(i + 1, len(active_ids)):
-            id_j = active_ids[j]
-            if candidates[id_j]['score'] == 0.0:
+    if len(ids_comparables) < 2:
+        return
+
+    # Tous les produits scalaires en une passe BLAS, au lieu d'une double boucle Python.
+    matrice = np.asarray(vecteurs, dtype=np.float64)
+    cosinus = matrice @ matrice.T
+
+    positions_conservees: list[int] = []
+    for position, cid in enumerate(ids_comparables):
+        if positions_conservees:
+            # Comparaison vectorisée contre TOUS les candidats déjà conservés.
+            contre_conserves = cosinus[position, positions_conservees]
+            plus_proche = int(np.argmax(contre_conserves))
+            if contre_conserves[plus_proche] > threshold:
+                candidates[cid]['score'] = 0.0
+                gagnant = ids_comparables[positions_conservees[plus_proche]]
+                logger.info("Q-EM: Interférence destructive (redondance sim=%.2f) : "
+                            "%s annulé au profit de %s",
+                            float(contre_conserves[plus_proche]), cid, gagnant)
                 continue
-            emb_j = candidates[id_j]['embedding']
-
-            if emb_i and emb_j:
-                cosine_sim = sum(x * y for x, y in zip(emb_i, emb_j))
-                if cosine_sim > threshold:
-                    candidates[id_j]['score'] = 0.0
-                    logger.info(f"Q-EM: Interférence destructive (redondance sim={cosine_sim:.2f}) : {id_j} annulé au profit de {id_i}")
+        positions_conservees.append(position)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,7 +240,7 @@ def estimate_tokens(content: str) -> int:
     return max(1, int(len(content.split()) * 1.3))
 
 
-def route_memory(m_type: str, m_subtype) -> str:
+def route_memory(m_type: str, m_subtype: str | None) -> str | None:
     """Détermine la clé du context_packet cible pour une mémoire (type/subtype).
 
     Routage « correct » (intention du code d'origine) :
@@ -244,9 +286,9 @@ def format_entry(content: str, occurred_at) -> str:
 
 
 def collapse_by_utility(
-    candidates: Dict[str, dict],
+    candidates: dict[str, dict],
     max_tokens: int,
-) -> Tuple[Dict[str, list], List[str], int]:
+) -> tuple[dict[str, list], list[str], int]:
     """Collapse glouton : maximise l'utilité/token sous contrainte `max_tokens`.
 
     Retourne `(context_packet, selected_ids, token_count)` où `context_packet`
@@ -277,8 +319,8 @@ def collapse_by_utility(
     # Tri par densité d'utilité par token décroissante (stable sur l'ordre d'insertion).
     collapsed_candidates.sort(key=lambda x: x['utility_density'], reverse=True)
 
-    packet = {k: [] for k in _PACKET_KEYS}
-    selected_ids: List[str] = []
+    packet: dict[str, list[str]] = {k: [] for k in _PACKET_KEYS}
+    selected_ids: list[str] = []
     token_count = 0
 
     for c in collapsed_candidates:

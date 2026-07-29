@@ -16,10 +16,18 @@ jobs:
           python-version: "3.12"
       - name: Installer les dépendances
         run: pip install -r requirements-dev.txt
-      - name: Ruff (erreurs réelles)
-        run: ruff check apps packages scripts --select E9,F
-      - name: Tests unitaires (sans infra)
-        run: pytest tests/unit -q
+      # La sélection de règles vit dans ruff.toml (E,W,F,I,B,UP,S,C4,RUF) depuis le 29/07 :
+      # plus de `--select` en ligne de commande, sinon la config du dépôt est contournée.
+      - name: Ruff (lint + sécurité + imports)
+        run: ruff check apps packages scripts tests benchmarks migrations examples
+      - name: Mypy (packages/core)
+        run: mypy
+      - name: Tests unitaires (sans infra) + couverture de packages/core
+        # Seuil à 90 % alors que la couverture réelle est de 95 % : un garde-fou contre une
+        # régression franche, pas un plafond qui casse au premier ajout de code.
+        run: pytest tests/unit -q --cov=synaptiq_core --cov-report=term-missing --cov-fail-under=90
+        env:
+          PYTHONPATH: packages/core
 
   integration:
     name: Tests d'intégration (hérités)
@@ -55,9 +63,9 @@ jobs:
           python-version: "3.12"
       - name: Installer les dépendances
         run: pip install -r requirements-dev.txt
-      - name: Initialiser le schéma
-        run: psql "$DATABASE_URL" -f infra/postgres/init.sql
-      - name: Appliquer les migrations
+      # Alembic est la seule autorité du schéma depuis le 29/07 : plus de psql init.sql
+      # en amont (il ne crée plus que l'extension, que la révision 0001 crée aussi).
+      - name: Créer le schéma (Alembic)
         run: alembic upgrade head
       - name: Tests d'intégration
         run: pytest -m integration -q
