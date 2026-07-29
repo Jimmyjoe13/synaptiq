@@ -6,6 +6,7 @@
 `agent_id` était un paramètre choisi par le modèle lui-même.
 """
 import inspect
+import logging
 import sys
 from pathlib import Path
 
@@ -86,6 +87,38 @@ def test_aucun_defaut_d_identite():
     import inspect
     source = inspect.getsource(mcp_server)
     assert 'os.getenv("SYNAPTIQ_AGENT_ID", "qwen_code_agent")' not in source
+
+
+def test_une_identite_manquante_ne_tue_pas_le_serveur(monkeypatch, caplog):
+    """RÉGRESSION : « échouer vite » rendait le serveur INVISIBLE dans le client MCP.
+
+    Le garde-fou levait une RuntimeError au démarrage. Résultat côté client :
+    `failed to stop mcp instance: synaptiq: exit status 1`, stderr jeté, et le serveur
+    absent de la liste. Le message d'aide n'atteignait donc personne.
+
+    Échouer vite n'a de valeur que si quelqu'un lit l'échec. Le serveur démarre désormais
+    toujours et c'est l'appel d'outil qui explique le problème.
+    """
+    monkeypatch.setattr(mcp_server, "SYNAPTIQ_AGENT_ID", "")
+    with caplog.at_level(logging.ERROR):
+        assert mcp_server.verifier_configuration() is False
+    assert "DEMARRAGE DEGRADE" in caplog.text
+    assert "SYNAPTIQ_AGENT_ID" in caplog.text
+
+
+def test_configuration_complete_est_signalee(monkeypatch, caplog):
+    monkeypatch.setattr(mcp_server, "SYNAPTIQ_AGENT_ID", "agent_configure")
+    with caplog.at_level(logging.INFO):
+        assert mcp_server.verifier_configuration() is True
+    assert "agent_configure" in caplog.text
+
+
+def test_le_demarrage_ne_leve_pas_sans_identite():
+    """Le bloc __main__ ne doit plus contenir de `raise` sur l'identité manquante."""
+    import inspect
+    source = inspect.getsource(mcp_server)
+    bloc_main = source[source.index('if __name__ == "__main__":'):]
+    assert "raise RuntimeError(_AIDE_AGENT_ID)" not in bloc_main
 
 
 def test_require_agent_id_echoue_avec_un_message_actionnable(monkeypatch):

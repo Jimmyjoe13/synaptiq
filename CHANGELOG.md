@@ -36,6 +36,25 @@ avant que l'API écoute, il réessaie une fois (`SYNAPTIQ_RETRY_DELAI_S`).
 
 Leçon générale : **le handshake d'un protocole ne doit jamais attendre une tâche annexe.**
 
+### `SYNAPTIQ_AGENT_ID` manquant ne tue plus le serveur
+
+Rendre l'identité obligatoire était juste ; **échouer au démarrage** ne l'était pas. En
+contexte MCP, un serveur qui refuse de démarrer disparaît de la liste du client, qui
+n'affiche qu'un `failed to stop mcp instance: synaptiq: exit status 1` et jette stderr — le
+message d'aide, soigneusement rédigé, n'atteignait donc personne. Symptôme constaté : le
+serveur invisible et un code d'erreur opaque, soit l'inverse de l'intention.
+
+Échouer vite n'a de valeur que si quelqu'un LIT l'échec. Le serveur démarre désormais
+toujours et expose ses outils ; `verifier_configuration()` journalise un `DEMARRAGE
+DEGRADE`, et chaque appel d'outil renvoie l'explication complète — le seul canal que
+l'utilisateur lit réellement. Le refus de démarrer reste en place pour le transport
+**réseau** sans clé API, où c'est une ouverture et non une gêne de diagnostic.
+
+Seconde cause du même `exit status 1`, indépendante : `python -m apps.mcp.server` exige que
+le client applique `cwd`, sans quoi c'est un `ModuleNotFoundError`. Le script insérant
+lui-même `sys.path`, la configuration de référence l'appelle désormais par **chemin absolu**,
+sans `cwd`.
+
 ### La taxonomie s'applique aux DEUX chemins d'écriture
 `VALID_SUBTYPES` vivait dans le worker, donc n'était appliquée qu'à l'extraction LLM :
 `POST /v1/memories` acceptait n'importe quel sous-type. Constaté en production, des mémoires

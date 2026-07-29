@@ -55,10 +55,40 @@ _AIDE_AGENT_ID = (
 
 
 def require_agent_id() -> str:
-    """Retourne l'identite configuree, ou echoue avec un message actionnable."""
+    """Retourne l'identite configuree, ou echoue avec un message actionnable.
+
+    Leve ICI, au moment de l'appel d'outil, et non au demarrage : c'est le seul endroit ou
+    le message atteint reellement l'utilisateur (cf. `verifier_configuration`).
+    """
     if not SYNAPTIQ_AGENT_ID:
         raise RuntimeError(_AIDE_AGENT_ID)
     return SYNAPTIQ_AGENT_ID
+
+
+def verifier_configuration() -> bool:
+    """Journalise l'etat de la configuration au demarrage. Retourne True si elle est complete.
+
+    ⚠️ NE QUITTE PAS quand `SYNAPTIQ_AGENT_ID` manque, et c'est deliberé.
+
+    La version precedente levait une RuntimeError pour « echouer vite ». En contexte MCP,
+    c'etait exactement le mauvais choix : le client ne montre que
+    `failed to stop mcp instance: synaptiq: exit status 1`, jette le contenu de stderr, et
+    le serveur DISPARAIT de la liste des serveurs. Le message d'aide, si soigneusement
+    redige soit-il, n'atteignait donc jamais personne — et l'utilisateur se retrouvait avec
+    un code d'erreur opaque au lieu d'un diagnostic.
+
+    Echouer vite n'a de valeur que si quelqu'un LIT l'echec. Ici, le seul canal que
+    l'utilisateur lit vraiment est la reponse d'un outil. Le serveur demarre donc toujours,
+    expose ses outils, et chaque outil renvoie l'explication complete via `require_agent_id`.
+    """
+    if not SYNAPTIQ_AGENT_ID:
+        logger.error("DEMARRAGE DEGRADE — aucune identite memoire configuree. Le serveur "
+                     "demarre et expose ses outils, mais chaque appel echouera avec ce "
+                     "message : %s", _AIDE_AGENT_ID)
+        return False
+    logger.info("Serveur MCP SynaptiQ : agent_id=%s, API=%s.",
+                SYNAPTIQ_AGENT_ID, SYNAPTIQ_API_URL)
+    return True
 
 
 # Initialiser FastMCP
@@ -257,11 +287,12 @@ def build_context(task: str, query: str, max_tokens: int = 1200) -> str:
 if __name__ == "__main__":
     transport = os.getenv("MCP_TRANSPORT", "stdio")
 
-    # Echec au demarrage, et non a la premiere requete : le probleme se voit dans les logs
-    # MCP du client au lieu de se manifester comme une memoire mysterieusement vide.
-    if not SYNAPTIQ_AGENT_ID:
-        raise RuntimeError(_AIDE_AGENT_ID)
+    # Journalise l'etat de la configuration SANS quitter : un serveur MCP qui refuse de
+    # demarrer disparait de la liste du client, qui n'affiche qu'un « exit status 1 ».
+    verifier_configuration()
 
+    # Ici, en revanche, refuser de demarrer est le bon choix : exposer MCP sur le RESEAU
+    # sans clé serait une ouverture, pas une gene de diagnostic.
     if transport != "stdio" and not SYNAPTIQ_API_KEY:
         raise RuntimeError("SYNAPTIQ_API_KEY est obligatoire pour exposer MCP en réseau.")
 
@@ -269,9 +300,6 @@ if __name__ == "__main__":
     # lancer de serveur. Desactivable, car en conteneur l'API est un service a part.
     if os.getenv("SYNAPTIQ_AUTOSTART_API", "true").lower() in ("1", "true", "yes"):
         ensure_api_running()
-
-    logger.info("Serveur MCP SynaptiQ : agent_id=%s, API=%s.",
-                SYNAPTIQ_AGENT_ID, SYNAPTIQ_API_URL)
 
     if transport == "stdio":
         mcp.run()

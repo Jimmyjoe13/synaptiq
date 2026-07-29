@@ -314,9 +314,8 @@ To connect SynaptiQ to **Claude Desktop** or **Cursor**, add the following snipp
 {
   "mcpServers": {
     "synaptiq": {
-      "command": "python",
-      "args": ["-m", "apps.mcp.server"],
-      "cwd": "/path/to/synaptiq",
+      "command": "/path/to/synaptiq/.venv/bin/python",
+      "args": ["/path/to/synaptiq/apps/mcp/server.py"],
       "env": {
         "SYNAPTIQ_API_URL": "http://127.0.0.1:8000",
         "SYNAPTIQ_API_KEY": "<your_api_key>",
@@ -327,6 +326,11 @@ To connect SynaptiQ to **Claude Desktop** or **Cursor**, add the following snipp
   }
 }
 ```
+
+> Use the **absolute path to `server.py`**, not `-m apps.mcp.server` with a `cwd`. The
+> script sets up `sys.path` itself, so it runs from any working directory. Clients that do
+> not apply `cwd` would otherwise fail with `ModuleNotFoundError`, which surfaces only as an
+> opaque `exit status 1`.
 
 <br>
 
