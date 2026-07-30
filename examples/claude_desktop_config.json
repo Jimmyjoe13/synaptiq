@@ -1,14 +1,20 @@
 {
+  "_comment": [
+    "Transport stdio (Claude Desktop, Cursor). Voir README, section « Installing the MCP Server ».",
+    "Chemins ABSOLUS obligatoires : le client n'applique pas toujours `cwd`, et un",
+    "ModuleNotFoundError ne remonte que sous la forme opaque `exit status 1`.",
+    "Avec antigravity CLI, preferer le transport http : { \"synaptiq\": { \"serverUrl\": \"http://127.0.0.1:8765/mcp/\" } }"
+  ],
   "mcpServers": {
     "synaptiq": {
-      "command": "python",
-      "args": ["-m", "apps.mcp.server"],
-      "cwd": "C:/Users/jimmy/Projet/SynaptiQ",
+      "command": "C:\\chemin\\vers\\synaptiq\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\chemin\\vers\\synaptiq\\apps\\mcp\\server.py"],
       "env": {
         "SYNAPTIQ_API_URL": "http://127.0.0.1:8000",
         "SYNAPTIQ_API_KEY": "votre_cle_api_ici",
-        "SYNAPTIQ_AGENT_ID": "qwen_code_agent",
-        "MCP_TRANSPORT": "stdio"
+        "SYNAPTIQ_AGENT_ID": "votre_agent_id",
+        "MCP_TRANSPORT": "stdio",
+        "SYNAPTIQ_AUTOSTART_API": "false"
       }
     }
   }

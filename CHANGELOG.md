@@ -1,5 +1,92 @@
 # Changelog
 
+## 0.2.7 - Unreleased — audit d'exploitation : quatre pannes silencieuses
+
+Audit du 30/07 mene sur le depot ET sur une instance de production reelle. Le code s'en sort
+bien ; l'exploitation beaucoup moins. Les quatre defauts trouves ont le meme trait : **aucun
+d'eux ne produit d'erreur**. C'est ce qui les rend graves pour un moteur de memoire, ou un
+resultat vide est indiscernable d'une memoire vide.
+
+### RUPTURE DE COMPATIBILITE — `admin` n'est plus implicite sans authentification
+
+`SYNAPTIQ_AUTH_REQUIRED=false` ouvrait la **purge RGPD**. Constate sur l'instance :
+`DELETE /v1/memories?confirm=<mauvais>` repondait `400`, pas `401`, sans aucune cle. Chaine
+complete : `get_auth()` rend `None`, `require_scope()` retournait aussitot, et il ne restait
+qu'a connaitre le nom du tenant — que le message d'erreur `400` livrait lui-meme
+(« Rappeler avec ?confirm=default »). Un appel local suffisait a vider l'instance.
+
+`require_scope(None, "admin")` leve desormais `403`. `read` et `write` restent permis sans cle :
+la commodite du mode de confiance vaut pour la lecture et l'ecriture, jamais pour la
+destruction. **Impact** : un script qui purgeait sans cle doit maintenant en presenter une
+portant `admin` (`create_api_key.py --scopes read write admin`).
+
+### Les images Docker `api`, `relay` et `migrate` etaient inconstructibles
+
+`apps/api/Dockerfile` copiait `requirements.txt` seul, alors que celui-ci commence par
+`-r requirements-common.txt` depuis le socle partage (F19). Tout build echouait sur
+`Could not open requirements file: '/app/requirements-common.txt'`. Comme cette image sert
+aussi `relay` et `migrate`, les trois services etaient hors service — et personne ne l'a vu
+parce que les conteneurs de l'instance tournaient encore sur des images anterieures au
+refactor. Corollaire mesure : la base etait estampillee `20260729_perf_idx` tandis que l'image
+`migrate` ignorait cette revision, donc `docker compose up` ne relevait plus rien
+(`depends_on: migrate: service_completed_successfully`).
+
+`apps/api/requirements.txt` est supprime : plus reference par rien, il avait deja derive
+(ni `numpy`, ni `prometheus-client`, ni `alembic`, et `python-dotenv==1.0.1` — l'epinglage que
+`requirements-common.txt` documente comme non resoluble). C'est exactement la derive que F19
+avait corrigee sur le worker, laissee en place sur l'API.
+
+### `/v1/health` denonce une ingestion a l'arret
+
+Un relais mort rend le chemin `/events` **totalement silencieux** : l'API ecrit dans l'outbox,
+repond `201 captured`, et la donnee n'est jamais consolidee. Constate sur l'instance, ou
+`synaptiq-relay` etait eteint depuis deux jours. Les jauges qui le detectaient
+(`synaptiq_outbox_pending`, `synaptiq_outbox_oldest_age_seconds`) existaient depuis F14, mais
+rien ne scrutait `/metrics` : une supervision non branchee est une supervision absente.
+
+`/v1/health` porte donc un troisieme service, `ingestion` : `healthy`, `stalled` ou `unknown`.
+C'est l'AGE du plus vieil evenement non publie qui decide (`HEALTH_OUTBOX_MAX_AGE_S`, 300 s),
+et non leur nombre : un outbox charge qui se vide est sain, un outbox a une entree immobile
+depuis une heure ne l'est pas. Le `status` global bascule en `degraded` — donc le healthcheck
+Compose de l'API le voit aussi.
+
+### Le worker refuse de demarrer sur un modele d'embedding incompatible
+
+L'instance a tourne avec `all-minilm-l6-v2` (anglophone) sur une base ecrite par
+`paraphrase-multilingual-minilm-l12-v2`. **384 dimensions tous les deux** : aucune exception,
+aucun log, aucune metrique — les vecteurs cessent simplement d'etre comparables et le rappel se
+degrade en silence. `EMBEDDING_DIM` ne protege que du cas bruyant.
+
+Le worker compare desormais, au demarrage, un vecteur deja stocke au meme contenu re-embarque
+par le modele courant. Cosinus < `EMBEDDING_COHERENCE_MIN` (0,999) -> `SystemExit` avec la
+mesure et la marche a suivre. Base vierge, base injoignable ou embedder muet : on laisse
+passer, il n'y a rien a contredire. Echappatoire assumee : `EMBEDDING_COHERENCE_CHECK=false`.
+Le worker QUITTE la ou le serveur MCP demarre degrade — la difference est qu'un worker qui
+continue **ecrit** des vecteurs incompatibles, donc aggrave les degats a chaque evenement.
+
+### Le relais ne s'empoisonne plus apres une coupure PostgreSQL
+
+`relay.py` appelait `conn.rollback()` sans garde. Quand PostgreSQL avait coupe, ce rollback
+levait `InterfaceError: connection already closed` — qui **remplacait l'erreur d'origine** dans
+les journaux — puis `putconn()` rendait au pool une connexion MORTE, redistribuee ensuite
+indefiniment : le relais ne se retablissait plus, meme PostgreSQL revenu. C'est le traceback
+reel du conteneur mort le 28/07. `worker.py` traitait deja ce cas correctement ; les deux
+formes sont alignees.
+
+### Documentation
+
+- Nouvelle section README **« Installing the MCP Server »** : ordre d'installation, tableau des
+  variables, comparatif `stdio` / `http` avec la limite mesuree, installation de reference
+  complete sous Windows, verification en trois points et tableau de depannage.
+- Le README affirmait que le serveur MCP **refuse de demarrer** sans `SYNAPTIQ_AGENT_ID`. Le
+  code fait deliberement l'inverse (et explique pourquoi) : corrige.
+- `examples/claude_desktop_config.json` faisait exactement ce que le README interdit
+  (`-m apps.mcp.server` + `cwd`), avec un chemin absolu personnel et l'`agent_id` a l'origine
+  de la panne du 29/07 : reecrit.
+
+Suite : **272 tests** (240 unitaires + 32 integration), ruff et mypy propres, couverture de
+`packages/core` a 95 %.
+
 ## 0.2.6 - Unreleased — le lanceur attend son infrastructure
 
 `start_services.ps1 -WaitForInfra <secondes>` patiente que PostgreSQL (5435) et Redis (6399)
