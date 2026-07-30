@@ -136,6 +136,49 @@ class TestReliability(unittest.TestCase):
             self._count("SELECT id::text FROM events WHERE tenant_id = 'test_tenant' LIMIT 1"),
         )
 
+    def test_health_signale_un_relais_mort(self):
+        """RÉGRESSION 30/07 : /health doit dénoncer une ingestion à l'arrêt.
+
+        Le relais de l'instance de production était éteint depuis deux jours. `/events`
+        continuait de répondre `201 captured` et rien ne l'indiquait : les événements
+        s'empilaient dans l'outbox sans jamais devenir des mémoires. Les jauges qui le
+        détectaient existaient, mais rien ne scrutait /metrics.
+
+        On vieillit artificiellement l'entrée d'outbox plutôt que d'attendre 300 s.
+        """
+        import apps.api.main as main
+
+        with TestClient(fastapi_app) as client:
+            client.post("/events", json={
+                "agent_id": "agent_rel",
+                "session_id": "sess_rel",
+                "content": "Evenement qui va rester en attente.",
+            })
+
+            # Outbox frais, personne ne l'a encore publié : c'est normal, pas une panne.
+            sain = client.get("/health").json()
+            self.assertEqual(sain["services"]["ingestion"], "healthy")
+
+            with self.db_conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE event_outbox SET created_at = CURRENT_TIMESTAMP - interval '1 hour' "
+                    "WHERE event_id IN (SELECT id FROM events WHERE tenant_id = 'test_tenant')"
+                )
+
+            malade = client.get("/health").json()
+
+        self.assertEqual(malade["services"]["ingestion"], "stalled")
+        # Et le statut global doit basculer : un `ok` avec une ingestion morte serait pire
+        # que pas de sonde du tout.
+        self.assertEqual(malade["status"], "degraded")
+        self.assertEqual(malade["services"]["postgres"], "healthy")
+
+        # Une fois publié, l'outbox se vide et la santé revient.
+        publish_pending(self.db_pool, self.redis_client)
+        with TestClient(fastapi_app) as client:
+            self.assertEqual(client.get("/health").json()["services"]["ingestion"], "healthy")
+        self.assertGreater(main.HEALTH_OUTBOX_MAX_AGE_S, 0)
+
     def test_worker_dedupes_replayed_event(self):
         """Rejouer le même événement (même source_event_id) ne crée qu'une mémoire."""
         from unittest.mock import patch

@@ -27,6 +27,9 @@ logger = logging.getLogger("synaptiq-relay")
 def publish_pending(db_pool, redis_client) -> int:
     """Publie un lot. Les doublons sont sûrs: le worker déduplique source_event_id."""
     conn = db_pool.getconn()
+    # Initialisé AVANT le try : le `finally` le lit sur TOUS les chemins, y compris le chemin
+    # nominal où le bloc `except` n'est jamais entré.
+    casse = False
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -43,10 +46,24 @@ def publish_pending(db_pool, redis_client) -> int:
             conn.commit()
             return len(rows)
     except Exception:
-        conn.rollback()
+        # Le rollback peut lui-même échouer : si PostgreSQL a coupé la connexion, psycopg2
+        # lève `InterfaceError: connection already closed`. Deux dégâts observés en
+        # production le 28/07 (traceback du conteneur `synaptiq-relay`) :
+        #   - cette seconde exception REMPLACE l'erreur d'origine (« Connection closed by
+        #     server »), donc les journaux accusent le rollback au lieu de la coupure ;
+        #   - `putconn` rend au pool une connexion MORTE, que le pool redistribue ensuite
+        #     indéfiniment : le relais ne se rétablit plus, même une fois PostgreSQL revenu.
+        # `worker.py` traite déjà ce cas correctement ; cette forme s'aligne dessus.
+        casse = True
+        try:
+            conn.rollback()
+            casse = False              # rollback réussi -> connexion réutilisable
+        except Exception:
+            logger.warning("Rollback impossible : la connexion sera fermée.", exc_info=True)
         raise
     finally:
-        db_pool.putconn(conn)
+        # Fermer la connexion si son état est douteux, plutôt que de la remettre en circulation.
+        db_pool.putconn(conn, close=casse)
 
 
 def main() -> None:

@@ -7,6 +7,7 @@ import sys
 import time
 from datetime import datetime
 
+import numpy as np
 import redis
 import requests
 from dotenv import load_dotenv
@@ -616,8 +617,93 @@ def _reclaim(r) -> None:
         logger.debug("reclaim ignoré : %s", e)
 
 
+# Cosinus minimal entre un vecteur stocké et le même contenu ré-embarqué par le modèle
+# COURANT. Deux modèles différents de même dimension descendent très bas ; le même modèle
+# rend 1.000 à la précision flottante près.
+EMBEDDING_COHERENCE_MIN = float(os.getenv("EMBEDDING_COHERENCE_MIN", "0.999"))
+EMBEDDING_COHERENCE_CHECK = os.getenv("EMBEDDING_COHERENCE_CHECK", "true").lower() in ("1", "true", "yes")
+
+
+def verifier_coherence_embedding() -> None:
+    """Refuse de démarrer si `EMBEDDING_MODEL` n'est pas celui qui a écrit les vecteurs.
+
+    ## Pourquoi un contrôle de dimension ne suffit pas
+
+    `EMBEDDING_DIM` protège du seul cas bruyant. Le cas dangereux est silencieux : deux
+    modèles de MÊME dimension. L'instance de production a tourné avec un modèle anglophone
+    (`all-minilm-l6-v2`, 384) sur une base écrite par un modèle multilingue
+    (`paraphrase-multilingual-minilm-l12-v2`, 384 aussi). Aucune exception, aucun log, aucune
+    métrique : les vecteurs cessent simplement d'être comparables et le rappel se dégrade EN
+    SILENCE. Pour un moteur de mémoire, c'est indiscernable d'une mémoire pauvre — donc
+    indébuggable de l'extérieur.
+
+    Le seul test valide est empirique : ré-embarquer un contenu déjà stocké et comparer. Même
+    modèle -> cosinus 1.000. Modèle différent -> nettement en dessous.
+
+    Le worker QUITTE ici, contrairement au serveur MCP qui démarre dégradé. La différence est
+    le lecteur : un worker est supervisé par un orchestrateur qui affiche ses sorties, alors
+    qu'un client MCP jette stderr et se contente d'un « exit status 1 ». Et surtout, un worker
+    qui continue ÉCRIT des vecteurs incompatibles — chaque événement traité aggrave les
+    dégâts. Refuser de démarrer est ici la seule option non destructive.
+
+    Base vierge ou vecteur illisible : on laisse passer. Il n'y a rien à contredire.
+    """
+    if not EMBEDDING_COHERENCE_CHECK:
+        logger.warning("Contrôle de cohérence des embeddings DÉSACTIVÉ "
+                       "(EMBEDDING_COHERENCE_CHECK=false).")
+        return
+    try:
+        pool = get_db_pool()
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT content, embedding::text FROM memories "
+                    "WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+                )
+                ligne = cur.fetchone()
+            conn.rollback()
+        finally:
+            pool.putconn(conn)
+    except Exception:
+        # Base injoignable au démarrage : ce n'est pas à ce contrôle de trancher. La boucle
+        # principale a sa propre gestion de l'indisponibilité.
+        logger.warning("Cohérence des embeddings non vérifiée (base injoignable).", exc_info=True)
+        return
+
+    if ligne is None or not ligne[1]:
+        logger.info("Base sans vecteur : cohérence des embeddings sans objet.")
+        return
+
+    try:
+        stocke = np.asarray(ligne[1].strip("[]").split(","), dtype=np.float64)
+        recalcule = np.asarray(get_embedder().embed_one(ligne[0]), dtype=np.float64)
+    except Exception:
+        logger.warning("Cohérence des embeddings non vérifiable (embedder injoignable).",
+                       exc_info=True)
+        return
+
+    if stocke.shape != recalcule.shape:
+        raise SystemExit(
+            f"EMBEDDING_MODEL={os.getenv('EMBEDDING_MODEL', '?')} produit des vecteurs de "
+            f"dimension {recalcule.shape[0]}, la base en contient de {stocke.shape[0]}."
+        )
+    normes = float(np.linalg.norm(stocke) * np.linalg.norm(recalcule))
+    cosinus = float(stocke @ recalcule / normes) if normes else 0.0
+    if cosinus < EMBEDDING_COHERENCE_MIN:
+        raise SystemExit(
+            f"INCOHÉRENCE D'EMBEDDING : EMBEDDING_MODEL={os.getenv('EMBEDDING_MODEL', '?')} "
+            f"ne correspond pas aux vecteurs déjà en base (cosinus {cosinus:.3f}, attendu "
+            f">= {EMBEDDING_COHERENCE_MIN}). Les dimensions concordent, donc rien n'aurait "
+            f"été signalé : le rappel se serait dégradé en silence. Restaurer le modèle "
+            f"d'origine, ou ré-embarquer toute la base avec le nouveau."
+        )
+    logger.info("Cohérence des embeddings vérifiée (cosinus %.3f).", cosinus)
+
+
 def main():
     logger.info("SynaptiQ Memory Worker démarré (consumer=%s)...", CONSUMER)
+    verifier_coherence_embedding()
     r = None
     while r is None:
         try:
