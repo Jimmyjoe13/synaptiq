@@ -12,8 +12,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Installer les deps d'abord (cache Docker)
-COPY requirements.txt ./
+# Installer les deps d'abord (cache Docker).
+# Les DEUX fichiers sont nécessaires : `requirements.txt` commence par
+# `-r requirements-common.txt` (socle partagé avec le worker et le relais, cf. F19). Copier
+# le seul requirements.txt faisait échouer le build sur
+# `Could not open requirements file: '/app/requirements-common.txt'` — et comme cette image
+# sert aussi les services `relay` et `migrate`, les trois étaient inconstructibles.
+COPY requirements.txt requirements-common.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copier le code (l'API importe apps.worker et packages/core)
