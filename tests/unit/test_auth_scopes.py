@@ -43,10 +43,27 @@ def test_scope_admin_accorde_explicitement():
     require_scope(auth, "admin")  # ne lève pas
 
 
-def test_sans_auth_tout_est_permis():
-    """Mode dev (SYNAPTIQ_AUTH_REQUIRED=false) : aucun scope à vérifier."""
-    for scope in ("read", "write", "admin"):
+def test_sans_auth_lecture_et_ecriture_sont_permises():
+    """Mode dev (SYNAPTIQ_AUTH_REQUIRED=false) : read et write passent sans clé."""
+    for scope in ("read", "write"):
         require_scope(None, scope)
+
+
+def test_sans_auth_admin_reste_refuse():
+    """RÉGRESSION 30/07 : `admin` n'est JAMAIS implicite, même sans authentification.
+
+    Ce test asseyait l'inverse jusqu'ici (« sans auth, tout est permis ») et c'est exactement
+    ce qui rendait la purge de l'instance de production joignable sans clé : un `DELETE
+    /v1/memories?confirm=default` anonyme répondait 400, pas 401. Le nom du tenant était le
+    seul secret — et le message d'erreur 400 le donnait.
+
+    Un mode de confort ne doit pas ouvrir un endpoint irréversible.
+    """
+    with pytest.raises(HTTPException) as exc:
+        require_scope(None, "admin")
+    assert exc.value.status_code == 403
+    # Le message doit dire quoi faire, pas seulement refuser.
+    assert "create_api_key" in exc.value.detail
 
 
 # ─── Périmètre d'agents ──────────────────────────────────────────────────────

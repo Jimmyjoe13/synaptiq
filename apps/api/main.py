@@ -354,13 +354,34 @@ def resolve_tenant(auth: AuthContext | None) -> str:
 
 
 def require_scope(auth: AuthContext | None, scope: str) -> None:
-    """Exige une permission portée par la clé. Sans auth (mode dev), tout est permis.
+    """Exige une permission portée par la clé.
 
     Trois permissions : `read` (retrieve, context/build), `write` (events, memories),
     `admin` (purge). Une clé de lecture ne doit pas pouvoir écrire, et surtout aucune clé
     d'agent ne doit pouvoir vider l'instance.
+
+    Sans auth (`SYNAPTIQ_AUTH_REQUIRED=false`), `read` et `write` passent — c'est le mode
+    d'une instance de confiance sur localhost. **`admin` ne passe JAMAIS sans clé**, et cette
+    exception est le cœur de la fonction.
+
+    Mesuré sur l'instance de production le 30/07 : `DELETE /v1/memories?confirm=<mauvais>`
+    répondait `400`, et non `401`. Aucune clé n'était fournie. L'enchaînement était complet —
+    `get_auth()` renvoie None, cette fonction retournait immédiatement, donc les trois
+    garde-fous de la purge (permission `admin`, `?confirm=<tenant>`, ligne d'audit) se
+    réduisaient à la connaissance du nom du tenant… que le message d'erreur 400 livre
+    lui-même. Un seul appel local suffisait à vider la mémoire de l'instance.
+
+    Un booléen de confort ne doit pas ouvrir un endpoint irréversible : la commodité du mode
+    sans auth vaut pour la lecture et l'écriture, pas pour la destruction.
     """
     if auth is None:
+        if scope == "admin":
+            raise HTTPException(
+                status_code=403,
+                detail="La purge exige une clé API portant la permission 'admin' "
+                       "(scripts/create_api_key.py --scopes read write admin), "
+                       "même lorsque SYNAPTIQ_AUTH_REQUIRED=false.",
+            )
         return
     if scope not in auth.scopes:
         raise HTTPException(
@@ -620,6 +641,48 @@ class ContextRequest(BaseModel):
     constraints: ContextConstraints = Field(default_factory=ContextConstraints)
     explain: bool = False
 
+# Âge maximal toléré du plus vieil événement non publié avant de déclarer l'ingestion en
+# panne. 300 s : très au-delà du cycle du relais (OUTBOX_POLL_SECONDS=0.5), donc aucun faux
+# positif sous charge, mais un relais mort est signalé en cinq minutes.
+HEALTH_OUTBOX_MAX_AGE_S = float(os.getenv("HEALTH_OUTBOX_MAX_AGE_S", "300"))
+
+
+def _etat_ingestion() -> str:
+    """`healthy`, `stalled` (relais mort) ou `unknown` (base injoignable).
+
+    ## Pourquoi cette sonde vit dans /health et pas seulement dans /metrics
+
+    Le pipeline d'ingestion peut être ENTIÈREMENT mort sans qu'aucun appelant ne s'en
+    aperçoive : `/events` écrit dans l'outbox et répond `201 captured`. C'est le relais
+    (`apps/relay/relay.py`) qui publie ensuite vers Redis. Sans lui, l'événement est accepté,
+    persisté, et jamais consolidé — l'appelant reçoit un succès pour une donnée qui n'arrivera
+    jamais en mémoire.
+
+    Constaté sur l'instance de production le 30/07 : `synaptiq-relay` était éteint depuis deux
+    jours. Les jauges qui détectent exactement ça existaient déjà (`synaptiq_outbox_pending`,
+    `synaptiq_outbox_oldest_age_seconds`), mais rien ne scrutait `/metrics` : une supervision
+    non branchée est une supervision absente. `/health` est le seul endpoint que quelqu'un
+    regarde vraiment — et le seul que les orchestrateurs interrogent.
+
+    C'est l'ÂGE et non le nombre qui est la bonne mesure : un outbox à 500 entrées qui se vide
+    est sain, un outbox à 1 entrée immobile depuis une heure ne l'est pas.
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COALESCE(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - min(created_at))), 0) "
+                    "FROM event_outbox WHERE published_at IS NULL"
+                )
+                age = float(cur.fetchone()[0] or 0)
+            conn.rollback()  # lecture seule : ne pas laisser de transaction ouverte
+    except Exception:
+        # Postgres est déjà signalé `unhealthy` par ailleurs : ne pas le rapporter deux fois
+        # sous un nom qui ferait chercher au mauvais endroit.
+        return "unknown"
+    return "healthy" if age < HEALTH_OUTBOX_MAX_AGE_S else "stalled"
+
+
 @v1_router.get("/health")
 def health_check():
     db_status = "healthy"
@@ -638,11 +701,16 @@ def health_check():
     except Exception:
         redis_status = "unhealthy"
 
+    ingestion = _etat_ingestion() if db_status == "healthy" else "unknown"
+
     return {
-        "status": "ok" if db_status == "healthy" and redis_status == "healthy" else "degraded",
+        "status": "ok" if (db_status == "healthy" and redis_status == "healthy"
+                           and ingestion == "healthy") else "degraded",
         "services": {
             "postgres": db_status,
-            "redis": redis_status
+            "redis": redis_status,
+            # `stalled` = des événements acceptés attendent un relais qui ne vient pas.
+            "ingestion": ingestion,
         }
     }
 

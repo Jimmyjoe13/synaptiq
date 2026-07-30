@@ -424,12 +424,40 @@ def test_purge_refusee_sans_scope_admin(client, db, monkeypatch):
         assert cur.fetchone()[0] == 1
 
 
-def test_purge_exige_la_confirmation(client, db):
-    """Sans ?confirm=<tenant>, la purge échoue en 400 et ne supprime rien."""
+def test_purge_exige_la_confirmation(client, db, monkeypatch):
+    """Sans ?confirm=<tenant>, la purge échoue en 400 et ne supprime rien.
+
+    La clé porte `admin` : c'est le garde-fou `confirm` qu'on isole ici, pas celui du scope
+    (cf. `test_purge_refusee_sans_cle_meme_sans_auth` pour l'absence de clé).
+    """
+    monkeypatch.setattr(main, "AUTH_REQUIRED", True)
+    _seed_api_key(db, "cle-admin-confirm", INSTANCE_TENANT, scopes=["read", "write", "admin"])
+    h = {"Authorization": "Bearer cle-admin-confirm"}
+    client.post("/memories", json={"agent_id": "agentA", "type": "semantic",
+                                   "content": "a garder"}, headers=h)
+    assert client.delete("/memories", headers=h).status_code == 400
+    assert client.delete("/memories?confirm=mauvais_tenant", headers=h).status_code == 400
+    with db.cursor() as cur:
+        cur.execute("SELECT count(*) FROM memories WHERE tenant_id = %s", (INSTANCE_TENANT,))
+        assert cur.fetchone()[0] == 1
+
+
+def test_purge_refusee_sans_cle_meme_sans_auth(client, db):
+    """RÉGRESSION 30/07 : `SYNAPTIQ_AUTH_REQUIRED=false` n'ouvre PAS la purge.
+
+    Constaté sur l'instance de production : sans clé, `require_scope` retournait
+    immédiatement, donc le seul obstacle restant était de connaître le nom du tenant — que le
+    message d'erreur 400 livrait lui-même (« Rappeler avec ?confirm=default »). Un unique
+    appel local vidait la mémoire de l'instance.
+
+    Ce test tourne AVEC `AUTH_REQUIRED=False` (le défaut de la fixture d'intégration) : c'est
+    tout l'intérêt. La réponse doit être 403, et surtout jamais 400 — un 400 signifierait
+    qu'on a franchi le contrôle de permission et qu'on négocie déjà la confirmation.
+    """
     client.post("/memories", json={"agent_id": "agentA", "type": "semantic",
                                    "content": "a garder"})
-    assert client.delete("/memories").status_code == 400
-    assert client.delete("/memories?confirm=mauvais_tenant").status_code == 400
+    assert client.delete("/memories").status_code == 403
+    assert client.delete(f"/memories?confirm={INSTANCE_TENANT}").status_code == 403
     with db.cursor() as cur:
         cur.execute("SELECT count(*) FROM memories WHERE tenant_id = %s", (INSTANCE_TENANT,))
         assert cur.fetchone()[0] == 1
