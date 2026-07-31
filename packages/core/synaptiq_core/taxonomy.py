@@ -25,21 +25,27 @@ classe d'erreur que la validation peut réellement attraper, donc la seule qu'el
 """
 from __future__ import annotations
 
+from synaptiq_core.collections import FAMILY_FALLBACK_KEY, SYSTEM_COLLECTIONS
+
 # Types de mémoire reconnus, et leurs sous-types CANONIQUES (ceux qui pilotent le routage
 # fin vers les 7 collections du context_packet — cf. `qem.route_memory`).
-VALID_SUBTYPES: dict[str, set[str]] = {
-    "procedural": {"code_error_resolution", "coding_best_practices", "rule"},
-    "semantic": {"preference", "fact"},
-    "episodic": {"interaction"},
-    "working": {"scratch"},
-}
+#
+# DÉRIVÉ de `collections.SYSTEM_COLLECTIONS`, et non plus écrit à la main : c'était la même
+# information tenue à deux endroits, donc une divergence en attente. Un sous-type canonique
+# est exactement une collection livrée avec le moteur — le nom d'un rayon que SynaptiQ
+# connaît d'avance, par opposition à ceux que l'agent se crée.
+VALID_SUBTYPES: dict[str, set[str]] = {}
+for _col in SYSTEM_COLLECTIONS:
+    VALID_SUBTYPES.setdefault(_col.family, set()).add(_col.name)
 
-# Sous-type retenu quand l'extraction LLM n'en propose pas d'exploitable.
+# Sous-type retenu quand l'extraction LLM n'en propose pas d'exploitable : la collection
+# système dont la clé de paquet est celle de repli de la famille (semantic -> facts, donc
+# `fact` ; procedural -> rules, donc `rule`…). Ainsi le défaut suit automatiquement le
+# routage au lieu d'être une troisième liste à maintenir.
 DEFAULT_SUBTYPE: dict[str, str] = {
-    "procedural": "rule",
-    "semantic": "fact",
-    "episodic": "interaction",
-    "working": "scratch",
+    _col.family: _col.name
+    for _col in SYSTEM_COLLECTIONS
+    if _col.packet_key == FAMILY_FALLBACK_KEY.get(_col.family)
 }
 
 

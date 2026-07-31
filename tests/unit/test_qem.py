@@ -366,7 +366,10 @@ def test_route_memory_routage_correct():
     assert route_memory("procedural", "code_error_resolution") == "errors"
     assert route_memory("procedural", "rule") == "rules"
     assert route_memory("working", None) == "examples"
-    assert route_memory("inconnu", None) is None
+    # Une famille inconnue renvoyait `None`, et `collapse_by_utility` retirait alors la
+    # mémoire du paquet — après l'avoir comptée dans `selected_ids` et facturée en tokens.
+    # Elle retombe désormais sur une section de repli (cf. tests/unit/test_collections.py).
+    assert route_memory("inconnu", None) == "facts"
 
 
 def test_collapse_routage_par_soustype():

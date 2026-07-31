@@ -1,5 +1,14 @@
 """synaptiq_core — logique partagée entre l'API et le worker (embeddings, gouvernance)."""
 
+from synaptiq_core.collections import (
+    FAMILIES,
+    FAMILY_FALLBACK_KEY,
+    SYSTEM_COLLECTIONS,
+    SYSTEM_PACKET_KEYS,
+    Collection,
+    CollectionRegistry,
+    CollectionStore,
+)
 from synaptiq_core.context_builder import (
     InMemoryStore,
     MemoryStore,
@@ -78,6 +87,15 @@ __all__ = [
     "route_memory",
     "estimate_tokens",
     "format_entry",
+    # Collections : le rangement est un objet que l'agent possède, la famille reste au
+    # moteur (elle porte le comportement : intrication, décroissance, section de repli)
+    "Collection",
+    "CollectionRegistry",
+    "CollectionStore",
+    "SYSTEM_COLLECTIONS",
+    "SYSTEM_PACKET_KEYS",
+    "FAMILIES",
+    "FAMILY_FALLBACK_KEY",
     # Taxonomie partagée par les DEUX chemins d'écriture (API directe et extraction worker)
     "VALID_SUBTYPES",
     "DEFAULT_SUBTYPE",

@@ -23,6 +23,10 @@ d'os.getenv ici, afin de tester chaque phase de manière déterministe.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from synaptiq_core.collections import CollectionRegistry
 
 import numpy as np
 
@@ -240,36 +244,32 @@ def estimate_tokens(content: str) -> int:
     return max(1, int(len(content.split()) * 1.3))
 
 
-def route_memory(m_type: str, m_subtype: str | None) -> str | None:
+def route_memory(m_type: str, m_subtype: str | None,
+                 registry: CollectionRegistry | None = None) -> str:
     """Détermine la clé du context_packet cible pour une mémoire (type/subtype).
 
-    Routage « correct » (intention du code d'origine) :
-      - semantic/preference           -> preferences
-      - semantic/<autre>              -> facts
-      - episodic/<*>                  -> episodes
+    Le routage est désormais porté par un registre de collections
+    (`synaptiq_core.collections`) plutôt que par une cascade de `if` : c'est ce qui permet
+    à un agent de déclarer ses propres rayons. Sans registre fourni, on utilise celui des
+    sept collections livrées — le comportement est alors identique au précédent :
+
+      - semantic/preference              -> preferences
+      - semantic/<libre>                 -> facts
+      - episodic/<*>                     -> episodes
       - procedural/coding_best_practices -> best_practices
       - procedural/code_error_resolution -> errors
-      - procedural/<autre>            -> rules
-      - working/<*>                   -> examples
-      - type inconnu                  -> None (non routé, comme l'original)
+      - procedural/<libre>               -> rules
+      - working/<*>                      -> examples
 
-    ⚠️ Voir `collapse_by_utility` : dans le chemin d'origine préservé, le sous-type
-    n'est PAS transmis (bug historique) et tout ce qui est semantic tombe donc dans
-    `facts` et tout ce qui est procedural dans `rules`.
+    ⚠️ **Ne renvoie plus jamais `None`.** Un type inconnu renvoyait `None`, et
+    `collapse_by_utility` retirait alors la mémoire du paquet — après l'avoir comptée dans
+    `selected_ids` et avoir dépensé son budget de tokens. Le souvenir était retrouvé, payé,
+    puis invisible, sans le moindre signal. Un rangement de repli est signalé par un
+    avertissement et reste corrigeable ; une disparition muette, non. Voir
+    `CollectionRegistry.packet_key`.
     """
-    if m_type == 'semantic':
-        return 'preferences' if m_subtype == 'preference' else 'facts'
-    if m_type == 'episodic':
-        return 'episodes'
-    if m_type == 'procedural':
-        if m_subtype == 'coding_best_practices':
-            return 'best_practices'
-        if m_subtype == 'code_error_resolution':
-            return 'errors'
-        return 'rules'
-    if m_type == 'working':
-        return 'examples'
-    return None
+    from synaptiq_core.collections import REGISTRE_SYSTEME
+    return (registry or REGISTRE_SYSTEME).packet_key(m_type, m_subtype)
 
 
 def format_entry(content: str, occurred_at) -> str:
@@ -329,9 +329,15 @@ def collapse_by_utility(
             token_count += c['tokens']
 
             # Routage complet type + sous-type vers la bonne collection logique.
+            # `route_memory` ne renvoie plus jamais None : le `if key is not None` d'avant
+            # était le point exact où une mémoire déjà comptée dans `selected_ids` et déjà
+            # facturée en tokens disparaissait du paquet sans laisser de trace.
             key = route_memory(c['type'], c.get('subtype'))
-            if key is not None:
-                packet[key].append(c['content'])
+            # `setdefault` et non `packet[key]` : une collection déclarée par l'agent peut
+            # porter une clé hors des sept canoniques. Le lot 2 construira les clés depuis
+            # le registre ; d'ici là, mieux vaut une section supplémentaire dans le paquet
+            # qu'un KeyError — ou pire, un retour au silence.
+            packet.setdefault(key, []).append(c['content'])
         else:
             logger.debug(f"Q-EM: Hors budget pour {c['id']} (tokens={c['tokens']}, restant={max_tokens - token_count})")
 

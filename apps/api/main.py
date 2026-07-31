@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, R
 from pydantic import BaseModel, Field, model_validator
 
 v1_router = APIRouter()
+import psycopg2.errors
 import redis
 from dotenv import load_dotenv
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
@@ -30,6 +31,9 @@ from psycopg2.extras import RealDictCursor
 
 # Logique partagée (embeddings pluggables + gouvernance), plus d'import depuis le worker
 from synaptiq_core import get_embedder, handle_contradictions, link_supersedes, to_pgvector
+
+# Registre des collections : le rangement devient un objet que l'agent possède (lot 1)
+from synaptiq_core.collections import Collection, CollectionRegistry
 
 # Orchestration des 4 phases Q-EM (sans SQL ni HTTP : testable en isolation)
 from synaptiq_core.context_builder import RetrievalConfig, build_context_packet
@@ -597,6 +601,82 @@ class PostgresMemoryStore:
         )
 
 
+class PostgresCollectionStore:
+    """Implémentation `CollectionStore` sur psycopg2, bornée à un (tenant, agent).
+
+    Même invariant que `PostgresMemoryStore` : le périmètre est fixé à la construction et
+    aucune méthode ne prend de `tenant_id` ni d'`agent_id`. Une collection déclarée par un
+    agent ne peut donc pas fuiter dans le registre d'un autre — la taxonomie d'un agent est
+    aussi privée que ses souvenirs.
+    """
+
+    def __init__(self, cur, tenant_id: str, agent_id: str) -> None:
+        self._cur = cur
+        self._tenant = tenant_id
+        self._agent = agent_id
+
+    def fetch_collections(self) -> list[Collection]:
+        """Collections système (valables partout) + celles de cet agent.
+
+        Lecture par POSITION et non par nom de colonne : les appelants n'ouvrent pas tous
+        leur curseur avec `RealDictCursor` (`create_memory` utilise un curseur à tuples).
+        Une première version indexait par clé et échouait donc sur la moitié des chemins —
+        rattrapée par le repli, donc invisible autrement que par un test.
+        """
+        self._cur.execute(
+            """
+            SELECT name, family, packet_key, description, entangle, created_by
+            FROM memory_collections
+            WHERE created_by = 'system'
+               OR (tenant_id = %s AND agent_id = %s)
+            ORDER BY created_by, name;
+            """,
+            (self._tenant, self._agent),
+        )
+        collections = []
+        for ligne in self._cur.fetchall():
+            valeurs = list(ligne.values()) if isinstance(ligne, dict) else list(ligne)
+            nom, famille, cle, description, entangle, origine = valeurs[:6]
+            try:
+                collections.append(Collection(
+                    name=nom, family=famille, packet_key=cle,
+                    description=description or "", entangle=bool(entangle),
+                    created_by=origine,
+                ))
+            except ValueError:
+                # Famille hors des quatre : ligne écrite par une version antérieure ou à la
+                # main. On l'ignore plutôt que de priver l'agent de TOUT son registre.
+                logger.warning("Collection ignorée (famille invalide) : %s/%s", famille, nom,
+                               exc_info=True)
+        return collections
+
+
+def charger_registre(cur, tenant_id: str, agent_id: str) -> CollectionRegistry:
+    """Registre des collections d'un (tenant, agent), replis système compris.
+
+    Le repli sur le registre système est délibéré : la taxonomie ne doit jamais être une
+    dépendance dure du rappel ni de l'écriture. Refuser une mémoire parce que son ÉTIQUETTE
+    est illisible serait disproportionné.
+
+    Mais les deux causes de repli ne se valent pas, et ce sont deux journaux différents :
+      - `UndefinedTable` = migration non encore appliquée. État d'exploitation légitime,
+        transitoire, attendu sur une instance qui vient d'être tirée.
+      - tout le reste = un défaut. Il doit crier, sinon le repli le masque exactement comme
+        les pannes silencieuses que ce projet passe son temps à fermer.
+    """
+    try:
+        return CollectionRegistry.depuis(
+            PostgresCollectionStore(cur, tenant_id, agent_id).fetch_collections())
+    except psycopg2.errors.UndefinedTable:
+        logger.warning("Table `memory_collections` absente (migration 20260731_collections "
+                       "non appliquée) : repli sur les collections système.")
+        return CollectionRegistry.systeme()
+    except Exception:
+        logger.error("Registre de collections illisible — repli sur les collections "
+                     "système. Le rangement fin de cet agent est INACTIF.", exc_info=True)
+        return CollectionRegistry.systeme()
+
+
 def retrieval_config() -> RetrievalConfig:
     """Assemble la configuration du moteur depuis les constantes de module.
 
@@ -955,7 +1035,10 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                 # parce qu'un sous-type libre retombe sur la collection du TYPE : sans cette
                 # information, l'appelant ne peut pas savoir que son libellé métier n'a pas
                 # produit le routage fin qu'il imaginait.
-                "collection": route_memory(memory.type, memory.subtype),
+                # Routage résolu par le REGISTRE de cet agent, et non plus par la cascade
+                # de `if` : une collection qu'il a déclarée lui-même est donc honorée ici.
+                "collection": route_memory(memory.type, memory.subtype,
+                                           charger_registre(cur, tenant, memory.agent_id)),
                 "canonical_subtype": is_canonical(memory.type, memory.subtype),
             }
     except HTTPException:
@@ -1085,6 +1168,63 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
     except Exception:
         conn.rollback()
         logger.error("Erreur de recherche de souvenirs.", exc_info=True)
+        raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
+    finally:
+        db_pool.putconn(conn)
+
+
+@v1_router.get("/collections")
+def list_collections(agent_id: str, auth: AuthContext | None = Depends(get_auth)):
+    """Registre des collections visibles par un agent : les système et les siennes.
+
+    Un agent ne peut pas structurer ce qu'il ne peut pas consulter. C'est cet endpoint qui
+    rend la collection réellement observable — et donc de premier ordre. L'outil MCP
+    `list_collections` s'y branchera au lot 3, avec `create_collection`.
+
+    `memory_count` est calculé ici plutôt que maintenu dans une colonne : une collection
+    déclarée mais vide est une information utile (l'agent l'a créée puis n'en a rien fait),
+    et un compteur dénormalisé dériverait au premier écart d'écriture.
+    """
+    tenant = resolve_tenant(auth)
+    require_scope(auth, "read")
+    resolve_agent(auth, agent_id)
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            registre = charger_registre(cur, tenant, agent_id)
+            cur.execute(
+                "SELECT type AS family, subtype AS name, count(*) AS n "
+                "FROM memories WHERE tenant_id = %s AND agent_id = %s AND status = 'active' "
+                "GROUP BY 1, 2",
+                (tenant, agent_id),
+            )
+            comptes = {(ligne["family"], ligne["name"]): ligne["n"]
+                       for ligne in cur.fetchall()}
+            conn.rollback()  # lecture seule
+        return {
+            "agent_id": agent_id,
+            "collections": [
+                {
+                    "name": col.name,
+                    "family": col.family,
+                    "packet_key": col.packet_key,
+                    "description": col.description,
+                    "entangle": col.entangle,
+                    "created_by": col.created_by,
+                    "memory_count": comptes.get((col.family, col.name), 0),
+                }
+                for col in sorted(registre.collections,
+                                  key=lambda c: (c.created_by, c.family, c.name))
+            ],
+            "packet_keys": list(registre.packet_keys()),
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        logger.error("Erreur de lecture du registre de collections.", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
     finally:
         db_pool.putconn(conn)
