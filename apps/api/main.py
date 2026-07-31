@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         redis_client.close()
 
 
-app = FastAPI(title="SynaptiQ API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="SynaptiQ API", version="0.3.0", lifespan=lifespan)
 
 # ─── Sécurité : CORS + rate limiting ───
 from fastapi.middleware.cors import CORSMiddleware

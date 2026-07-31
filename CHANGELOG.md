@@ -1,6 +1,19 @@
 # Changelog
 
-## 0.3.0 - Unreleased — l'agent structure sa propre memoire
+> **Versions anterieures a 0.3.0 : datees et taggees a posteriori.** Jusqu'au 31/07 rien
+> n'avait ete tagge depuis `0.2.0`, et huit entrees portaient la mention « Unreleased ». La
+> date de chaque version est celle du commit qui a livre son contenu, indique a cote du
+> numero. Deux consequences a connaitre :
+>
+> - **`0.2.1` et `0.2.2` pointent sur le MEME commit** (`c5d2516`) : les lots P0 et P1 de
+>   l'audit du 28/07 ont ete livres ensemble. Les separer ici garde la lisibilite du
+>   decoupage, mais il n'y a jamais eu deux livraisons.
+> - **Les tags ne partitionnent pas tout l'historique.** Quelques commits ne sont rattaches a
+>   aucune entree — notamment le lot du 26/07 (recherche hybride, harnais LOCOMO, embeddings
+>   OpenRouter) et `a0b844b`. Le journal avait ces trous avant les tags ; les combler
+>   a posteriori aurait demande d'inventer des notes de version.
+
+## 0.3.0 — 2026-07-31 — l'agent structure sa propre memoire
 
 Jusqu'ici une « collection » n'existait nulle part : c'etait le resultat d'une cascade de
 `if` dans `route_memory`. Un agent ne pouvait ni la consulter, ni en creer, ni decider
@@ -94,7 +107,7 @@ Suite : **377 tests** (307 unitaires + 70 integration), ruff et mypy propres, co
 `RETRIEVAL_HYBRID=false` — le filtre de collection est repete dans les deux branches SQL,
 comme le filtre tenant/agent.
 
-## 0.2.7 - Unreleased — audit d'exploitation : quatre pannes silencieuses
+## 0.2.7 — 2026-07-30 · `2e02463` — audit d'exploitation : quatre pannes silencieuses
 
 Audit du 30/07 mene sur le depot ET sur une instance de production reelle. Le code s'en sort
 bien ; l'exploitation beaucoup moins. Les quatre defauts trouves ont le meme trait : **aucun
@@ -181,7 +194,7 @@ formes sont alignees.
 Suite : **272 tests** (240 unitaires + 32 integration), ruff et mypy propres, couverture de
 `packages/core` a 95 %.
 
-## 0.2.6 - Unreleased — le lanceur attend son infrastructure
+## 0.2.6 — 2026-07-29 · `e6e0baf` — le lanceur attend son infrastructure
 
 `start_services.ps1 -WaitForInfra <secondes>` patiente que PostgreSQL (5435) et Redis (6399)
 repondent avant de demarrer l'API. Indispensable a l'ouverture de session : Docker Desktop met
@@ -192,7 +205,7 @@ demarrage automatique produisait donc une instance en apparence lancee mais tota
 Sans le drapeau (lancement manuel), le comportement est inchange si l'infra est la, et un
 refus explicite sinon, avec la commande a lancer — plutot qu'un demarrage voue a l'echec.
 
-## 0.2.5 - Unreleased — l'API plantait au demarrage sur un .env non-ASCII (Windows)
+## 0.2.5 — 2026-07-29 · `d4c10c9` — l'API plantait au demarrage sur un .env non-ASCII (Windows)
 
 Trouve en montant une instance de production sur Windows : `cp .env.example .env` puis
 lancement local de l'API echouait sur un `UnicodeDecodeError` opaque, tres loin de sa cause.
@@ -208,7 +221,7 @@ de toute facon redondante — SynaptiQ charge sa configuration via `load_dotenv`
 passe `default_limits` explicitement. Verifie avec un `.env` contenant un emoji : l'import
 passe, sans avertissement.
 
-## 0.2.4 - Unreleased — transport MCP : stdio vs HTTP
+## 0.2.4 — 2026-07-29 · `0c84dfd` — transport MCP : stdio vs HTTP
 
 ### Limite mesurée du transport stdio avec antigravity CLI
 
@@ -230,7 +243,7 @@ serveur Obsidian, dont le pont `npx mcp-remote` ne terminait jamais son handshak
 (`-Status`, `-Stop`), en attendant l'écoute effective plutôt qu'en annonçant un démarrage
 optimiste.
 
-## 0.2.3 - Unreleased — suites d'un incident de production
+## 0.2.3 — 2026-07-29 · `5ddd040` — suites d'un incident de production
 
 Trois correctifs issus d'une panne constatée le 29/07 sur une instance réelle : le serveur
 MCP répondait « aucun souvenir trouvé » alors que la base en contenait.
@@ -301,7 +314,7 @@ Seul un sous-type canonique rattaché au mauvais type est refusé en 422 — `ty
 l'appelant sache où son souvenir sera servi au lieu de le supposer.
 
 
-## 0.2.2 - Unreleased — performance, observabilité, outillage
+## 0.2.2 — 2026-07-29 · `c5d2516` — performance, observabilité, outillage
 
 Lot P1 de l'audit du 28/07. Aucune rupture de compatibilité d'API.
 
@@ -379,7 +392,7 @@ Lot P1 de l'audit du 28/07. Aucune rupture de compatibilité d'API.
   complété (tests, benchmarks, dataset et visuels n'ont plus à entrer dans les images).
 - `Makefile` + `scripts/dev.ps1` (équivalent Windows, mêmes noms de cibles).
 
-## 0.2.1 - Unreleased — durcissement sécurité & intégrité mémoire
+## 0.2.1 — 2026-07-29 · `c5d2516` — durcissement sécurité & intégrité mémoire
 
 Lot P0 de l'audit du 28/07. Deux ruptures de compatibilité, signalées ci-dessous.
 
@@ -423,7 +436,7 @@ Lot P0 de l'audit du 28/07. Deux ruptures de compatibilité, signalées ci-desso
 - Tests : 130 unitaires + 23 d'intégration (153 au total), dont un test de non-régression
   par correctif de ce lot.
 
-## 0.2.0 - Unreleased
+## 0.2.0 — 2026-07-24 · `681ef85`
 - Transactional outbox et déduplication worker par événement source.
 - Migrations Alembic, contrats API bornés et trace de retrieval optionnelle.
 - Compose local sécurisé et SDK TypeScript initial.

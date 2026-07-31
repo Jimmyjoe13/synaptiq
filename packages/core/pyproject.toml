@@ -1,6 +1,9 @@
 [project]
 name = "synaptiq-core"
-version = "0.1.0"
+# Version UNIQUE pour tout le dépôt (API, cœur, SDK) : ces composants évoluent ensemble et
+# se livrent ensemble. Deux numéros distincts laisseraient croire à une compatibilité
+# croisée que rien ne teste.
+version = "0.3.0"
 description = "Logique partagée de SynaptiQ : embeddings pluggables et gouvernance mémoire."
 requires-python = ">=3.11"
 # numpy : produits scalaires vectorisés du filtre de redondance Q-EM (cf. qem.py).

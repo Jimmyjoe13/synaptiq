@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "synaptiq-sdk"
-version = "0.1.0"
+# Alignée sur la version du dépôt (cf. packages/core/pyproject.toml).
+version = "0.3.0"
 description = "SDK Python pour l'API SynaptiQ — second-brain vectoriel pour agents IA."
 requires-python = ">=3.11"
 license = { text = "MIT" }
