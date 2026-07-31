@@ -13,6 +13,39 @@
 >   OpenRouter) et `a0b844b`. Le journal avait ces trous avant les tags ; les combler
 >   a posteriori aurait demande d'inventer des notes de version.
 
+## 0.3.1 - Unreleased — les conteneurs se pointaient sur eux-memes
+
+### Regression de `a0b844b` : `EMBEDDING_BASE_URL` en conteneur
+
+`a0b844b` a rendu l'endpoint d'embedding surchargeable depuis `.env` en reutilisant le MEME
+nom de variable : `${EMBEDDING_BASE_URL:-http://host.docker.internal:1234/v1}`. Or le `.env`
+declare legitimement `EMBEDDING_BASE_URL=http://localhost:1234/v1` — valeur juste pour un
+process de l'hote. Compose reprenait donc cette valeur, et dans le conteneur `localhost`
+designe le conteneur lui-meme.
+
+Consequence mesuree le 30/07 sur l'instance de production : `Connection refused` sur
+`/v1/embeddings` a chaque evenement, cinq tentatives, puis DLQ. **Le chemin `/events` etait
+entierement hors service en conteneur**, avec une configuration qui paraissait correcte.
+`LLM_BASE_URL` echappait deja au piege grace a une variable distincte (`LLM_BASE_URL_DOCKER`) ;
+c'est ce motif qui est generalise.
+
+### Deuxieme occurrence, trouvee en verifiant la premiere
+
+Le service `api` n'avait aucune surcharge de `LLM_BASE_URL`. Ce n'est pas anodin : l'API
+appelle un LLM elle aussi — `POST /v1/memories` soumet les preferences proches au juge de
+contradiction (`synaptiq_core.contradiction`). En conteneur, elle aurait interroge son propre
+port. Le juge etant fail-closed, plus rien n'aurait jamais ete archive — sans erreur, encore
+une fois.
+
+`EMBEDDING_BASE_URL_DOCKER` et `LLM_BASE_URL_DOCKER` sont desormais posees sur `api` et
+`worker`. Verifie par `docker compose config` sur trois scenarios : `.env` en `localhost` sans
+surcharge (le cas de la regression), surcharge explicite vers un fournisseur distant
+(l'objectif initial de `a0b844b`, preserve), et `.env` vide.
+
+> **Obstacle independant, cote hote.** Si le serveur de modeles n'ecoute que sur `127.0.0.1`,
+> aucun conteneur ne l'atteindra meme avec la bonne URL. Dans LM Studio, activer « Serve on
+> Local Network ».
+
 ## 0.3.0 — 2026-07-31 — l'agent structure sa propre memoire
 
 Jusqu'ici une « collection » n'existait nulle part : c'etait le resultat d'une cascade de

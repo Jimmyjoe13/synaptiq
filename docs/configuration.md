@@ -23,12 +23,21 @@ one phase without a redeploy.
 | Variable | Default | Notes |
 |---|---|---|
 | `EMBEDDING_PROVIDER` | `lmstudio` | `lmstudio` · `openrouter` · `openai` · `mock` (**tests only** — non-semantic vectors). |
-| `EMBEDDING_BASE_URL` | `http://localhost:1234/v1` | OpenAI-compatible endpoint. |
+| `EMBEDDING_BASE_URL` | `http://localhost:1234/v1` | OpenAI-compatible endpoint, as seen **from the host**. |
+| `EMBEDDING_BASE_URL_DOCKER` | `http://host.docker.internal:1234/v1` | Same endpoint **as seen from a container**. |
 | `EMBEDDING_MODEL` | `text-embedding-paraphrase-multilingual-minilm-l12-v2.gguf` | |
 | `EMBEDDING_DIM` | `384` | **Must match the `VECTOR(n)` column.** Changing it is a schema migration. |
 | `EMBEDDING_API_KEY` | — | Also read from `OPENROUTER_API_KEY` / `OPENAI_API_KEY`. |
 | `EMBEDDING_COHERENCE_CHECK` | `true` | Worker refuses to start if the model disagrees with the stored vectors. |
 | `EMBEDDING_COHERENCE_MIN` | `0.999` | Cosine floor for that check. |
+
+> [!CAUTION]
+> [!IMPORTANT]
+> **A container's `localhost` is the container itself.** That is why every endpoint reachable
+> on the host has a second variable with a `_DOCKER` suffix, and why the override must use a
+> *different name* than the value it overrides. Reusing the same name looks tidier and is a
+> trap: Compose then picks up the host value from `.env` and points the container at itself —
+> `Connection refused` on every call, with a configuration that reads as correct.
 
 > [!CAUTION]
 > **`EMBEDDING_DIM` protects only against the noisy case.** The dangerous one is silent: two
@@ -42,7 +51,8 @@ one phase without a redeploy.
 | Variable | Default | Notes |
 |---|---|---|
 | `LLM_PROVIDER` | `mock` | `mock` = regex heuristics. See the warning below. |
-| `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | A local endpoint needs no API key. |
+| `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | As seen **from the host**. A local endpoint needs no API key. |
+| `LLM_BASE_URL_DOCKER` | `http://host.docker.internal:1234/v1` | Same endpoint **as seen from a container** (worker *and* API — the contradiction judge runs API-side). |
 | `LLM_MODEL` | `meta-llama/llama-3-8b-instruct:free` | |
 | `LLM_API_KEY` | — | |
 | `LLM_MAX_RETRIES` / `LLM_RETRY_BACKOFF_S` | `3` / `2.0` | Honours `Retry-After`; `429` is frequent on free tiers. |

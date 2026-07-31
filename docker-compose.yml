@@ -51,11 +51,15 @@ services:
       # Surcharge des URLs pour le réseau interne Docker
       DATABASE_URL: postgresql://${POSTGRES_USER:-synaptiq}:${POSTGRES_PASSWORD:-synaptiq_password}@postgres:5432/${POSTGRES_DB:-synaptiq_db}
       REDIS_URL: redis://redis:6379/0
-      # LM Studio tourne sur l'hôte, joignable via host.docker.internal. Surchargeable
-      # depuis .env : une instance qui bascule sur un fournisseur distant (par ex.
-      # EMBEDDING_PROVIDER=openrouter) doit pouvoir imposer son propre endpoint, sinon
-      # cette valeur codée en dur le ramène silencieusement vers l'hôte.
-      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://host.docker.internal:1234/v1}
+      # LM Studio tourne sur l'hôte, joignable depuis un conteneur via
+      # host.docker.internal. La surcharge passe par une variable DISTINCTE
+      # (`*_DOCKER`), et c'est tout l'intérêt — voir la note du worker.
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL_DOCKER:-http://host.docker.internal:1234/v1}
+      # L'API aussi appelle un LLM : `POST /v1/memories` soumet les préférences proches au
+      # juge de contradiction (`synaptiq_core.contradiction`), qui lit `LLM_BASE_URL`. Sans
+      # cette surcharge, l'API interrogerait son propre conteneur ; le juge étant
+      # fail-closed, plus rien ne serait jamais archivé — en silence, encore.
+      LLM_BASE_URL: ${LLM_BASE_URL_DOCKER:-http://host.docker.internal:1234/v1}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -83,10 +87,24 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-synaptiq}:${POSTGRES_PASSWORD:-synaptiq_password}@postgres:5432/${POSTGRES_DB:-synaptiq_db}
       REDIS_URL: redis://redis:6379/0
-      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://host.docker.internal:1234/v1}
-      # LM Studio (embeddings ET extraction LLM) tourne sur l'hôte : sans cette
-      # surcharge, 'localhost' désignerait le conteneur worker lui-même et
-      # l'extraction retomberait silencieusement sur les heuristiques regex.
+      # LM Studio (embeddings ET extraction LLM) tourne sur l'hôte : sans ces deux
+      # surcharges, 'localhost' désignerait le conteneur worker lui-même.
+      #
+      # ⚠️ La surcharge doit passer par une variable au nom DIFFÉRENT de celle qu'elle
+      # surcharge. Le commit a0b844b a rendu `EMBEDDING_BASE_URL` configurable en réutilisant
+      # le MÊME nom — `${EMBEDDING_BASE_URL:-http://host.docker.internal:1234/v1}`. Or le
+      # `.env` déclare légitimement `EMBEDDING_BASE_URL=http://localhost:1234/v1`, valeur
+      # juste pour un process de l'hôte : la substitution la reprenait donc, et le conteneur
+      # se pointait sur lui-même. Résultat mesuré le 30/07 : `Connection refused` sur
+      # /v1/embeddings à chaque événement, 5 tentatives, puis DLQ. Le chemin `/events` était
+      # entièrement hors service en conteneur, sans que la configuration paraisse fausse.
+      #
+      # `LLM_BASE_URL` échappait déjà au piège grâce à `LLM_BASE_URL_DOCKER` ; les deux
+      # variables suivent maintenant la même règle. Laisser les deux valeurs par défaut
+      # convient à LM Studio sur l'hôte ; les renseigner permet de viser un fournisseur
+      # distant (par ex. `EMBEDDING_BASE_URL_DOCKER=https://openrouter.ai/api/v1`) sans
+      # toucher à la valeur utilisée hors conteneur.
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL_DOCKER:-http://host.docker.internal:1234/v1}
       LLM_BASE_URL: ${LLM_BASE_URL_DOCKER:-http://host.docker.internal:1234/v1}
     extra_hosts:
       - "host.docker.internal:host-gateway"
