@@ -43,10 +43,24 @@ export class SynaptiqClient {
     return this.post<{ memories: unknown[] }>("/v1/retrieve", { agent_id, query, limit, memory_type });
   }
 
-  buildContext(agent_id: string, session_id: string, task: string, query: string, options: { maxTokens?: number; memoryTypes?: MemoryType[]; explain?: boolean } = {}) {
+  /**
+   * `memoryTypes` filtre par FAMILLE cognitive (les 4, fermees) ; `collections` filtre
+   * finement par rayon declare par l'agent (`memories.subtype`).
+   *
+   * /!\ `context_packet` n'a plus un nombre de cles fixe : les sept sections canoniques
+   * sont toujours presentes, plus une section par collection declaree par l'agent, meme
+   * vide. Iterer sur les entrees plutot que de lire sept cles en dur.
+   */
+  buildContext(agent_id: string, session_id: string, task: string, query: string, options: { maxTokens?: number; memoryTypes?: MemoryType[]; collections?: string[]; explain?: boolean } = {}) {
+    const constraints: Record<string, unknown> = {
+      max_tokens: options.maxTokens ?? 1200,
+      memory_types: options.memoryTypes ?? ["semantic", "episodic", "procedural", "working"],
+    };
+    // Omis quand absent : le serveur distingue « toutes les collections » d'une liste
+    // explicite, et une liste vide serait un filtre qui ne ramene rien.
+    if (options.collections !== undefined) constraints.collections = options.collections;
     return this.post<ContextResult>("/v1/context/build", {
-      agent_id, session_id, task, query, explain: options.explain ?? false,
-      constraints: { max_tokens: options.maxTokens ?? 1200, memory_types: options.memoryTypes ?? ["semantic", "episodic", "procedural", "working"] },
+      agent_id, session_id, task, query, explain: options.explain ?? false, constraints,
     });
   }
 }

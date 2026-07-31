@@ -222,11 +222,11 @@ class CollectionRegistry:
         return family in ("procedural", "semantic")
 
     def packet_keys(self) -> tuple[str, ...]:
-        """Clés du paquet, canoniques d'abord puis celles ajoutées par l'agent.
+        """Sections du paquet : les sept canoniques d'abord, puis celles de l'agent.
 
-        Le lot 2 s'en servira pour rendre le `context_packet` dynamique. Tant qu'il n'est
-        pas fait, `qem._PACKET_KEYS` reste l'autorité et cette méthode n'est pas consommée
-        par le chemin de production — elle est ici pour que le registre soit complet.
+        L'ordre compte : les canoniques restent en tête et toujours présentes, de sorte
+        qu'un consommateur écrit avant les collections continue de lire les mêmes clés au
+        même endroit. Les sections de l'agent s'ajoutent à la suite.
         """
         supplementaires = []
         for col in self.collections:
@@ -234,14 +234,67 @@ class CollectionRegistry:
                 supplementaires.append(col.packet_key)
         return SYSTEM_PACKET_KEYS + tuple(supplementaires)
 
-    def noms_par_famille(self) -> dict[str, list[str]]:
-        """Vue `{famille: [noms de collection]}` — alimente `taxonomy.VALID_SUBTYPES`."""
-        par_famille: dict[str, list[str]] = {f: [] for f in FAMILIES}
-        for col in self.collections:
-            par_famille.setdefault(col.family, []).append(col.name)
-        return par_famille
-
 
 # Registre par défaut du processus. Utilisé par `route_memory` quand aucun registre n'est
 # fourni, ce qui garantit que tout le code existant conserve son comportement exact.
 REGISTRE_SYSTEME = CollectionRegistry.systeme()
+
+
+# ─── Chargement depuis la base ───────────────────────────────────────────────
+# Prend un CURSEUR, comme `governance.handle_contradictions` : le paquet reste sans
+# dépendance psycopg2, tout en évitant que l'API et le worker entretiennent chacun leur
+# copie de la même requête. Les deux chemins d'écriture doivent voir le MÊME registre —
+# c'est la leçon de la taxonomie, qui vivait dans le worker et laissait l'API sans règle.
+
+_SQL_COLLECTIONS = """
+    SELECT name, family, packet_key, description, entangle, created_by
+    FROM memory_collections
+    WHERE created_by = 'system' OR (tenant_id = %s AND agent_id = %s)
+    ORDER BY created_by, name;
+"""
+
+
+def charger_registre(cur, tenant_id: str, agent_id: str) -> CollectionRegistry:
+    """Registre des collections d'un (tenant, agent), complété par les collections système.
+
+    Le repli sur le registre système est délibéré et vaut pour toute erreur : la taxonomie
+    ne doit jamais être une dépendance dure du rappel ni de l'écriture. Refuser une mémoire
+    parce que son ÉTIQUETTE est illisible serait disproportionné.
+
+    Les deux causes de repli ne se valent pas et ne se journalisent donc pas pareil :
+    une table absente est un état d'exploitation légitime (migration pas encore tirée),
+    tout le reste est un défaut et doit crier — sinon le repli masque la panne exactement
+    comme les silences que ce projet passe son temps à fermer.
+
+    La lecture se fait par POSITION : les appelants n'ouvrent pas tous leur curseur avec
+    `RealDictCursor` (`create_memory` utilise un curseur à tuples).
+    """
+    try:
+        cur.execute(_SQL_COLLECTIONS, (tenant_id, agent_id))
+        lignes = cur.fetchall()
+    except Exception as exc:
+        # `UndefinedTable` porte ce code SQLSTATE. Comparé sur le code plutôt que sur la
+        # classe pour ne pas importer psycopg2 ici.
+        if getattr(exc, "pgcode", None) == "42P01":
+            logger.warning("Table `memory_collections` absente (migration "
+                           "20260731_collections non appliquée) : collections système.")
+        else:
+            logger.error("Registre de collections illisible — repli sur les collections "
+                         "système. Le rangement fin de cet agent est INACTIF.",
+                         exc_info=True)
+        return CollectionRegistry.systeme()
+
+    collections = []
+    for ligne in lignes:
+        valeurs = list(ligne.values()) if isinstance(ligne, dict) else list(ligne)
+        nom, famille, cle, description, entangle, origine = valeurs[:6]
+        try:
+            collections.append(Collection(
+                name=nom, family=famille, packet_key=cle, description=description or "",
+                entangle=bool(entangle), created_by=origine,
+            ))
+        except ValueError:
+            # Famille hors des quatre : ligne écrite à la main ou par une version
+            # antérieure. On l'écarte plutôt que de priver l'agent de TOUT son registre.
+            logger.warning("Collection ignorée (famille invalide) : %s/%s", famille, nom)
+    return CollectionRegistry.depuis(collections)

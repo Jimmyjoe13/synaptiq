@@ -183,15 +183,30 @@ def _poster(url: str, payload: dict, timeout: int = 5):
         return requests.post(url, json=payload, headers=HEADERS, timeout=timeout)
 
 
+def _lire(url: str, params: dict, timeout: int = 5):
+    """GET vers l'API, avec UNE nouvelle tentative si la connexion est refusee."""
+    try:
+        return requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+    except requests.ConnectionError:
+        logger.info("API pas encore joignable, nouvelle tentative dans %.1f s.", RETRY_DELAI_S)
+        time.sleep(RETRY_DELAI_S)
+        return requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+
+
 @mcp.tool()
 def store_memory(content: str, memory_type: str, subtype: str | None = None) -> str:
     """
     Enregistre de maniere autonome un fait, une preference, une regle ou un episode dans la memoire SynaptiQ.
 
+    Le couple (memory_type, subtype) designe une COLLECTION. `subtype` est le nom du rayon :
+    utiliser `list_collections` pour voir ceux qui existent, `create_collection` pour en
+    ouvrir un nouveau. Un nom NON declare est accepte, mais le souvenir est alors range dans
+    la section par defaut de sa famille -- la reponse le dit explicitement.
+
     Args:
         content: Le souvenir ou fait a retenir (ex: 'L'utilisateur prefere les rapports courts').
-        memory_type: Le type de memoire ('semantic' pour les faits/preferences, 'procedural' pour les regles/playbooks, 'episodic' pour les actions/resultats).
-        subtype: Precision optionnelle (ex: 'preference', 'rule', 'error_resolution').
+        memory_type: La famille de memoire ('semantic' pour les faits/preferences, 'procedural' pour les regles/playbooks, 'episodic' pour les actions/resultats, 'working' pour le volatil).
+        subtype: Nom de la collection (ex: 'preference', 'rule', 'clients_paca').
     """
     url = f"{SYNAPTIQ_API_URL}/v1/memories"
     try:
@@ -208,19 +223,174 @@ def store_memory(content: str, memory_type: str, subtype: str | None = None) -> 
         response = _poster(url, payload)
         response.raise_for_status()
         res_data = response.json()
-        return f"[SUCCESS] Memoire enregistree avec succes. ID: {res_data.get('memory_id')}"
+
+        # ── Le verdict de rangement est RENDU a l'agent ──
+        # L'API renvoie `collection` et `canonical_subtype` depuis toujours ; cet outil les
+        # jetait et ne retournait que l'identifiant. L'agent croyait donc ranger finement
+        # alors que son libelle metier retombait dans la section par defaut de sa famille,
+        # et rien ne le detrompait. Un moteur de memoire ne doit pas laisser croire a un
+        # classement qui n'a pas eu lieu.
+        collection = res_data.get("collection")
+        message = (f"[SUCCESS] Memoire enregistree. ID: {res_data.get('memory_id')} | "
+                   f"servie dans la section '{collection}'")
+        if subtype and not res_data.get("canonical_subtype") and collection != subtype:
+            message += (f".\n[INFO] '{subtype}' n'est pas une collection declaree : le "
+                        f"souvenir est range dans '{collection}', la section par defaut de "
+                        f"la famille '{memory_type}'. Pour qu'il ait sa propre section, "
+                        f"appeler create_collection(name='{subtype}', "
+                        f"family='{memory_type}', description=...).")
+        return message
     except Exception as e:
         return f"[ERROR] Echec de l'enregistrement de la memoire : {e}"
 
+
 @mcp.tool()
-def recall_memories(query: str, limit: int = 5, memory_type: str | None = None) -> str:
+def list_collections() -> str:
+    """
+    Liste les collections de la memoire de cet agent : les rayons ou ranger un souvenir.
+
+    A APPELER AVANT de creer une collection, et avant d'inventer un `subtype` dans
+    store_memory. Une collection existante qui convient doit toujours etre reutilisee :
+    une taxonomie qui se demultiplie a chaque nuance devient illisible, pour l'agent comme
+    pour le modele qui lit le contexte.
+
+    Deux origines :
+      - `systeme` : livrees avec le moteur, communes a tous les agents.
+      - `agent`   : creees par cet agent, pour lui seul.
+    """
+    url = f"{SYNAPTIQ_API_URL}/v1/collections"
+    try:
+        response = _lire(url, {"agent_id": require_agent_id()})
+        response.raise_for_status()
+        data = response.json()
+        collections = data.get("collections", [])
+        if not collections:
+            return "Aucune collection (registre vide)."
+
+        lignes = ["Collections de la memoire SynaptiQ :"]
+        dormantes = []
+        for col in collections:
+            origine = "systeme" if col["created_by"] == "system" else "agent"
+            graphe = "intriquee" if col["entangle"] else "hors graphe"
+            marque = " | DORMANTE" if col.get("stale") else ""
+            if col.get("stale"):
+                dormantes.append(col["name"])
+            lignes.append(
+                f"- {col['name']} [{origine} | famille={col['family']} | {graphe} | "
+                f"{col['memory_count']} souvenir(s){marque}] -> section '{col['packet_key']}'"
+                + (f"\n    {col['description']}" if col.get("description") else "")
+            )
+
+        limites = data.get("limits") or {}
+        if limites:
+            lignes.append(f"\nQuota : {limites.get('used')} / "
+                          f"{limites.get('max_collections')} collections creees.")
+        if dormantes:
+            # Une collection declaree puis jamais remplie est le premier symptome d'une
+            # taxonomie qui se disperse. La signaler est ce qui permet de la corriger.
+            lignes.append(
+                f"[ATTENTION] Collections creees mais restees vides : {', '.join(dormantes)}. "
+                f"Les reutiliser, ou les verser dans un autre rayon via merge_collections.")
+        return "\n".join(lignes)
+    except Exception as e:
+        return f"[ERROR] Echec de la lecture des collections : {e}"
+
+
+@mcp.tool()
+def merge_collections(source: str, target: str) -> str:
+    """
+    Verse tous les souvenirs de la collection `source` dans `target`, puis supprime `source`.
+
+    C'est l'outil d'entretien de la taxonomie. A utiliser des que deux rayons se recouvrent
+    (`clients_paca` et `clients_region_paca`, par exemple) : une memoire eparpillee entre
+    des rayons quasi identiques est une memoire ou plus rien ne se retrouve.
+
+    Aucun souvenir n'est detruit -- seule leur etiquette change.
+
+    Contraintes : `source` doit etre une collection creee par cet agent (les collections
+    systeme servent tous les agents), et les deux doivent appartenir a la MEME famille --
+    la famille decide de l'intrication et de la decroissance, la changer modifierait le
+    traitement des souvenirs et pas seulement leur rangement.
+
+    Args:
+        source: Collection a vider puis supprimer.
+        target: Collection qui recoit les souvenirs.
+    """
+    url = f"{SYNAPTIQ_API_URL}/v1/collections/merge"
+    try:
+        response = _poster(url, {"agent_id": require_agent_id(),
+                                 "source": source, "target": target})
+        if response.status_code in (404, 409, 422):
+            return f"[REFUSE] {response.json().get('detail', response.text)}"
+        response.raise_for_status()
+        data = response.json()
+        return (f"[SUCCESS] '{data.get('source')}' versee dans '{data.get('target')}' : "
+                f"{data.get('moved_memories')} souvenir(s) deplace(s).")
+    except Exception as e:
+        return f"[ERROR] Echec de la fusion : {e}"
+
+
+@mcp.tool()
+def create_collection(name: str, family: str, description: str,
+                      entangle: bool = True) -> str:
+    """
+    Cree un nouveau rayon dans la memoire de cet agent, pour y classer une categorie de
+    souvenirs qui n'a pas encore sa place.
+
+    A n'utiliser QUE si `list_collections` ne montre rien de convenable : reutiliser vaut
+    toujours mieux que multiplier. Une collection est un engagement durable, pas une
+    etiquette jetable.
+
+    La FAMILLE n'est pas une categorie de rangement, c'est un COMPORTEMENT du moteur, et
+    elle ne peut pas etre inventee. Choisir parmi :
+      - 'semantic'   : savoirs stables (faits, preferences, profils, referentiels).
+      - 'procedural' : regles, procedures, resolutions d'erreur, conventions.
+      - 'episodic'   : evenements dates (comptes rendus, incidents, historique).
+      - 'working'    : volatil, jetable apres usage.
+
+    Args:
+        name: Nom du rayon, en minuscules_avec_underscores (ex: 'clients_paca').
+        family: 'semantic' | 'procedural' | 'episodic' | 'working'.
+        description: A quoi sert ce rayon et ce qu'on y range. Sert a decider plus tard s'il faut le reutiliser -- etre concret.
+        entangle: True pour un savoir structurant (le souvenir tisse des liens semantiques exploites par le rappel multi-saut). False pour du volumineux peu discriminant (brouillons, journaux bruts), afin de ne pas encombrer le graphe.
+    """
+    url = f"{SYNAPTIQ_API_URL}/v1/collections"
+    try:
+        payload = {
+            "agent_id": require_agent_id(),
+            "name": name,
+            "family": family,
+            "description": description,
+            "entangle": entangle,
+        }
+        response = _poster(url, payload)
+        if response.status_code in (409, 422):
+            # Refus METIER (doublon, nom canonique, plafond) : le detail de l'API est
+            # actionnable, il doit atteindre l'agent tel quel plutot que sous la forme
+            # d'un « HTTP 409 » qu'il ne saura pas interpreter.
+            detail = response.json().get("detail", response.text)
+            return f"[REFUSE] {detail}"
+        response.raise_for_status()
+        data = response.json()
+        usage = data.get("usage", {})
+        return (f"[SUCCESS] Collection '{data.get('name')}' creee "
+                f"(famille {data.get('family')}, section '{data.get('packet_key')}'). "
+                f"Pour y ecrire : store_memory(content=..., "
+                f"memory_type='{usage.get('type')}', subtype='{usage.get('subtype')}').")
+    except Exception as e:
+        return f"[ERROR] Echec de la creation de la collection : {e}"
+
+@mcp.tool()
+def recall_memories(query: str, limit: int = 5, memory_type: str | None = None,
+                    collections: list[str] | None = None) -> str:
     """
     Recherche sementiquement des souvenirs ou regles dans la memoire SynaptiQ pour adapter les reponses ou actions de l'agent.
 
     Args:
         query: Le sujet ou mot-cle a rechercher (ex: 'preferences style ecriture').
         limit: Nombre maximum de souvenirs a ramener (default: 5).
-        memory_type: Filtrer par type de memoire ('semantic', 'procedural', 'episodic').
+        memory_type: Filtrer par famille de memoire ('semantic', 'procedural', 'episodic', 'working').
+        collections: Restreindre a ces collections (cf. list_collections). Cible un rayon precis plutot qu'une famille entiere : moins de candidats, donc moins de bruit.
     """
     url = f"{SYNAPTIQ_API_URL}/v1/retrieve"
     try:
@@ -230,6 +400,10 @@ def recall_memories(query: str, limit: int = 5, memory_type: str | None = None) 
             "limit": limit,
             "memory_type": memory_type,
         }
+        # Omis quand absent : une liste vide serait un filtre qui ne ramene rien, alors que
+        # l'absence de filtre doit tout balayer.
+        if collections:
+            payload["collections"] = collections
         response = _poster(url, payload)
         response.raise_for_status()
         memories = response.json().get("memories", [])
@@ -245,40 +419,61 @@ def recall_memories(query: str, limit: int = 5, memory_type: str | None = None) 
         return f"[ERROR] Echec de la recherche de souvenirs : {e}"
 
 
+# Libelles lisibles des sept sections livrees avec le moteur. Les sections creees par
+# l'agent n'y figurent pas : elles portent deja le nom qu'il leur a donne.
+_LIBELLES_CANONIQUES = {
+    "facts": "FAITS", "preferences": "PREFERENCES", "episodes": "EPISODES",
+    "rules": "REGLES", "best_practices": "BONNES PRATIQUES",
+    "errors": "ERREURS", "examples": "EXEMPLES",
+}
+
+
 @mcp.tool()
-def build_context(task: str, query: str, max_tokens: int = 1200) -> str:
+def build_context(task: str, query: str, max_tokens: int = 1200,
+                  collections: list[str] | None = None) -> str:
     """
     Assemble un paquet de contexte compact (Q-EM) pret a injecter dans le prompt systeme
-    de l'agent : faits, preferences, episodes, regles, bonnes pratiques, erreurs.
+    de l'agent : faits, preferences, episodes, regles, bonnes pratiques, erreurs, plus une
+    section par collection que cet agent s'est creee.
 
     Args:
         task: La tache en cours (ex: 'Rediger un email de suivi B2B').
         query: La requete de rappel semantique (ex: 'style d'ecriture, preferences client').
         max_tokens: Budget de tokens du contexte (default: 1200).
+        collections: Restreindre le rappel a ces collections (cf. list_collections). Cible un rayon precis au lieu de ratisser toute la memoire : moins de bruit a budget de tokens egal. Omettre pour tout balayer.
     """
     url = f"{SYNAPTIQ_API_URL}/v1/context/build"
     try:
+        contraintes: dict = {
+            "max_tokens": max_tokens,
+            "memory_types": ["semantic", "episodic", "procedural", "working"],
+        }
+        if collections:
+            contraintes["collections"] = collections
         payload = {
             "agent_id": require_agent_id(),
             "session_id": "mcp-session",
             "task": task,
             "query": query,
-            "constraints": {"max_tokens": max_tokens,
-                            "memory_types": ["semantic", "episodic", "procedural", "working"]},
+            "constraints": contraintes,
         }
         response = _poster(url, payload, timeout=10)
         response.raise_for_status()
         data = response.json()
         packet = data.get("context_packet", {})
         lines = [f"Contexte SynaptiQ (~{data.get('token_estimate', 0)} tokens) :"]
-        labels = {
-            "facts": "FAITS", "preferences": "PREFERENCES", "episodes": "EPISODES",
-            "rules": "REGLES", "best_practices": "BONNES PRATIQUES",
-            "errors": "ERREURS", "examples": "EXEMPLES",
-        }
-        for key, label in labels.items():
-            for item in packet.get(key, []):
-                lines.append(f"- [{label}] {item}")
+
+        # Parcours du paquet REELLEMENT renvoye, et non d'une liste figee de sept cles.
+        # Le paquet porte desormais une section par collection de l'agent : iterer sur une
+        # table de libelles codee en dur les aurait toutes ecartees en silence -- le
+        # rangement qu'il s'est donne aurait ete invisible dans son propre contexte, et
+        # rien ne l'aurait signale. Les canoniques restent en tete, dans leur ordre.
+        ordre = [c for c in _LIBELLES_CANONIQUES if c in packet]
+        ordre += [c for c in packet if c not in _LIBELLES_CANONIQUES]
+        for cle in ordre:
+            libelle = _LIBELLES_CANONIQUES.get(cle, cle.upper())
+            for item in packet.get(cle, []):
+                lines.append(f"- [{libelle}] {item}")
         return "\n".join(lines) if len(lines) > 1 else "Aucun contexte pertinent trouve."
     except Exception as e:
         return f"[ERROR] Echec de la construction du contexte : {e}"

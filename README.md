@@ -133,7 +133,8 @@ Comparative evaluation on knowledge evolution & contradiction resolution scenari
 
 **🔌 Integrations**
 - 🐍 **Python SDK** (`synaptiq-sdk`) & 🟦 **TypeScript SDK** (`@synaptiq/sdk`) out of the box.
-- 🧰 **MCP Server** — native FastMCP tools (`store_memory`, `recall_memories`, `build_context`) for Claude Desktop, Cursor, and any MCP client.
+- 🧰 **MCP Server** — native FastMCP tools (`store_memory`, `recall_memories`, `build_context`, `list_collections`, `create_collection`) for Claude Desktop, Cursor, and any MCP client.
+- 🗂️ **Self-structuring taxonomy** — the agent declares and names its own collections; each one gets its own section in the context packet.
 - 🧬 **Pluggable Embeddings** — LM Studio (local) by default, OpenRouter, OpenAI, or NVIDIA NIM on demand.
 
 **🔐 Security**
@@ -305,7 +306,61 @@ const ctx = await client.buildContext({
 | `POST` | `/v1/memories` | Direct write of pre-consolidated memory (returns the target `collection`) |
 | `POST` | `/v1/retrieve` | Semantic vector search + Full-Text Search (FTS) |
 | `POST` | `/v1/context/build` | Q-EM context packet assembly under token budget |
+| `GET` | `/v1/collections` | The agent's own taxonomy: system collections + the ones it declared |
+| `POST` | `/v1/collections` | Declare a new collection — the agent structures its own memory |
+| `POST` | `/v1/collections/merge` | Pour one collection into another and drop the source |
 | `DELETE` | `/v1/memories` | GDPR purge — requires `admin` scope **and** `?confirm=<tenant_id>` (optional `?agent_id=` filter) |
+
+### 🗃️ Collections — the agent structures its own memory
+
+A memory carries a **family** and a **collection**. The distinction is the whole design:
+
+- **Family** (`semantic`, `episodic`, `procedural`, `working`) — closed, owned by the
+  engine. It is not a filing category, it is **behaviour**: whether the memory is entangled
+  into the graph, how it decays, which section it falls back to.
+- **Collection** — free, owned by the agent. It declares its own shelves via
+  `POST /v1/collections`, and each one gets **its own section in the context packet**.
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/collections -H 'Content-Type: application/json' -d '{
+  "agent_id": "my_agent", "name": "clients_paca", "family": "semantic",
+  "description": "Clients and prospects in the PACA region.", "entangle": true }'
+```
+
+> [!IMPORTANT]
+> **`context_packet` no longer has a fixed number of keys.** The seven canonical sections
+> (`facts`, `preferences`, `episodes`, `rules`, `best_practices`, `errors`, `examples`) are
+> always present, and every collection the agent declared adds one more — **even when
+> empty**, so the shape of the response never depends on whether there were hits. Iterate
+> over the packet's entries instead of reading seven hardcoded keys.
+
+`entangle` is the setting that matters for recall quality. It used to be the instance-wide
+`QEM_ENTANGLE_TYPES`, so `episodic` wove **no graph edges at all, for anyone**. An agent can
+now mark one episodic collection as structuring (meeting notes, say) while raw interaction
+logs stay out — feeding the multi-hop path, which is where Q-EM actually separates from the
+baseline, without polluting the graph.
+
+Writing to an undeclared collection is accepted and routed to the family's fallback section
+— and the write response says so explicitly (`collection`, `canonical_subtype`), so an agent
+is never left believing in a filing that did not happen.
+
+#### Keeping a self-built taxonomy readable
+
+Give a model the right to create a category and it will create one per nuance:
+`clients_paca`, then `clients_region_paca`, then `prospects_paca`. None is wrong, and the
+result is a memory where nothing can be found. Four guardrails, none optional:
+
+| Guardrail | What it does |
+|---|---|
+| **Semantic duplicate check** | Descriptions are embedded and compared. Above `COLLECTION_DUP_THRESHOLD` (0.85), creation is refused **and names the near collection**. Unique names protect nothing here — the engine is turned against its own drift. |
+| **Cap** | `MAX_COLLECTIONS_PER_AGENT` (50), exposed in the listing so the agent anticipates it rather than hitting it. |
+| **Merge** | `POST /v1/collections/merge` — the garbage collector. Without it a taxonomy can only grow. Memories are relabelled, never destroyed; system collections and cross-family merges are refused. |
+| **Dormant collections** | Declared but still empty after `COLLECTION_STALE_DAYS` (14) → flagged `stale`. A flaw nobody sees is a flaw nobody fixes. |
+
+There is deliberately **no cap on the number of packet sections**: rendering only prints
+sections that have content, so an agent with forty collections still produces a prompt with
+no empty rubrics — and capping would break the guarantee that a declared collection always
+appears in the packet's shape.
 
 <br>
 

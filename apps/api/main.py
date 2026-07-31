@@ -22,7 +22,6 @@ from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, R
 from pydantic import BaseModel, Field, model_validator
 
 v1_router = APIRouter()
-import psycopg2.errors
 import redis
 from dotenv import load_dotenv
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
@@ -32,8 +31,11 @@ from psycopg2.extras import RealDictCursor
 # Logique partagée (embeddings pluggables + gouvernance), plus d'import depuis le worker
 from synaptiq_core import get_embedder, handle_contradictions, link_supersedes, to_pgvector
 
-# Registre des collections : le rangement devient un objet que l'agent possède (lot 1)
-from synaptiq_core.collections import Collection, CollectionRegistry
+# Registre des collections : le rangement est un objet que l'agent possède. Le chargement
+# vit dans le cœur (comme `handle_contradictions`), afin que l'API et le worker voient
+# forcément le MÊME registre — la taxonomie avait déjà divergé une fois entre les deux
+# chemins d'écriture, elle ne doit pas recommencer.
+from synaptiq_core.collections import charger_registre
 
 # Orchestration des 4 phases Q-EM (sans SQL ni HTTP : testable en isolation)
 from synaptiq_core.context_builder import RetrievalConfig, build_context_packet
@@ -427,7 +429,8 @@ def audit(cur, tenant_id: str, action: str, auth: AuthContext | None,
     )
 
 def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
-                      agent_id: str, memory_types: list[str]) -> list[dict]:
+                      agent_id: str, memory_types: list[str],
+                      collections: list[str] | None = None) -> list[dict]:
     """Ramène les candidats par similarité vectorielle ET, si activé, par plein texte.
 
     Une seule requête à deux CTE plutôt que deux allers-retours : chaque ligne porte son
@@ -456,6 +459,17 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
     # refuse la requête ("column reference id is ambiguous").
     colonnes_m = ", ".join(f"m.{c}" for c in champs)
 
+    # Filtrage FIN par collection. Le fragment est CHOISI par le serveur (deux formes
+    # possibles, sans aucune donnee d'appelant) ; les noms de collection passent par un
+    # parametre lie, comme le reste. Meme motif que `type_filter` dans `retrieve_memories`.
+    #
+    # ⚠️ Le fragment est place APRES `type = ANY(...)` dans chaque WHERE, et les parametres
+    # suivent le meme ordre : ces requetes sont positionnelles, un decalage y serait muet
+    # (les types concordent tous) et fausserait le filtre au lieu de lever.
+    filtre_col = "AND subtype = ANY(%s)" if collections else ""
+    filtre_col_m = "AND m.subtype = ANY(%s)" if collections else ""
+    p_col: list = [collections] if collections else []
+
     # Interpolation limitee a `colonnes`/`colonnes_m` (listes de colonnes CONSTANTES,
     # definies juste au-dessus) : aucune valeur d'appelant n'entre dans le SQL, toutes
     # passent par des parametres lies (cf. l'exemption S608 justifiee dans ruff.toml).
@@ -469,10 +483,11 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
                    row_number() OVER (ORDER BY embedding <=> %s::vector) AS rank_vec,
                    NULL::bigint AS rank_fts
             FROM memories
-            WHERE tenant_id = %s AND agent_id = %s AND type = ANY(%s) AND status = 'active'
+            WHERE tenant_id = %s AND agent_id = %s AND type = ANY(%s) {filtre_col}
+              AND status = 'active'
             ORDER BY embedding <=> %s::vector
             LIMIT %s;
-        """, (vector_str, vector_str, tenant, agent_id, memory_types, vector_str,
+        """, (vector_str, vector_str, tenant, agent_id, memory_types, *p_col, vector_str,
               RETRIEVAL_CANDIDATES))
         return cur.fetchall()
 
@@ -482,7 +497,8 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
             FROM (
                 SELECT id, embedding <=> %s::vector AS distance
                 FROM memories
-                WHERE tenant_id = %s AND agent_id = %s AND type = ANY(%s) AND status = 'active'
+                WHERE tenant_id = %s AND agent_id = %s AND type = ANY(%s) {filtre_col}
+                  AND status = 'active'
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
             ) v
@@ -492,7 +508,7 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
             FROM (
                 SELECT m.id, ts_rank(m.content_tsv, q.query) AS score
                 FROM memories m, websearch_to_tsquery('simple', %s) AS q(query)
-                WHERE m.tenant_id = %s AND m.agent_id = %s AND m.type = ANY(%s)
+                WHERE m.tenant_id = %s AND m.agent_id = %s AND m.type = ANY(%s) {filtre_col_m}
                   AND m.status = 'active' AND m.content_tsv @@ q.query
                 ORDER BY ts_rank(m.content_tsv, q.query) DESC
                 LIMIT %s
@@ -513,8 +529,8 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
                EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - m.last_accessed_at)) AS age_seconds,
                r.rank_vec, r.rank_fts
         FROM retenus r JOIN memories m ON m.id = r.id;
-    """, (vector_str, tenant, agent_id, memory_types, vector_str, RETRIEVAL_CANDIDATES,
-          query_text, tenant, agent_id, memory_types, RETRIEVAL_CANDIDATES,
+    """, (vector_str, tenant, agent_id, memory_types, *p_col, vector_str, RETRIEVAL_CANDIDATES,
+          query_text, tenant, agent_id, memory_types, *p_col, RETRIEVAL_CANDIDATES,
           vector_str))
     return cur.fetchall()
 
@@ -547,10 +563,14 @@ class PostgresMemoryStore:
     pas la possibilité d'exprimer.
     """
 
-    def __init__(self, cur, tenant_id: str, agent_id: str) -> None:
+    def __init__(self, cur, tenant_id: str, agent_id: str,
+                 collections: list[str] | None = None) -> None:
         self._cur = cur
         self._tenant = tenant_id
         self._agent = agent_id
+        # Restriction optionnelle à certaines collections. Fixée à la construction, comme le
+        # périmètre : le cœur n'a pas à savoir qu'un filtre de rangement existe.
+        self._collections = collections
 
     @staticmethod
     def _normaliser(ligne) -> dict:
@@ -561,7 +581,8 @@ class PostgresMemoryStore:
 
     def fetch_candidates(self, query_vector, query_text: str, memory_types: list[str]) -> list[dict]:
         lignes = _fetch_candidates(self._cur, to_pgvector(query_vector), query_text,
-                                   self._tenant, self._agent, memory_types)
+                                   self._tenant, self._agent, memory_types,
+                                   self._collections)
         return [self._normaliser(ligne) for ligne in lignes]
 
     def fetch_relationships(self, memory_ids: list[str]) -> list[dict]:
@@ -601,82 +622,6 @@ class PostgresMemoryStore:
         )
 
 
-class PostgresCollectionStore:
-    """Implémentation `CollectionStore` sur psycopg2, bornée à un (tenant, agent).
-
-    Même invariant que `PostgresMemoryStore` : le périmètre est fixé à la construction et
-    aucune méthode ne prend de `tenant_id` ni d'`agent_id`. Une collection déclarée par un
-    agent ne peut donc pas fuiter dans le registre d'un autre — la taxonomie d'un agent est
-    aussi privée que ses souvenirs.
-    """
-
-    def __init__(self, cur, tenant_id: str, agent_id: str) -> None:
-        self._cur = cur
-        self._tenant = tenant_id
-        self._agent = agent_id
-
-    def fetch_collections(self) -> list[Collection]:
-        """Collections système (valables partout) + celles de cet agent.
-
-        Lecture par POSITION et non par nom de colonne : les appelants n'ouvrent pas tous
-        leur curseur avec `RealDictCursor` (`create_memory` utilise un curseur à tuples).
-        Une première version indexait par clé et échouait donc sur la moitié des chemins —
-        rattrapée par le repli, donc invisible autrement que par un test.
-        """
-        self._cur.execute(
-            """
-            SELECT name, family, packet_key, description, entangle, created_by
-            FROM memory_collections
-            WHERE created_by = 'system'
-               OR (tenant_id = %s AND agent_id = %s)
-            ORDER BY created_by, name;
-            """,
-            (self._tenant, self._agent),
-        )
-        collections = []
-        for ligne in self._cur.fetchall():
-            valeurs = list(ligne.values()) if isinstance(ligne, dict) else list(ligne)
-            nom, famille, cle, description, entangle, origine = valeurs[:6]
-            try:
-                collections.append(Collection(
-                    name=nom, family=famille, packet_key=cle,
-                    description=description or "", entangle=bool(entangle),
-                    created_by=origine,
-                ))
-            except ValueError:
-                # Famille hors des quatre : ligne écrite par une version antérieure ou à la
-                # main. On l'ignore plutôt que de priver l'agent de TOUT son registre.
-                logger.warning("Collection ignorée (famille invalide) : %s/%s", famille, nom,
-                               exc_info=True)
-        return collections
-
-
-def charger_registre(cur, tenant_id: str, agent_id: str) -> CollectionRegistry:
-    """Registre des collections d'un (tenant, agent), replis système compris.
-
-    Le repli sur le registre système est délibéré : la taxonomie ne doit jamais être une
-    dépendance dure du rappel ni de l'écriture. Refuser une mémoire parce que son ÉTIQUETTE
-    est illisible serait disproportionné.
-
-    Mais les deux causes de repli ne se valent pas, et ce sont deux journaux différents :
-      - `UndefinedTable` = migration non encore appliquée. État d'exploitation légitime,
-        transitoire, attendu sur une instance qui vient d'être tirée.
-      - tout le reste = un défaut. Il doit crier, sinon le repli le masque exactement comme
-        les pannes silencieuses que ce projet passe son temps à fermer.
-    """
-    try:
-        return CollectionRegistry.depuis(
-            PostgresCollectionStore(cur, tenant_id, agent_id).fetch_collections())
-    except psycopg2.errors.UndefinedTable:
-        logger.warning("Table `memory_collections` absente (migration 20260731_collections "
-                       "non appliquée) : repli sur les collections système.")
-        return CollectionRegistry.systeme()
-    except Exception:
-        logger.error("Registre de collections illisible — repli sur les collections "
-                     "système. Le rangement fin de cet agent est INACTIF.", exc_info=True)
-        return CollectionRegistry.systeme()
-
-
 def retrieval_config() -> RetrievalConfig:
     """Assemble la configuration du moteur depuis les constantes de module.
 
@@ -711,7 +656,15 @@ class EventInput(BaseModel):
 
 class ContextConstraints(BaseModel):
     max_tokens: int = Field(default=1200, ge=1, le=8000)
+    # Familles cognitives. Le plafond de 4 n'est pas arbitraire : c'est le nombre TOTAL de
+    # familles, et elles restent fermées (chacune porte un comportement du moteur).
     memory_types: list[MemoryType] = Field(default=["semantic", "episodic", "procedural", "working"], min_length=1, max_length=4)
+    # Filtrage FIN par collection (`memories.subtype`). C'est ici que la granularité s'ouvre :
+    # un agent qui a déclaré `clients_paca` peut viser ce seul rayon au lieu de ratisser tout
+    # `semantic`. Moins de candidats en entrée de Q-EM, donc moins de bruit à budget égal.
+    # None = toutes les collections des familles retenues (comportement historique).
+    collections: list[str] | None = Field(default=None, max_length=32,
+                                          json_schema_extra={"example": ["clients_paca"]})
 
 class ContextRequest(BaseModel):
     agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$", json_schema_extra={"example": "agent_sales_01"})
@@ -925,8 +878,13 @@ def build_context(request: ContextRequest, auth: AuthContext | None = Depends(ge
     try:
         query_vector = get_embedder().embed_one(request.query)
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Le registre décide des SECTIONS du paquet : une collection déclarée par cet
+            # agent y apparaît, même vide. Chargé ici, avant l'assemblage, pour que la
+            # réponse ait la même forme qu'il y ait des souvenirs ou non.
+            registre = charger_registre(cur, tenant, request.agent_id)
             resultat = build_context_packet(
-                store=PostgresMemoryStore(cur, tenant, request.agent_id),
+                store=PostgresMemoryStore(cur, tenant, request.agent_id,
+                                          request.constraints.collections),
                 query_vector=query_vector,
                 query_text=request.query,
                 memory_types=request.constraints.memory_types,
@@ -934,6 +892,7 @@ def build_context(request: ContextRequest, auth: AuthContext | None = Depends(ge
                 config=retrieval_config(),
                 trace_id=trace_id,
                 explain=request.explain,
+                registry=registre,
             )
             # `mark_accessed` a ecrit dans la transaction : la valider.
             conn.commit()
@@ -1055,6 +1014,8 @@ class RetrieveRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=8000)
     limit: int = Field(default=5, ge=1, le=100)
     memory_type: MemoryType | None = None
+    # Symétrique de `ContextConstraints.collections` : viser un rayon plutôt qu'une famille.
+    collections: list[str] | None = Field(default=None, max_length=32)
 
 @v1_router.post("/retrieve")
 def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depends(get_auth)):
@@ -1078,10 +1039,16 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
             # `type_filter` est un fragment CHOISI par le serveur (deux valeurs
             # possibles), jamais une chaine fournie par l'appelant : le type de memoire
             # est valide en amont par Pydantic (Literal, cf. exemption S608 dans ruff.toml).
+            # Le fragment et `filtre_params` sont construits ENSEMBLE et dans le même ordre :
+            # les trois requêtes ci-dessous sont positionnelles, et un décalage y serait muet
+            # (les types concordent) — il fausserait le filtre au lieu de lever.
             type_filter = "AND m.type = %s" if request.memory_type else ""
-            filtre_params = [tenant, request.agent_id]
+            filtre_params: list = [tenant, request.agent_id]
             if request.memory_type:
                 filtre_params.append(request.memory_type)
+            if request.collections:
+                type_filter += " AND m.subtype = ANY(%s)"
+                filtre_params.append(request.collections)
 
             if not RETRIEVAL_HYBRID:
                 cur.execute(f"""
@@ -1173,6 +1140,323 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
         db_pool.putconn(conn)
 
 
+# Plafond du nombre de collections qu'un agent peut se créer. Ce n'est pas une limite
+# technique : c'est un garde-fou de LISIBILITÉ. Un LLM à qui l'on donne le droit de créer
+# une catégorie en crée une à chaque nouveauté ; quarante rayons produisent un paquet de
+# contexte éclaté en quarante sections dont trente-cinq vides — plus dur à exploiter pour le
+# modèle que les sept d'origine. Le contrôle anti-doublon SÉMANTIQUE (comparaison des
+# descriptions) et la fusion viendront compléter ce plafond ; il est volontairement en place
+# dès l'ouverture de la création, pour qu'aucune fenêtre ne laisse la taxonomie s'emballer.
+MAX_COLLECTIONS_PER_AGENT = int(os.getenv("MAX_COLLECTIONS_PER_AGENT", "50"))
+
+# Cosinus au-delà duquel deux descriptions de collection décrivent la même chose. 0,85 est
+# volontairement plus haut que le seuil de redondance des souvenirs (0,75) : refuser à tort
+# une collection légitime est plus coûteux que d'en laisser passer une proche — l'agent peut
+# fusionner après coup, mais un refus le laisse sans rayon où ranger.
+COLLECTION_DUP_THRESHOLD = float(os.getenv("COLLECTION_DUP_THRESHOLD", "0.85"))
+
+# Jours sans écriture au-delà desquels une collection vide est signalée comme dormante.
+# Une collection créée puis jamais utilisée est le premier symptôme d'une taxonomie qui
+# part en morceaux ; la signaler est ce qui permet de la fusionner ou de la supprimer.
+COLLECTION_STALE_DAYS = int(os.getenv("COLLECTION_STALE_DAYS", "14"))
+
+
+def _cosinus(a, b) -> float:
+    """Cosinus entre deux vecteurs. 0.0 si l'un est nul (jamais une division par zéro)."""
+    va, vb = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    normes = float(np.linalg.norm(va) * np.linalg.norm(vb))
+    return float(va @ vb / normes) if normes else 0.0
+
+
+def _collection_trop_proche(cur, tenant: str, agent_id: str, description: str,
+                            vecteur) -> tuple[str, float] | None:
+    """Une collection existante décrit-elle déjà la même chose ?
+
+    ## Le moteur retourné contre sa propre dérive
+
+    Un LLM à qui l'on donne le droit de créer une catégorie en crée une à chaque nuance :
+    `clients_paca`, puis `clients_region_paca`, puis `prospects_paca`. Aucune n'est fausse,
+    et le résultat est une mémoire éparpillée où plus rien ne se retrouve. Un contrôle sur
+    le NOM n'y peut rien — ces trois-là sont trois chaînes distinctes.
+
+    La description, elle, est du texte : on la compare avec l'outil que le produit sait
+    déjà faire, la similarité vectorielle. C'est le même mécanisme que le filtre de
+    redondance des souvenirs, appliqué à la taxonomie.
+
+    Les descriptions sans vecteur en base (collections système, et celles reprises par la
+    migration) sont embarquées À LA VOLÉE, en un seul appel groupé. Sans cela, la protection
+    serait inopérante précisément contre les doublons des sept rayons livrés — le cas le
+    plus probable pour un agent qui débute.
+    """
+    cur.execute(
+        "SELECT name, description, description_embedding::text FROM memory_collections "
+        "WHERE created_by = 'system' OR (tenant_id = %s AND agent_id = %s)",
+        (tenant, agent_id),
+    )
+    lignes = [dict(li) if isinstance(li, dict) else
+              {"name": li[0], "description": li[1], "description_embedding": li[2]}
+              for li in cur.fetchall()]
+
+    connus: list[tuple[str, Any]] = []
+    a_embarquer: list[tuple[str, str]] = []
+    for li in lignes:
+        if not (li["description"] or "").strip():
+            continue                      # rien à comparer
+        if li["description_embedding"]:
+            connus.append((li["name"], parse_embedding(li["description_embedding"])))
+        else:
+            a_embarquer.append((li["name"], li["description"]))
+
+    if a_embarquer:
+        # Un seul appel groupé : l'interface Embedder est batch, et la création de
+        # collection est une opération rare.
+        vecteurs = get_embedder().embed([d for _, d in a_embarquer])
+        connus.extend((nom, vec) for (nom, _), vec in zip(a_embarquer, vecteurs, strict=False))
+
+    meilleur: tuple[str, float] | None = None
+    for nom, autre in connus:
+        score = _cosinus(vecteur, autre)
+        if score >= COLLECTION_DUP_THRESHOLD and (meilleur is None or score > meilleur[1]):
+            meilleur = (nom, score)
+    return meilleur
+
+
+class CollectionInput(BaseModel):
+    """Déclaration d'un nouveau rayon par l'agent lui-même."""
+
+    agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$")
+    # Devient la valeur de `memories.subtype`. Snake_case minuscule : ce nom voyage jusque
+    # dans les clés du context_packet, il doit rester lisible et stable.
+    name: str = Field(..., min_length=2, max_length=64, pattern=r"^[a-z0-9_]+$",
+                      json_schema_extra={"example": "clients_paca"})
+    family: Literal["semantic", "episodic", "procedural", "working"] = Field(
+        ..., json_schema_extra={"example": "semantic"})
+    # OBLIGATOIRE, et ce n'est pas de la bureaucratie : elle sera vectorisée pour refuser
+    # une collection qui en double une autre, et c'est aussi ce que l'agent relira dans
+    # `list_collections` pour décider s'il doit créer ou réutiliser.
+    description: str = Field(..., min_length=10, max_length=500)
+    entangle: bool = Field(
+        default=True,
+        description="Cette collection tisse-t-elle des liens 'entangled_with' ? "
+                    "Vrai pour un savoir structurant, faux pour du volumineux peu "
+                    "discriminant (brouillons, journaux bruts).")
+    # Plusieurs collections peuvent alimenter une même section du paquet. Par défaut chacune
+    # a la sienne, ce qui est le cas attendu.
+    packet_key: str | None = Field(default=None, min_length=2, max_length=64,
+                                   pattern=r"^[a-z0-9_]+$")
+
+
+@v1_router.post("/collections", status_code=201)
+def create_collection(payload: CollectionInput, auth: AuthContext | None = Depends(get_auth)):
+    """Déclare une collection. C'est l'acte par lequel l'agent structure sa propre mémoire.
+
+    ## Pourquoi la création est EXPLICITE et non implicite
+
+    Écrire dans une collection inexistante ne la crée pas. Un rangement auto-créé à la
+    volée serait indiscernable d'une faute de frappe : `clients_paca`, `client_paca` et
+    `clientspaca` cohabiteraient, chacun avec sa section dans le paquet, et personne ne
+    saurait laquelle fait foi. Un acte délibéré produit une taxonomie qu'on peut relire.
+
+    ## Ce qui est refusé
+
+    - un nom CANONIQUE (`fact`, `preference`, `rule`…). Le registre sait techniquement faire
+      primer une collection d'agent sur son homonyme système, mais ouvrir ça ici laisserait
+      un agent rerouter en silence tout ce qui est déjà rangé sous ce nom ;
+    - un doublon exact pour ce même agent ;
+    - le dépassement de `MAX_COLLECTIONS_PER_AGENT`.
+    """
+    tenant = resolve_tenant(auth)
+    require_scope(auth, "write")
+    resolve_agent(auth, payload.agent_id)
+
+    if is_canonical(payload.family, payload.name):
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{payload.name}' est une collection système de la famille "
+                   f"'{payload.family}' : elle existe déjà et sert tous les agents. "
+                   f"Choisir un autre nom, ou écrire directement dedans.",
+        )
+
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM memory_collections "
+                "WHERE tenant_id = %s AND agent_id = %s AND created_by = 'agent'",
+                (tenant, payload.agent_id),
+            )
+            existantes = cur.fetchone()["n"]
+            if existantes >= MAX_COLLECTIONS_PER_AGENT:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Plafond atteint ({MAX_COLLECTIONS_PER_AGENT} collections). "
+                           f"Une taxonomie qui grossit sans fin devient illisible : "
+                           f"réutiliser une collection existante, ou en fusionner deux.",
+                )
+
+            # Anti-doublon SÉMANTIQUE. Le contrôle d'unicité du nom ne protège de rien ici :
+            # `clients_paca` et `clients_region_paca` sont deux chaînes distinctes qui
+            # désignent le même rayon.
+            vecteur = get_embedder().embed_one(payload.description)
+            proche = _collection_trop_proche(cur, tenant, payload.agent_id,
+                                             payload.description, vecteur)
+            if proche is not None:
+                conn.rollback()
+                nom_proche, score = proche
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"'{nom_proche}' décrit déjà la même chose (similarité "
+                           f"{score:.2f}). Y ranger ce souvenir plutôt que de créer un "
+                           f"rayon de plus. Si les deux sont réellement distincts, "
+                           f"reformuler la description pour dire en quoi.",
+                )
+
+            cur.execute(
+                """
+                INSERT INTO memory_collections
+                    (tenant_id, agent_id, name, family, packet_key, entangle, description,
+                     description_embedding, created_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'agent')
+                ON CONFLICT DO NOTHING
+                RETURNING id;
+                """,
+                (tenant, payload.agent_id, payload.name, payload.family,
+                 payload.packet_key or payload.name, payload.entangle, payload.description,
+                 to_pgvector(vecteur)),
+            )
+            ligne = cur.fetchone()
+            if ligne is None:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"La collection '{payload.name}' existe déjà pour cet agent.",
+                )
+            audit(cur, tenant, "create_collection", auth, agent_id=payload.agent_id,
+                  name=payload.name, family=payload.family, entangle=payload.entangle)
+            conn.commit()
+
+        logger.info("Collection '%s' déclarée par l'agent %s (famille %s, intrication %s).",
+                    payload.name, payload.agent_id, payload.family, payload.entangle)
+        return {
+            "status": "created",
+            "name": payload.name,
+            "family": payload.family,
+            "packet_key": payload.packet_key or payload.name,
+            "entangle": payload.entangle,
+            # Ce qu'il faut passer à `store_memory` pour écrire dedans : sans ce rappel,
+            # l'agent doit deviner que « collection » se traduit par (type, subtype).
+            "usage": {"type": payload.family, "subtype": payload.name},
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        logger.error("Erreur lors de la création de la collection.", exc_info=True)
+        raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
+    finally:
+        db_pool.putconn(conn)
+
+
+class MergeInput(BaseModel):
+    agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$")
+    source: str = Field(..., min_length=2, max_length=64, pattern=r"^[a-z0-9_]+$")
+    target: str = Field(..., min_length=2, max_length=64, pattern=r"^[a-z0-9_]+$")
+
+
+@v1_router.post("/collections/merge")
+def merge_collections(payload: MergeInput, auth: AuthContext | None = Depends(get_auth)):
+    """Verse les souvenirs de `source` dans `target`, puis supprime `source`.
+
+    ## Pourquoi cette opération est indispensable
+
+    Sans elle, une taxonomie ne peut que grossir. Le plafond et l'anti-doublon ralentissent
+    la dérive, ils ne la corrigent pas : dès que deux rayons proches ont été créés, seule
+    la fusion permet de revenir en arrière. C'est le ramasse-miettes de la structure.
+
+    ## Deux refus, pour deux raisons distinctes
+
+    - **`source` doit appartenir à l'agent.** Une collection système sert tous les agents :
+      la fusionner depuis une requête d'agent la retirerait à tout le monde.
+    - **Même famille des deux côtés.** La famille porte un COMPORTEMENT (intrication,
+      décroissance, section de repli). Déplacer un souvenir de `episodic` vers `semantic`
+      changerait donc la manière dont le moteur le traite, sans que personne ne l'ait
+      demandé. Un rangement ne doit pas modifier une sémantique.
+
+    Aucun souvenir n'est détruit : seule l'étiquette change. L'opération est journalisée.
+    """
+    tenant = resolve_tenant(auth)
+    require_scope(auth, "write")
+    resolve_agent(auth, payload.agent_id)
+
+    if payload.source == payload.target:
+        raise HTTPException(status_code=422, detail="Source et cible identiques.")
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
+
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT name, family, created_by FROM memory_collections "
+                "WHERE name = ANY(%s) AND (created_by = 'system' "
+                "   OR (tenant_id = %s AND agent_id = %s))",
+                ([payload.source, payload.target], tenant, payload.agent_id),
+            )
+            par_nom = {li["name"]: li for li in cur.fetchall()}
+            source, cible = par_nom.get(payload.source), par_nom.get(payload.target)
+
+            if source is None:
+                raise HTTPException(status_code=404,
+                                    detail=f"Collection source '{payload.source}' inconnue.")
+            if cible is None:
+                raise HTTPException(status_code=404,
+                                    detail=f"Collection cible '{payload.target}' inconnue.")
+            if source["created_by"] == "system":
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"'{payload.source}' est une collection système : elle sert tous "
+                           f"les agents et ne peut pas être fusionnée.")
+            if source["family"] != cible["family"]:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Familles différentes ('{source['family']}' vers "
+                           f"'{cible['family']}'). La famille décide de l'intrication et de "
+                           f"la décroissance : la changer modifierait le traitement des "
+                           f"souvenirs déplacés, pas seulement leur rangement.")
+
+            cur.execute(
+                "UPDATE memories SET subtype = %s, updated_at = CURRENT_TIMESTAMP "
+                "WHERE tenant_id = %s AND agent_id = %s AND type = %s AND subtype = %s",
+                (payload.target, tenant, payload.agent_id, source["family"], payload.source),
+            )
+            deplacees = cur.rowcount
+            cur.execute(
+                "DELETE FROM memory_collections WHERE tenant_id = %s AND agent_id = %s "
+                "AND name = %s AND created_by = 'agent'",
+                (tenant, payload.agent_id, payload.source),
+            )
+            audit(cur, tenant, "merge_collections", auth, agent_id=payload.agent_id,
+                  source=payload.source, target=payload.target, moved=deplacees)
+            conn.commit()
+
+        logger.info("Fusion de collections : %s -> %s (%d souvenirs déplacés).",
+                    payload.source, payload.target, deplacees)
+        return {"status": "merged", "source": payload.source, "target": payload.target,
+                "moved_memories": deplacees}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        logger.error("Erreur lors de la fusion de collections.", exc_info=True)
+        raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
+    finally:
+        db_pool.putconn(conn)
+
+
 @v1_router.get("/collections")
 def list_collections(agent_id: str, auth: AuthContext | None = Depends(get_auth)):
     """Registre des collections visibles par un agent : les système et les siennes.
@@ -1202,23 +1486,45 @@ def list_collections(agent_id: str, auth: AuthContext | None = Depends(get_auth)
             )
             comptes = {(ligne["family"], ligne["name"]): ligne["n"]
                        for ligne in cur.fetchall()}
+            # Âge des collections de l'agent : une collection déclarée puis jamais utilisée
+            # est le premier symptôme d'une taxonomie qui se disperse. La signaler est ce
+            # qui rend la fusion possible — un défaut qu'on ne voit pas ne se corrige pas.
+            cur.execute(
+                "SELECT name, family, "
+                "EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at)) / 86400 AS jours "
+                "FROM memory_collections WHERE tenant_id = %s AND agent_id = %s",
+                (tenant, agent_id),
+            )
+            ages = {(li["family"], li["name"]): float(li["jours"] or 0)
+                    for li in cur.fetchall()}
             conn.rollback()  # lecture seule
+
+        collections = []
+        for col in sorted(registre.collections,
+                          key=lambda c: (c.created_by, c.family, c.name)):
+            nombre = comptes.get((col.family, col.name), 0)
+            age = ages.get((col.family, col.name))
+            collections.append({
+                "name": col.name,
+                "family": col.family,
+                "packet_key": col.packet_key,
+                "description": col.description,
+                "entangle": col.entangle,
+                "created_by": col.created_by,
+                "memory_count": nombre,
+                # Vide ET ancienne. Une collection créée il y a dix minutes et encore vide
+                # est normale : l'agent est en train de la remplir.
+                "stale": bool(col.created_by == "agent" and nombre == 0
+                              and age is not None and age >= COLLECTION_STALE_DAYS),
+            })
         return {
             "agent_id": agent_id,
-            "collections": [
-                {
-                    "name": col.name,
-                    "family": col.family,
-                    "packet_key": col.packet_key,
-                    "description": col.description,
-                    "entangle": col.entangle,
-                    "created_by": col.created_by,
-                    "memory_count": comptes.get((col.family, col.name), 0),
-                }
-                for col in sorted(registre.collections,
-                                  key=lambda c: (c.created_by, c.family, c.name))
-            ],
+            "collections": collections,
             "packet_keys": list(registre.packet_keys()),
+            "limits": {
+                "max_collections": MAX_COLLECTIONS_PER_AGENT,
+                "used": sum(1 for c in collections if c["created_by"] == "agent"),
+            },
         }
     except HTTPException:
         raise

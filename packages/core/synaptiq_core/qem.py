@@ -288,18 +288,25 @@ def format_entry(content: str, occurred_at) -> str:
 def collapse_by_utility(
     candidates: dict[str, dict],
     max_tokens: int,
+    registry: CollectionRegistry | None = None,
 ) -> tuple[dict[str, list], list[str], int]:
     """Collapse glouton : maximise l'utilité/token sous contrainte `max_tokens`.
 
-    Retourne `(context_packet, selected_ids, token_count)` où `context_packet`
-    porte toujours les 7 clés (listes, éventuellement vides).
+    Retourne `(context_packet, selected_ids, token_count)`.
 
-    Routage COMPLET par type ET sous-type vers les 7 collections logiques
-    (via `route_memory`) : `semantic/preference` -> preferences, `semantic/*` -> facts,
-    `episodic/*` -> episodes, `procedural/coding_best_practices` -> best_practices,
-    `procedural/code_error_resolution` -> errors, `procedural/*` -> rules,
-    `working/*` -> examples. Le sous-type est propagé dans l'entrée collapsée.
+    ## Le paquet n'a plus un nombre de sections fixe
+
+    Il portait toujours les sept mêmes clés, codées en dur. Il porte désormais celles du
+    REGISTRE : les sept canoniques d'abord (contrat préservé, elles sont toujours présentes
+    même vides), puis une section par collection que l'agent s'est déclarée. C'est ce qui
+    rend le rangement qu'il choisit réellement visible dans le contexte servi au LLM —
+    jusqu'ici son libellé métier était dilué dans `facts`.
+
+    Sans registre, on retombe sur le registre système : sept clés, routage identique à
+    l'origine.
     """
+    from synaptiq_core.collections import REGISTRE_SYSTEME
+    registre = registry or REGISTRE_SYSTEME
     # Sélection des candidats survivants + densité d'utilité par token.
     collapsed_candidates = []
     for mem_id, c in candidates.items():
@@ -319,7 +326,10 @@ def collapse_by_utility(
     # Tri par densité d'utilité par token décroissante (stable sur l'ordre d'insertion).
     collapsed_candidates.sort(key=lambda x: x['utility_density'], reverse=True)
 
-    packet: dict[str, list[str]] = {k: [] for k in _PACKET_KEYS}
+    # Sections issues du registre : canoniques puis celles de l'agent. Toujours toutes
+    # présentes, y compris vides — un consommateur ne doit pas avoir à tester l'existence
+    # d'une clé pour savoir qu'une collection n'a rien donné.
+    packet: dict[str, list[str]] = {k: [] for k in registre.packet_keys()}
     selected_ids: list[str] = []
     token_count = 0
 
@@ -332,11 +342,11 @@ def collapse_by_utility(
             # `route_memory` ne renvoie plus jamais None : le `if key is not None` d'avant
             # était le point exact où une mémoire déjà comptée dans `selected_ids` et déjà
             # facturée en tokens disparaissait du paquet sans laisser de trace.
-            key = route_memory(c['type'], c.get('subtype'))
-            # `setdefault` et non `packet[key]` : une collection déclarée par l'agent peut
-            # porter une clé hors des sept canoniques. Le lot 2 construira les clés depuis
-            # le registre ; d'ici là, mieux vaut une section supplémentaire dans le paquet
-            # qu'un KeyError — ou pire, un retour au silence.
+            key = route_memory(c['type'], c.get('subtype'), registre)
+            # `setdefault` conservé : le registre couvre les clés qu'il connaît, mais une
+            # mémoire peut porter une famille inconnue (donnée écrite par une version
+            # antérieure) et retomber sur une clé de repli. Mieux vaut une section en plus
+            # qu'un KeyError — ou pire, un retour au silence d'avant.
             packet.setdefault(key, []).append(c['content'])
         else:
             logger.debug(f"Q-EM: Hors budget pour {c['id']} (tokens={c['tokens']}, restant={max_tokens - token_count})")

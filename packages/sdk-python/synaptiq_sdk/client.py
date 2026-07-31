@@ -47,20 +47,35 @@ class SynaptiqClient:
             raise RuntimeError(f"Échec de l'enregistrement de l'événement : {e}") from e
 
     def build_context(self, agent_id: str, session_id: str, task: str, query: str, max_tokens: int = 1200,
-                      memory_types: list[str] | None = None, explain: bool = False) -> dict[str, Any]:
+                      memory_types: list[str] | None = None, explain: bool = False,
+                      collections: list[str] | None = None) -> dict[str, Any]:
         """
         Récupère un paquet de contexte structuré et minimaliste pour alimenter le prompt du LLM.
+
+        `memory_types` filtre par FAMILLE cognitive (les 4, fermées) ; `collections` filtre
+        finement par rayon déclaré par l'agent (`memories.subtype`). Viser une collection
+        précise réduit le nombre de candidats en entrée de Q-EM, donc le bruit à budget égal.
+
+        ⚠️ `context_packet` n'a plus un nombre de clés fixe. Il porte toujours les sept
+        sections canoniques (`facts`, `preferences`, `episodes`, `rules`, `best_practices`,
+        `errors`, `examples`), et EN PLUS une section par collection déclarée par l'agent —
+        même vide. Itérer sur `.items()` plutôt que de lire sept clés en dur.
         """
         url = f"{self.base_url}/v1/context/build"
+        contraintes: dict[str, Any] = {
+            "max_tokens": max_tokens,
+            "memory_types": memory_types or ["semantic", "episodic", "procedural", "working"],
+        }
+        # Omis quand None : le serveur distingue « toutes les collections » (absent) de
+        # « cette liste », et une liste vide y serait un filtre qui ne ramène rien.
+        if collections is not None:
+            contraintes["collections"] = collections
         payload = {
             "agent_id": agent_id,
             "session_id": session_id,
             "task": task,
             "query": query,
-            "constraints": {
-                "max_tokens": max_tokens,
-                "memory_types": memory_types or ["semantic", "episodic", "procedural", "working"]
-            },
+            "constraints": contraintes,
             "explain": explain,
         }
         try:

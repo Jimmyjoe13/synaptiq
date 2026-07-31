@@ -21,6 +21,9 @@ for _p in (_root, os.path.join(_root, "packages", "core")):
         sys.path.insert(0, _p)
 
 from synaptiq_core import get_embedder, handle_contradictions, link_supersedes, to_pgvector
+
+# Registre des collections : l'intrication est décidée par collection, plus par instance
+from synaptiq_core.collections import charger_registre
 from synaptiq_core.embeddings import generate_mock_embedding  # noqa: F401 (compat rétro tests)
 from synaptiq_core.observability import configure_logging, set_trace_id
 from synaptiq_core.taxonomy import DEFAULT_SUBTYPE, VALID_SUBTYPES, normalize_extraction
@@ -77,14 +80,30 @@ QEM_ENTANGLE_TYPES = {
 }
 
 
-def _is_entanglement_candidate(memory_data: dict) -> bool:
+def _is_entanglement_candidate(memory_data: dict, registry=None) -> bool:
     """Une mémoire doit-elle chercher des voisins à intriquer ?
 
     Historiquement restreint à `procedural` + `semantic/preference`, ce qui laissait le
     graphe VIDE dès que l'extraction retombait en `episodic/interaction` (cas du mode
     d'extraction heuristique) : sans arêtes, la propagation d'activation de build_context
     n'a rien à propager et Q-EM dégénère en simple top-k vectoriel.
+
+    ## La décision passe de l'instance à la collection
+
+    `QEM_ENTANGLE_TYPES` est un réglage d'INSTANCE : il vaut pour les quatre familles, donc
+    pour tous les agents et tous leurs rayons à la fois. Exclure `episodic` globalement était
+    le bon défaut — les épisodes bruts sont nombreux et peu discriminants — mais c'était
+    aussi une décision impossible à nuancer : une collection d'épisodes réellement
+    structurante (des comptes rendus de réunion, par exemple) ne pouvait pas tisser d'arête.
+
+    Or le multi-hop est la seule dimension où Q-EM creuse nettement l'écart sur la baseline.
+    Pouvoir densifier le graphe là où l'agent sait que ça compte est le gain mesurable de ce
+    lot, et non un simple confort de rangement.
+
+    Sans registre, on retombe exactement sur le comportement précédent.
     """
+    if registry is not None:
+        return registry.entangle_pour(memory_data.get("type"), memory_data.get("subtype"))
     return (
         memory_data.get("type") in QEM_ENTANGLE_TYPES
         or memory_data.get("subtype") == "preference"
@@ -179,13 +198,17 @@ def _parse_occurred_at(value) -> "datetime | None":
     return None
 
 
-def _validate_extraction(data: dict, event_content: str) -> dict:
+def _validate_extraction(data: dict, event_content: str, registry=None) -> dict:
     """Normalise et valide UN fait de la sortie LLM ; corrige les incohérences.
 
     Ne lève jamais : un modèle qui hallucine un type doit produire une mémoire dégradée,
     pas faire perdre l'événement (cf. `taxonomy.normalize_extraction`).
+
+    Le registre, quand il est fourni, préserve les collections que l'agent a déclarées :
+    sans lui, l'extraction écrasait `clients_paca` en `fact` alors que l'écriture directe
+    l'aurait conservé.
     """
-    mtype, subtype = normalize_extraction(data.get("type"), data.get("subtype"))
+    mtype, subtype = normalize_extraction(data.get("type"), data.get("subtype"), registry)
 
     def _clamp(value, default):
         try:
@@ -205,7 +228,7 @@ def _validate_extraction(data: dict, event_content: str) -> dict:
     }
 
 
-def _validate_extractions(payload, event_content: str) -> list:
+def _validate_extractions(payload, event_content: str, registry=None) -> list:
     """Normalise la sortie LLM en une LISTE de faits valides.
 
     Tolère les trois formes rencontrées : {"memories": [...]}, une liste nue, ou un objet
@@ -226,7 +249,7 @@ def _validate_extractions(payload, event_content: str) -> list:
     for item in items[:MAX_FACTS_PER_EVENT]:
         if not isinstance(item, dict):
             continue
-        fait = _validate_extraction(item, event_content)
+        fait = _validate_extraction(item, event_content, registry)
         cle = fait["content"].strip().lower()
         if not cle or cle in vus:
             continue
@@ -285,7 +308,8 @@ def _response_format_for(mode: str | None) -> dict | None:
     return None
 
 
-def call_llm_extractor(event_content: str, occurred_at: str | None = None) -> list:
+def call_llm_extractor(event_content: str, occurred_at: str | None = None,
+                       registry=None) -> list:
     """Extrait les mémoires consolidées d'un événement brut. Retourne une LISTE de faits.
 
     - Sans clé LLM (ou LLM_PROVIDER=mock) : heuristiques regex locales (un seul fait).
@@ -402,7 +426,7 @@ def call_llm_extractor(event_content: str, occurred_at: str | None = None) -> li
         # Tolérance : certains modèles encadrent le JSON en markdown malgré response_format
         if "```" in raw:
             raw = raw[raw.find("{"): raw.rfind("}") + 1]
-        faits = _validate_extractions(json.loads(raw), event_content)
+        faits = _validate_extractions(json.loads(raw), event_content, registry)
         logger.info("%d fait(s) extrait(s) de l'événement.", len(faits))
         return faits
     except Exception:
@@ -481,14 +505,33 @@ def process_event(event: dict) -> bool:
     logger.info("Traitement de l'événement %s pour l'agent %s.", event_id, agent_id,
                 extra={"event_id": str(event_id), "agent_id": agent_id, "tenant_id": tenant_id})
 
+    # 0. Registre des collections de cet agent, chargé AVANT l'extraction.
+    #
+    # Emprunt de connexion à part, volontairement court : les étapes 1 et 2 sont deux appels
+    # RÉSEAU (LLM puis embeddings, jusqu'à 30 s chacun). Garder une connexion du pool
+    # mobilisée pendant ce temps assècherait le pool sous charge — c'est précisément pour
+    # cela que l'écriture n'emprunte qu'à l'étape 3.
+    #
+    # Le registre est nécessaire dès l'extraction : sans lui, `normalize_extraction` écrasait
+    # toute collection non canonique par le défaut de sa famille. Un `clients_paca` proposé
+    # par le LLM devenait `fact`, alors que l'écriture directe l'aurait conservé — deux
+    # chemins, deux règles, la divergence que la taxonomie partagée avait déjà eu à corriger.
+    pool = get_db_pool()
+    conn_registre = pool.getconn()
+    try:
+        with conn_registre.cursor() as cur_reg:
+            registre = charger_registre(cur_reg, tenant_id, agent_id)
+        conn_registre.rollback()  # lecture seule
+    finally:
+        pool.putconn(conn_registre)
+
     # 1. Extraction : 1 à N faits, datés quand l'interaction le permet
-    facts = call_llm_extractor(content, occurred_at=event_time)
+    facts = call_llm_extractor(content, occurred_at=event_time, registry=registre)
 
     # 2. Embeddings en UN SEUL appel pour tous les faits (l'interface Embedder est batch)
     embeddings = get_embedder().embed([f['content'] for f in facts])
 
     # 3. Écriture en base : contradictions, insertion, intrication
-    pool = get_db_pool()
     conn = pool.getconn()
     broken = False
     try:
@@ -522,8 +565,8 @@ def process_event(event: dict) -> bool:
                 if superseded:
                     link_supersedes(cur, new_mem_id, superseded)
 
-                # 4. Graphe d'intrication : seuls les souvenirs durables le tissent.
-                if _is_entanglement_candidate(fact):
+                # 4. Graphe d'intrication : la collection décide, plus la variable globale.
+                if _is_entanglement_candidate(fact, registre):
                     _entangle(cur, tenant_id, agent_id, new_mem_id, fact, embedding)
 
         conn.commit()

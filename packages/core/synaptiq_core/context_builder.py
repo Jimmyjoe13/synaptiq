@@ -27,6 +27,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from synaptiq_core.collections import CollectionRegistry
 from synaptiq_core.qem import (
     apply_contradictions,
     collapse_by_utility,
@@ -39,10 +40,25 @@ from synaptiq_core.retrieval import DEFAULT_RRF_K, reciprocal_rank_fusion
 
 logger = logging.getLogger("synaptiq-core.context")
 
-# Les 7 clés du context_packet, répétées ici pour la réponse vide (contrat stable).
+# Les 7 clés canoniques, pour la réponse vide en l'absence de registre (contrat stable).
+# Conservé comme constante : plusieurs tests et intégrations s'y réfèrent.
 PACKET_VIDE: dict[str, list[str]] = {
     "facts": [], "preferences": [], "episodes": [],
     "rules": [], "best_practices": [], "errors": [], "examples": []}
+
+
+def packet_vide(registry: CollectionRegistry | None = None) -> dict[str, list[str]]:
+    """Paquet vide portant TOUTES les sections du registre, agent comprises.
+
+    Sans cette fonction, une recherche sans résultat renvoyait les sept clés canoniques
+    tandis qu'une recherche fructueuse en renvoyait davantage : le consommateur aurait vu
+    la forme de la réponse changer selon qu'il y a des souvenirs ou non. Une collection
+    déclarée doit apparaître même vide — c'est précisément l'information « j'ai créé ce
+    rayon et il ne contient rien ».
+    """
+    if registry is None:
+        return dict(PACKET_VIDE)
+    return {cle: [] for cle in registry.packet_keys()}
 
 
 @dataclass(frozen=True)
@@ -132,6 +148,7 @@ def build_context_packet(
     config: RetrievalConfig,
     trace_id: str,
     explain: bool = False,
+    registry: CollectionRegistry | None = None,
 ) -> dict[str, Any]:
     """Assemble un paquet de contexte compact selon les 4 phases de Q-EM.
 
@@ -164,7 +181,7 @@ def build_context_packet(
 
     if not candidates:
         return {
-            "context_packet": dict(PACKET_VIDE),
+            "context_packet": packet_vide(registry),
             "token_estimate": 0,
             "selected_memory_ids": [],
             "trace_id": trace_id,
@@ -198,7 +215,8 @@ def build_context_packet(
                            config.entangle_damping, config.entangle_max_hops)
     apply_contradictions(candidates, relationships)
     filter_redundancy(candidates, config.redundancy_threshold)
-    context_packet, selected_ids, token_count = collapse_by_utility(candidates, max_tokens)
+    context_packet, selected_ids, token_count = collapse_by_utility(
+        candidates, max_tokens, registry)
 
     if selected_ids:
         store.mark_accessed(selected_ids)

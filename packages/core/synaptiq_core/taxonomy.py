@@ -25,7 +25,11 @@ classe d'erreur que la validation peut réellement attraper, donc la seule qu'el
 """
 from __future__ import annotations
 
-from synaptiq_core.collections import FAMILY_FALLBACK_KEY, SYSTEM_COLLECTIONS
+from synaptiq_core.collections import (
+    FAMILY_FALLBACK_KEY,
+    SYSTEM_COLLECTIONS,
+    CollectionRegistry,
+)
 
 # Types de mémoire reconnus, et leurs sous-types CANONIQUES (ceux qui pilotent le routage
 # fin vers les 7 collections du context_packet — cf. `qem.route_memory`).
@@ -85,14 +89,32 @@ def validate_subtype(memory_type: str, subtype: str | None) -> str | None:
     return subtype
 
 
-def normalize_extraction(memory_type: str | None, subtype: str | None) -> tuple[str, str]:
-    """Normalise une sortie de LLM en un couple (type, sous-type) sûr.
+def normalize_extraction(memory_type: str | None, subtype: str | None,
+                         registry: CollectionRegistry | None = None) -> tuple[str, str]:
+    """Normalise une sortie de LLM en un couple (famille, collection) sûr.
 
     Contrairement à `validate_subtype`, on ne lève rien ici : un modèle qui hallucine un
-    type doit produire une mémoire dégradée, jamais faire perdre l'événement. Le sous-type
-    est ramené au canonique du type quand il n'y appartient pas.
+    type doit produire une mémoire dégradée, jamais faire perdre l'événement.
+
+    ## Ce que le registre change
+
+    Sans registre, tout sous-type non canonique était ÉCRASÉ par le défaut de sa famille.
+    Sur le chemin d'extraction, un `clients_paca` proposé par le LLM devenait donc `fact` —
+    la collection que l'agent s'est donnée était détruite à l'écriture, alors même que
+    l'écriture directe (`POST /v1/memories`) l'aurait acceptée. Encore deux chemins, deux
+    règles.
+
+    Avec un registre, une collection DÉCLARÉE par l'agent est conservée telle quelle. Un
+    sous-type ni canonique ni déclaré reste ramené au défaut : sur ce chemin, la valeur
+    vient d'un modèle et non d'une intention, et laisser un LLM peupler la taxonomie à
+    chaque hallucination la rendrait illisible en quelques jours. La création reste un acte
+    délibéré (lot 3).
     """
     mtype = memory_type if memory_type in VALID_SUBTYPES else "semantic"
-    if subtype not in VALID_SUBTYPES[mtype]:
-        subtype = DEFAULT_SUBTYPE[mtype]
-    return mtype, subtype
+    if subtype is not None and subtype in VALID_SUBTYPES[mtype]:
+        return mtype, subtype
+    if registry is not None and registry.get(mtype, subtype) is not None:
+        # `get` ne renvoie jamais autre chose que None pour un `subtype` vide : le passage
+        # ici garantit donc que `subtype` est une chaîne non vide.
+        return mtype, str(subtype)
+    return mtype, DEFAULT_SUBTYPE[mtype]
