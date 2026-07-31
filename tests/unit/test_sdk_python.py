@@ -27,10 +27,11 @@ class _Reponse:
 def appels(monkeypatch):
     enregistres = []
 
-    def _requete(url, json=None, headers=None, timeout=None, **kw):
+    def _requete(url, json=None, headers=None, timeout=None, params=None, **kw):
         enregistres.append({"url": url, "payload": json, "headers": headers,
-                            "timeout": timeout})
-        return _Reponse({"status": "ok", "memories": [], "memory_id": "mem-1"})
+                            "timeout": timeout, "params": params})
+        return _Reponse({"status": "ok", "memories": [], "memory_id": "mem-1",
+                         "collections": [], "limits": {"max_collections": 50, "used": 0}})
 
     import synaptiq_sdk.client as module
     monkeypatch.setattr(module.requests, "post", _requete)
@@ -110,3 +111,69 @@ def test_les_appels_ont_un_timeout(appels):
     """Sans timeout, un agent se bloquerait indéfiniment sur une API muette."""
     SynaptiqClient().capture(agent_id="a", session_id="s", content="c")
     assert appels[0]["timeout"] is not None
+
+
+# ─── Collections : la taxonomie que l'agent se donne ────────────────────────
+
+def test_les_collections_sont_omises_quand_absentes(appels):
+    """Une liste vide serait un filtre qui ne ramène rien ; l'absence doit tout balayer.
+
+    C'est la distinction que `None` porte et qu'une valeur par défaut `[]` détruirait.
+    """
+    client = SynaptiqClient()
+    client.build_context(agent_id="a", session_id="s", task="t", query="q")
+    client.retrieve(agent_id="a", query="q")
+    assert "collections" not in appels[0]["payload"]["constraints"]
+    assert "collections" not in appels[1]["payload"]
+
+
+def test_les_collections_sont_transmises_quand_fournies(appels):
+    client = SynaptiqClient()
+    client.build_context(agent_id="a", session_id="s", task="t", query="q",
+                         collections=["clients_paca"])
+    client.retrieve(agent_id="a", query="q", collections=["clients_paca"])
+    assert appels[0]["payload"]["constraints"]["collections"] == ["clients_paca"]
+    assert appels[1]["payload"]["collections"] == ["clients_paca"]
+
+
+def test_list_collections_est_un_get_versionne(appels):
+    SynaptiqClient().list_collections(agent_id="agentA")
+    assert appels[0]["url"].endswith("/v1/collections")
+    assert appels[0]["params"] == {"agent_id": "agentA"}
+
+
+def test_create_collection_transmet_la_famille_et_l_intrication(appels):
+    SynaptiqClient().create_collection(
+        agent_id="agentA", name="clients_paca", family="semantic",
+        description="Clients de la region PACA.", entangle=False)
+    charge = appels[0]["payload"]
+    assert appels[0]["url"].endswith("/v1/collections")
+    assert charge["family"] == "semantic"
+    assert charge["entangle"] is False
+    # `packet_key` non fourni : le serveur retombe sur le nom. Ne pas l'envoyer à None,
+    # ce serait une valeur explicite là où l'on veut le défaut du serveur.
+    assert "packet_key" not in charge
+
+
+def test_merge_collections_appelle_la_bonne_route(appels):
+    SynaptiqClient().merge_collections(agent_id="agentA", source="a_vider",
+                                       target="la_cible")
+    assert appels[0]["url"].endswith("/v1/collections/merge")
+    assert appels[0]["payload"] == {"agent_id": "agentA", "source": "a_vider",
+                                    "target": "la_cible"}
+
+
+def test_une_panne_sur_les_collections_leve_une_erreur_explicite(monkeypatch):
+    """Comme le reste du SDK : jamais de `None` silencieux sur une panne réseau."""
+    import synaptiq_sdk.client as module
+
+    def _casse(*a, **kw):
+        raise ConnectionError("injoignable")
+
+    monkeypatch.setattr(module.requests, "get", _casse)
+    monkeypatch.setattr(module.requests, "post", _casse)
+    with pytest.raises(RuntimeError, match="collections"):
+        SynaptiqClient().list_collections(agent_id="a")
+    with pytest.raises(RuntimeError, match="collection"):
+        SynaptiqClient().create_collection(agent_id="a", name="n", family="semantic",
+                                           description="d")

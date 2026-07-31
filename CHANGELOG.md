@@ -1,5 +1,99 @@
 # Changelog
 
+## 0.3.0 - Unreleased — l'agent structure sa propre memoire
+
+Jusqu'ici une « collection » n'existait nulle part : c'etait le resultat d'une cascade de
+`if` dans `route_memory`. Un agent ne pouvait ni la consulter, ni en creer, ni decider
+comment ses souvenirs sont ranges — alors que SynaptiQ est cense etre SA memoire. Il
+inventait bien des sous-types (`nana_intelligence_lead_webhook` existe en production), mais
+ils etaient servis dans `facts` comme n'importe quel fait, et **rien ne le lui disait**.
+
+### Le partage des roles : famille au moteur, collection a l'agent
+
+C'est l'invariant de tout le lot, et il tient en une phrase : **le `type` n'est pas une
+etiquette, c'est un comportement.**
+
+- `memories.type` -> la **FAMILLE** (`semantic`, `episodic`, `procedural`, `working`).
+  Fermee, propriete du moteur : elle decide de l'intrication, de la decroissance et de la
+  section de repli.
+- `memories.subtype` -> le **NOM de la collection**. Libre, propriete de l'agent.
+
+Ce decoupage epouse le schema existant, donc **aucune donnee n'est deplacee** : les
+sous-types deja ecrits deviennent retroactivement de vraies collections. La migration
+`20260731_collections` les declare, verifiee sur base vierge ET sur base peuplee.
+
+### Ce que l'agent peut faire maintenant
+
+Trois outils MCP (`list_collections`, `create_collection`, `merge_collections`) et quatre
+routes (`GET`/`POST /v1/collections`, `POST /v1/collections/merge`, plus le filtre
+`collections` sur `/v1/retrieve` et `/v1/context/build`).
+
+La creation est **explicite** : ecrire dans une collection inexistante ne la cree pas. Un
+rangement auto-cree serait indiscernable d'une faute de frappe — `clients_paca`,
+`client_paca` et `clientspaca` cohabiteraient, chacun avec sa section, sans qu'on sache
+laquelle fait foi.
+
+### RUPTURE — `context_packet` n'a plus un nombre de cles fixe
+
+Les sept sections canoniques restent toujours presentes, **meme vides**, et chaque
+collection declaree en ajoute une. Un consommateur qui lit sept cles en dur doit passer a
+une iteration sur les entrees. Les deux SDK sont mis a jour et documentent la rupture ; les
+deux harnais de benchmark iteraient deja dynamiquement.
+
+La forme ne depend PAS de la presence de resultats : une recherche infructueuse renvoie les
+memes cles qu'une recherche fructueuse. Sans cela, le consommateur aurait du tester
+l'existence de chaque cle.
+
+### Le gain qui touche le rappel : l'intrication par collection
+
+`QEM_ENTANGLE_TYPES` etait un reglage d'INSTANCE : `episodic` ne tissait **aucune arete,
+pour personne**. Bon defaut — les episodes bruts sont nombreux et peu discriminants — mais
+impossible a nuancer. Un agent peut desormais declarer qu'une collection d'episodes est
+structurante (des comptes rendus de reunion) et la faire alimenter le graphe, sans que les
+journaux bruts le polluent. Le multi-hop est la seule dimension ou Q-EM creuse nettement
+l'ecart sur la baseline : c'est le seul levier de ce lot qui touche la qualite du rappel.
+
+### Deux silences fermes
+
+- **`route_memory` ne renvoie plus jamais `None`.** Il le faisait pour une famille inconnue,
+  et `collapse_by_utility` retirait alors la memoire du paquet — *apres* l'avoir comptee
+  dans `selected_ids` et avoir depense son budget de tokens. Retrouvee, payee, invisible.
+- **`store_memory` (MCP) rend son verdict de rangement.** L'API renvoyait `collection` et
+  `canonical_subtype` depuis toujours ; l'outil les jetait et repondait exactement la meme
+  chose qu'un rangement reussi. L'agent n'avait aucun moyen de distinguer les deux, donc
+  aucun moyen d'apprendre.
+
+Corrige au passage : l'outil MCP `build_context` iterait sur sept libelles codes en dur, ce
+qui aurait ecarte **en silence** toutes les sections creees par l'agent — son propre
+rangement invisible dans son propre contexte.
+
+### Garder une taxonomie auto-construite lisible
+
+Un LLM a qui l'on donne le droit de creer une categorie en cree une par nuance. Quatre
+garde-fous, aucun optionnel :
+
+- **anti-doublon SEMANTIQUE** (`COLLECTION_DUP_THRESHOLD`, 0,85) : les descriptions sont
+  vectorisees et comparees, et le refus **nomme** la collection proche. L'unicite du nom ne
+  protege de rien ici. Les descriptions systeme, sans vecteur en base, sont embarquees a la
+  volee — sinon la protection serait inoperante contre le cas le plus probable, un agent
+  debutant qui redouble un des sept rayons livres ;
+- **plafond** (`MAX_COLLECTIONS_PER_AGENT`, 50), expose dans la liste pour etre anticipe ;
+- **fusion** : sans elle une taxonomie ne peut que grossir. Les souvenirs changent
+  d'etiquette, jamais detruits. Collections systeme et fusions inter-familles refusees — la
+  famille porte un comportement, la changer ne serait pas qu'un rangement ;
+- **dormantes** : vide au-dela de `COLLECTION_STALE_DAYS` (14) -> signalee, avec l'issue
+  nommee. Un defaut qu'on ne voit pas ne se corrige pas.
+
+**Pas de plafond sur le nombre de sections du paquet**, contrairement a ce qui etait prevu :
+verification faite, le rendu n'imprime que les sections ayant du contenu, donc 40
+collections ne produisent aucune rubrique vide dans le prompt — et un plafond aurait casse
+la garantie de forme stable. Un test verrouille cette propriete.
+
+Suite : **377 tests** (307 unitaires + 70 integration), ruff et mypy propres, couverture de
+`packages/core` a 96 %. Verifie aussi sous `SYNAPTIQ_AUTH_REQUIRED=true` et
+`RETRIEVAL_HYBRID=false` — le filtre de collection est repete dans les deux branches SQL,
+comme le filtre tenant/agent.
+
 ## 0.2.7 - Unreleased — audit d'exploitation : quatre pannes silencieuses
 
 Audit du 30/07 mene sur le depot ET sur une instance de production reelle. Le code s'en sort

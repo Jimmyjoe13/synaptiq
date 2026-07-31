@@ -106,20 +106,87 @@ class SynaptiqClient:
         except Exception as e:
             raise RuntimeError(f"Échec de l'enregistrement de la mémoire par l'agent : {e}") from e
 
-    def retrieve(self, agent_id: str, query: str, limit: int = 5, memory_type: str | None = None) -> dict[str, Any]:
+    def retrieve(self, agent_id: str, query: str, limit: int = 5, memory_type: str | None = None,
+                 collections: list[str] | None = None) -> dict[str, Any]:
         """
         Permet à l'agent IA de rechercher sémantiquement dans ses souvenirs.
+
+        `memory_type` filtre par famille cognitive, `collections` par rayon précis.
         """
         url = f"{self.base_url}/v1/retrieve"
-        payload = {
+        payload: dict[str, Any] = {
             "agent_id": agent_id,
             "query": query,
             "limit": limit,
             "memory_type": memory_type
         }
+        # Omis quand None : une liste vide serait un filtre qui ne ramène rien, alors que
+        # l'absence de filtre doit tout balayer.
+        if collections is not None:
+            payload["collections"] = collections
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=5)
             response.raise_for_status()
             return response.json()
         except Exception as e:
             raise RuntimeError(f"Échec de la récupération des souvenirs : {e}") from e
+
+    # ─── Collections : la taxonomie que l'agent se donne ────────────────────
+    # La FAMILLE (`semantic`, `episodic`, `procedural`, `working`) appartient au moteur et
+    # porte un comportement : intrication dans le graphe, décroissance, section de repli.
+    # La COLLECTION appartient à l'agent : il la nomme, la décrit, et elle obtient sa propre
+    # section dans le context_packet.
+
+    def list_collections(self, agent_id: str) -> dict[str, Any]:
+        """Collections visibles par cet agent : les système et les siennes.
+
+        Chaque entrée porte `memory_count` et `stale` (déclarée mais restée vide) ; la
+        réponse porte aussi `limits`, pour anticiper le plafond plutôt que s'y cogner.
+        """
+        url = f"{self.base_url}/v1/collections"
+        try:
+            response = requests.get(url, params={"agent_id": agent_id},
+                                    headers=self.headers, timeout=5)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise RuntimeError(f"Échec de la lecture des collections : {e}") from e
+
+    def create_collection(self, agent_id: str, name: str, family: str, description: str,
+                          entangle: bool = True,
+                          packet_key: str | None = None) -> dict[str, Any]:
+        """Déclare une collection.
+
+        La `description` est obligatoire et vectorisée : une collection trop proche d'une
+        existante est refusée (409) en nommant celle qui fait doublon. `entangle=False`
+        garde une collection volumineuse et peu discriminante hors du graphe.
+        """
+        url = f"{self.base_url}/v1/collections"
+        payload: dict[str, Any] = {
+            "agent_id": agent_id, "name": name, "family": family,
+            "description": description, "entangle": entangle,
+        }
+        if packet_key is not None:
+            payload["packet_key"] = packet_key
+        try:
+            response = requests.post(url, json=payload, headers=self.headers, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise RuntimeError(f"Échec de la création de la collection : {e}") from e
+
+    def merge_collections(self, agent_id: str, source: str, target: str) -> dict[str, Any]:
+        """Verse `source` dans `target` puis supprime `source`.
+
+        Les souvenirs changent d'étiquette, aucun n'est détruit. Les deux collections
+        doivent appartenir à la même famille, et `source` doit avoir été créée par l'agent.
+        """
+        url = f"{self.base_url}/v1/collections/merge"
+        try:
+            response = requests.post(
+                url, json={"agent_id": agent_id, "source": source, "target": target},
+                headers=self.headers, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise RuntimeError(f"Échec de la fusion de collections : {e}") from e
