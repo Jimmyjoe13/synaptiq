@@ -1,17 +1,14 @@
-<!-- ╔══════════════════════════════════════════════════════════════╗ -->
-<!-- ║                          SYNAPTIQ                              ║ -->
-<!-- ╚══════════════════════════════════════════════════════════════╝ -->
-
 <div align="center">
 
 <p align="center">
-  <img src="img/logo-synaptiq3.png" alt="SynaptiQ Logo" width="" />
+  <img src="img/logo-synaptiq3.png" alt="SynaptiQ" width="" />
+</p>
 
-
-<h3><em>The vector second brain for AI agents — long-term, semantic, and temporal memory.</em></h3>
+<h3><em>Long-term memory infrastructure for AI agents — semantic, temporal, self-structuring.</em></h3>
 
 <p>
-  <strong>Q-EM</strong> · <em>Quantum-like Entanglement Memory</em> — a memory engine that connects memories by <strong>meaning</strong>, not manually written wikilinks.
+  <strong>Q-EM</strong> · <em>Quantum-like Entanglement Memory</em> — a memory engine that links
+  memories by <strong>meaning</strong>, not by hand-written wikilinks.
 </p>
 
 <p>
@@ -21,257 +18,310 @@
   <img alt="PostgreSQL" src="https://img.shields.io/badge/PostgreSQL-pgvector-336791?logo=postgresql&logoColor=white">
   <img alt="Redis" src="https://img.shields.io/badge/Redis-Streams-DC382D?logo=redis&logoColor=white">
   <img alt="MCP" src="https://img.shields.io/badge/MCP-ready-6E56CF">
-  <img alt="Ruff" src="https://img.shields.io/badge/lint-ruff-261230?logo=ruff&logoColor=white">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-passing-brightgreen">
+  <img alt="Coverage" src="https://img.shields.io/badge/core%20coverage-96%25-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 <p>
-  <a href="#-why-q-em">Why Q-EM</a> ·
-  <a href="#-key-features">Key Features</a> ·
-  <a href="#-architecture">Architecture</a> ·
-  <a href="#-quickstart">Quickstart</a> ·
-  <a href="#-the-q-em-engine-in-4-phases">Q-EM Engine</a> ·
-  <a href="#-sdk-usage">SDKs</a> ·
-  <a href="#-api-reference-v1">API</a> ·
-  <a href="#-installing-the-mcp-server">MCP Server</a> ·
-  <a href="#-security">Security</a>
+  <a href="#what-it-is">What it is</a> ·
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#core-concepts">Concepts</a> ·
+  <a href="#api-reference">API</a> ·
+  <a href="#sdks">SDKs</a> ·
+  <a href="#mcp-server">MCP</a> ·
+  <a href="#security">Security</a> ·
+  <a href="#benchmarks">Benchmarks</a>
 </p>
 
 </div>
 
 ---
 
-**SynaptiQ** is a production-grade Long-Term Memory (LTM) infrastructure for autonomous AI agents. Unlike standard "flat top-k" RAG systems that simply retrieve the 5 nearest raw document chunks, SynaptiQ **consolidates** the agent's stream of experience, **entangles** memories semantically, **prunes** contradictions and redundancies, and **assembles** a compact context packet perfectly tailored to your token budget.
+## What it is
+
+**SynaptiQ is long-term memory for autonomous agents.** Where a standard RAG stack retrieves
+the *k* nearest raw chunks, SynaptiQ **consolidates** an agent's stream of experience into
+discrete memories, **links** them semantically, **prunes** contradictions and redundancies,
+and **assembles** a compact context packet that fits a token budget.
+
+It runs on your own hardware: PostgreSQL + pgvector for storage, Redis Streams for async
+ingestion, FastAPI for the surface, and a native MCP server for agent clients.
 
 > [!NOTE]
-> **Self-hosted: 1 deployment = 1 security perimeter.** The tenant boundary is enforced server-side and never trusted from request payloads. Keep your data on-premise while giving your agents a memory that learns from its mistakes.
+> **Self-hosted: one deployment = one security perimeter.** The tenant boundary is decided
+> server-side and never trusted from a request payload. Agents inside a deployment are
+> isolated by `agent_id`.
 
-<br>
+**Project status.** Actively developed, running in production on a single-instance
+deployment. The API is versioned under `/v1`; the schema is owned by Alembic migrations.
+Breaking changes are documented in [`CHANGELOG.md`](CHANGELOG.md). The comparative benchmark
+is honest about not yet being statistically significant — see [Benchmarks](#benchmarks).
 
-## 💡 Why Q-EM
+### When SynaptiQ fits — and when it doesn't
 
-Standard RAG answers: *"Which chunks look similar to my query text?"*  
-Q-EM answers: *"What exact context does the agent actually need right now to act without repeating itself?"*
-
-| Feature / Dimension | 🗂️ Standard RAG | 🧠 SynaptiQ (Q-EM) |
-|---|:---|:---|
-| **Stored Unit** | Raw document chunks | Consolidated memories (facts, preferences, rules, errors…) |
-| **Selection Algorithm** | Top-k cosine similarity | Superposition → **entanglement** → interference → measurement |
-| **Related Memories** | Ignored if they don't match query text | **Retrieved via activation** along `entangled_with` graph edges |
-| **Contradictions** | Returned side-by-side | **Adjudicated** — an obsolete memory is superseded only on an explicit contradiction verdict, never on similarity alone |
-| **Redundancies** | Fill up context budget | **Pruned** (cosine > threshold → only one survives) |
-| **Temporality** | Missing or naive | Configurable **temporal decay** (half-life, recency boost) |
-| **Output** | Unstructured list of chunks | **Structured packet** under token budget (facts, preferences, rules, errors…) |
-
-<br>
-
-### 📊 LOCOMO Benchmark (Proof of Value vs Vector Baseline)
-
-Run on **LOCOMO**, one conversation: 419 dialogue turns, 152 evaluated questions, fixed
-context budget of 1500 tokens.
-
-| Question Category | Vector Baseline (Top-k) | 🧠 SynaptiQ (Q-EM) | Difference |
-|:---|:---:|:---:|:---:|
-| **Overall Accuracy** | 48.03 % | 51.32 % | +3.29 pts · 95% CI [−7.9, +14.5] |
-| **Multi-Hop** (graph entanglement) | 18.75 % | 25.00 % | +6.25 pts |
-| **Temporal Reasoning** (timestamping) | 78.38 % | 83.78 % | +5.40 pts |
-| **Single-Hop** | 47.14 % | 52.86 % | +5.72 pts |
-
-> ### ⚠️ Read this before quoting the numbers above
->
-> **On 152 questions, none of these differences is statistically significant.** The 95%
-> confidence interval on the overall gain spans **−7.9 to +14.5 points** — it contains zero,
-> so this run cannot establish that Q-EM beats the baseline. The per-category intervals are
-> wider still (multi-hop rests on 16 questions).
->
-> We publish it anyway, with its uncertainty, because that is what the measurement actually
-> says. The direction is consistent with what the algorithm does — the largest gains land on
-> multi-hop and temporal questions, which are exactly what the entanglement graph and
-> `occurred_at` are for — but *consistent* is not *demonstrated*.
->
-> Reaching a ±2 point margin needs **~2,400 questions**, i.e. the full 10-conversation LOCOMO
-> set (~1,990 questions). That run is the next milestone; until it lands, treat this table as
-> a smoke test, not as proof.
->
-> Every interval here is computed by `synaptiq_core.stats` (Wilson intervals) and emitted by
-> the harness itself, so a result can no longer be published without its uncertainty.
-
-* 🔗 **1,420 entanglement relations** automatically generated by the background worker.
-* 🛡️ **0.0 % degraded extractions** (every memory came from structured LLM extraction, none
-  from the regex fallback — a run with degraded extractions measures a handicapped Q-EM).
-* 🎲 Fixed seed, dedicated tenant, identical token budget and identical answering model on
-  both arms. Reproduce with `make bench` (or `.\scripts\dev.ps1 bench` on Windows).
-
-<br>
-
-### ⚔️ SynaptiQ Q-EM vs Obsidian MCP (Static Markdown Search)
-
-Comparative evaluation on knowledge evolution & contradiction resolution scenarios:
-
-| Test / Scenario | 📝 Obsidian MCP (Markdown Notes) | 🧠 SynaptiQ (Q-EM) | Analysis & Victory |
-|:---|:---:|:---:|:---|
-| **DB Migration Contradiction** | ❌ Failed (0/1) | **✅ Passed (1/1)** 🥇 | Obsidian keeps MySQL & Postgres; SynaptiQ supersedes MySQL (`supersedes_by`). |
-| **Style & Tone Rule Update** | ❌ Failed (0/1) | **✅ Passed (1/1)** 🥇 | Obsidian outputs contradictory advice; SynaptiQ filters out obsolete rules. |
-| **Contradiction Resolution Rate** | **0.0 %** | **100.0 %** 🥇 | **Absolute supremacy of SynaptiQ on continuous learning.** |
-
-<br>
-
-## ⚡ Key Features
-
-**🧠 Memory Engine**
-- 🌌 **Q-EM Core** — semantic superposition, concept entanglement, destructive interference, greedy collapse by utility density.
-- 🔗 **Automatic Entanglement** — worker automatically builds `entangled_with` and `supersedes_by` edges.
-- ⏳ **Temporal Decay** — unaccessed memories decay over time (configurable half-life) and reactivate upon retrieval.
-- 🗃️ **Logical Collections** — automatic routing by `type`/`subtype`: facts, preferences, rules, coding best practices, error resolutions, episodes.
-
-**🛰️ Pipeline & Reliability**
-- 📡 **Asynchronous Ingestion** — Redis Streams (consumer groups, ACK, bounded retries, dead-letter queue): zero latency for the calling agent.
-- 🧩 **Structured LLM Extraction** — memory classification into validated JSON schemas, with regex fallback heuristics.
-- 🪪 **Idempotency** — `idempotency_key`: submitting the same event twice results in a single consolidated memory.
-- 🏊 **PostgreSQL Connection Pooling** & **HNSW Indexing** for ultra-fast vector search.
-
-**🔌 Integrations**
-- 🐍 **Python SDK** (`synaptiq-sdk`) & 🟦 **TypeScript SDK** (`@synaptiq/sdk`) out of the box.
-- 🧰 **MCP Server** — native FastMCP tools (`store_memory`, `recall_memories`, `build_context`, `list_collections`, `create_collection`) for Claude Desktop, Cursor, and any MCP client.
-- 🗂️ **Self-structuring taxonomy** — the agent declares and names its own collections; each one gets its own section in the context packet.
-- 🧬 **Pluggable Embeddings** — LM Studio (local) by default, OpenRouter, OpenAI, or NVIDIA NIM on demand.
-
-**🔐 Security**
-- 🏰 **Multi-Tenant Isolation** enforced server-side, Bearer API key authentication, rate limiting, CORS configuration, **GDPR purge endpoint**.
-
-<br>
-
-## 🏗️ Architecture
-
-Modular async architecture: the agent never waits for heavy processing, all extraction and graph building is offloaded to background workers.
-
-```mermaid
-graph LR
-    A[🤖 AI Agent] -->|1. events| API[⚙️ FastAPI Server]
-    API -->|2. push job| R[(📨 Redis Streams)]
-    R -->|3. pull job| W[🧠 Consolidation Worker]
-    W -->|4. embedding + entanglement| DB[(🗄️ PostgreSQL + pgvector)]
-    A -->|5. context/build| API
-    API -->|6. Q-EM recall| DB
-    DB -->|7. context packet| API
-    API -->|8. rehydrated prompt| A
-```
-
-| Component | Role |
+| Good fit | Poor fit |
 |---|---|
-| **API** (`apps/api`) | Event ingestion (`/events`), context assembly (`/context/build`, `/retrieve`), direct memory writing (`/memories`). |
-| **Worker** (`apps/worker`) | Consumes stream, classifies → embeds → entangles memories in graph. |
-| **Core** (`packages/core`) | Shared logic: pluggable `Embedder`, governance, pure Q-EM mathematical engine. |
-| **SDKs** (`packages/sdk-python`, `packages/sdk-typescript`) | Native client libraries for Python & TypeScript/JavaScript. |
-| **MCP** (`apps/mcp`) | Exposed tools for AI agents via Model Context Protocol (`stdio` & `http`). |
+| An agent that must remember across sessions and **stop repeating its mistakes** | One-shot document Q&A over a static corpus — use a plain vector store |
+| Knowledge that **evolves and contradicts itself** (preferences, rules, decisions) | Immutable reference documents |
+| A **token-budgeted** context assembled per task | Feeding an entire corpus into a long context window |
+| Self-hosting, data staying on-premise | A fully managed SaaS you don't want to operate |
 
 <br>
 
-## 🚀 Quickstart
+## Quickstart
 
-### Prerequisites
-- **Docker** & Docker Compose
-- **LM Studio** (local) or an **OpenRouter / OpenAI API Key** (see [Embeddings](#-embeddings))
-- Python **3.11+** (for non-container local development)
-
-### Option A — Full Stack via Docker (Recommended)
+**Prerequisites** — Docker & Docker Compose · an embedding provider ([LM Studio](https://lmstudio.ai)
+locally, or an OpenRouter/OpenAI key) · Python 3.11+ for non-container development.
 
 ```bash
 git clone https://github.com/Jimmyjoe13/synaptiq.git
 cd synaptiq
-cp .env.example .env          # Adjust EMBEDDING_PROVIDER & API keys as needed
-docker compose up --build     # Starts Postgres + Redis + API + Worker + MCP
+cp .env.example .env       # review EMBEDDING_PROVIDER and the API keys
+docker compose up -d       # Postgres + Redis + migrate + API + worker + relay
 ```
-
-Once `synaptiq-api` reports `healthy`:
 
 ```bash
-curl http://127.0.0.1:8000/v1/health   # -> {"status":"ok", ...}
+curl http://127.0.0.1:8000/v1/health
+# {"status":"ok","services":{"postgres":"healthy","redis":"healthy","ingestion":"healthy"}}
 ```
 
-| Service | Endpoint |
-|---|---|
-| API (`v1`) | `http://127.0.0.1:8000` |
-| MCP (SSE) | `http://127.0.0.1:8765` |
-| PostgreSQL | `127.0.0.1:5435` |
-| Redis | `127.0.0.1:6399` |
+| Service | Endpoint | Started by default |
+|---|---|:---:|
+| API (`/v1`) | `http://127.0.0.1:8000` | ✅ |
+| PostgreSQL | `127.0.0.1:5435` | ✅ |
+| Redis | `127.0.0.1:6399` | ✅ |
+| Worker + relay | *(no port)* | ✅ |
+| MCP server | `http://127.0.0.1:8765` | ⛔ `--profile mcp-http` |
+
+The MCP service sits behind a Compose profile: `docker compose --profile mcp-http up -d`.
+See the [MCP guide](docs/mcp-server.md).
 
 <details>
-<summary><strong>Option B — Local Dev (Without Docker Containers for Python)</strong></summary>
+<summary><strong>Running the Python services on the host instead</strong></summary>
 
 <br>
 
-```bash
-# 1. Start database infrastructure only
-docker compose up -d postgres redis
+Needed when your embedding server only listens on loopback — a container cannot reach it.
 
-# 2. Install dependencies
+```bash
+docker compose up -d postgres redis migrate    # storage + schema only
+
 pip install -r requirements-dev.txt
 pip install -e packages/core -e packages/sdk-python
 
-# 3. Start FastAPI server (port 8000)
 python -m uvicorn apps.api.main:app --reload --port 8000
-
-# 4. Start Consolidation Worker (separate terminal)
-python apps/worker/worker.py
+python apps/worker/worker.py        # separate terminal
+python apps/relay/relay.py          # separate terminal — publishes the outbox
 ```
+
+Skipping the **relay** is the classic mistake: `/events` still answers `201`, the event lands
+in the transactional outbox, and nothing ever consolidates it. `/v1/health` reports
+`"ingestion":"stalled"` when that happens.
 
 </details>
 
-<br>
+### First memory, end to end
 
-## 🌌 The Q-EM Engine in 4 Phases
+```bash
+# Write a consolidated memory directly
+curl -X POST http://127.0.0.1:8000/v1/memories -H 'Content-Type: application/json' -d '{
+  "agent_id": "george", "type": "semantic", "subtype": "preference",
+  "content": "Jimmy prefers short progress reports, in French." }'
 
-A quantum-inspired metaphor, a deterministic algorithmic pipeline. On every `/v1/context/build`:
-
+# Ask for a context packet before calling your LLM
+curl -X POST http://127.0.0.1:8000/v1/context/build -H 'Content-Type: application/json' -d '{
+  "agent_id": "george", "session_id": "s1",
+  "task": "Draft the weekly update", "query": "writing style preferences" }'
 ```
-  1. SUPERPOSITION      Vector similarity search (pgvector) → scored memory candidates
-        │               score = cosine_similarity × recency_factor
-        ▼
-  2. ENTANGLEMENT       Damped activation spreading along 'entangled_with' graph edges
-        │               → related memories surface even if they don't match query keywords
-        ▼
-  3. INTERFERENCE       Destructive filtering:
-        │                 • contradictions → obsolete versions are superseded
-        ▼                 • redundancies (cosine > threshold) → only one survives
-  4. MEASUREMENT        Greedy collapse by utility density per token,
-                        routed into the 7 context packet collections
-```
-
-The algorithmic core lives in `packages/core/synaptiq_core/qem.py` — **pure functions, zero I/O, 100% unit tested**.
 
 <br>
 
-## 🐍 SDK Usage
+## Architecture
 
-### Python (`synaptiq-sdk`)
+The calling agent never waits for heavy processing: extraction, embedding and graph building
+are offloaded to a background worker.
+
+```mermaid
+graph LR
+    A[🤖 Agent] -->|1. POST /events| API[⚙️ FastAPI]
+    API -->|2. same transaction| OB[(📥 event_outbox)]
+    OB -->|3. relay publishes| R[(📨 Redis Streams)]
+    R -->|4. consumer group| W[🧠 Worker]
+    W -->|5. extract · embed · entangle| DB[(🗄️ PostgreSQL + pgvector)]
+    A -->|6. POST /context/build| API
+    API -->|7. Q-EM recall| DB
+    DB -->|8. context packet| API
+    API -->|9. rehydrated prompt| A
+```
+
+| Component | Path | Role |
+|---|---|---|
+| **API** | `apps/api` | Ingestion, retrieval, context assembly, collection management. |
+| **Relay** | `apps/relay` | Publishes the transactional outbox to Redis. Without it, `/events` is a silent black hole. |
+| **Worker** | `apps/worker` | Consumes the stream: extract → embed → entangle. Consumer group, ACK, bounded retries, DLQ. |
+| **Core** | `packages/core` | Pure Q-EM engine, pluggable `Embedder`, governance, collection registry. Zero I/O, 96% covered. |
+| **MCP** | `apps/mcp` | Six tools over MCP (`stdio` / `http`). |
+| **SDKs** | `packages/sdk-python`, `packages/sdk-typescript` | Native clients. |
+
+**Write reliability.** `/events` writes the event *and* its outbox row in a single
+transaction — never straight to Redis. The relay publishes, the worker deduplicates on
+`memories.source_event_id`, and `idempotency_key` makes a repeated submission a no-op. The
+guarantee is at-least-once delivery without duplicated memories.
+
+<br>
+
+## Core concepts
+
+### The Q-EM engine, in four phases
+
+A quantum-inspired metaphor over a strictly deterministic pipeline. Every
+`POST /v1/context/build` runs:
+
+```
+  1. SUPERPOSITION    Hybrid search: pgvector similarity ∪ full-text, fused by RRF
+        │             initial score = relevance × recency_factor
+        ▼
+  2. ENTANGLEMENT     Damped activation spreading along 'entangled_with' edges (multi-hop)
+        │             → related memories surface even without matching the query text
+        ▼
+  3. INTERFERENCE     Destructive filtering:
+        │               • contradictions → the superseded version is cancelled
+        ▼               • redundancies (cosine > threshold) → one survivor
+  4. MEASUREMENT      Greedy collapse by utility density per token, routed into sections
+```
+
+The algorithmic core lives in `packages/core/synaptiq_core/qem.py`: **pure functions, no I/O,
+fully unit-tested.** Every threshold is an environment variable, read at call time, so an
+ablation study needs no redeploy.
+
+### Families and collections
+
+A memory carries a **family** and a **collection**. The distinction is the whole design:
+
+|  | **Family** | **Collection** |
+|---|---|---|
+| Column | `memories.type` | `memories.subtype` |
+| Values | `semantic` · `episodic` · `procedural` · `working` — **closed** | free, agent-defined |
+| Owner | the engine | the agent |
+| Meaning | a **behaviour**: entanglement, decay, fallback section | a **label**: which shelf, which packet section |
+
+The family is not a filing category. It decides whether a memory is woven into the graph, how
+it decays, and where it falls back. That is why it stays closed — and why the agent gets full
+freedom on the layer above it.
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/collections -H 'Content-Type: application/json' -d '{
+  "agent_id": "george", "name": "clients_paca", "family": "semantic",
+  "description": "Clients and prospects in the PACA region.", "entangle": true }'
+```
+
+Seven collections ship with the engine and back the canonical packet sections:
+
+| Collection | Family | Packet section |
+|---|---|---|
+| `fact` · `preference` | `semantic` | `facts` · `preferences` |
+| `interaction` | `episodic` | `episodes` |
+| `rule` · `coding_best_practices` · `code_error_resolution` | `procedural` | `rules` · `best_practices` · `errors` |
+| `scratch` | `working` | `examples` |
+
+> [!IMPORTANT]
+> **`context_packet` does not have a fixed number of keys.** The seven canonical sections are
+> always present, and every collection the agent declared adds one — **even when empty**, so
+> the response shape never depends on whether there were hits. Iterate over the packet's
+> entries; never read seven hardcoded keys.
+
+**`entangle` is the setting that moves recall quality.** It used to be the instance-wide
+`QEM_ENTANGLE_TYPES`, so `episodic` wove no graph edges at all, for anyone. An agent can now
+mark one episodic collection as structuring (meeting notes, say) while raw interaction logs
+stay out — feeding the multi-hop path without polluting the graph.
+
+Writing to an undeclared collection is accepted and routed to the family's fallback section —
+and the response says so explicitly (`collection`, `canonical_subtype`), so an agent is never
+left believing in a filing that did not happen.
+
+<details>
+<summary><strong>Keeping a self-built taxonomy readable</strong></summary>
+
+<br>
+
+Give a model the right to create a category and it creates one per nuance: `clients_paca`,
+then `clients_region_paca`, then `prospects_paca`. None is wrong, and the result is a memory
+where nothing can be found. Four guardrails:
+
+| Guardrail | Behaviour |
+|---|---|
+| **Semantic duplicate check** | Descriptions are embedded and compared. Above `COLLECTION_DUP_THRESHOLD` (0.85), creation is refused **and names the near collection**. Unique names protect nothing here — the engine is turned against its own drift. |
+| **Cap** | `MAX_COLLECTIONS_PER_AGENT` (50), surfaced in the listing so it is anticipated rather than hit. |
+| **Merge** | `POST /v1/collections/merge`. Without it a taxonomy can only grow. Memories are relabelled, never destroyed; system collections and cross-family merges are refused. |
+| **Dormant shelves** | Declared but still empty after `COLLECTION_STALE_DAYS` (14) → flagged `stale`. A flaw nobody sees is a flaw nobody fixes. |
+
+There is deliberately **no cap on packet sections**: rendering only prints sections that have
+content, so forty collections still produce a prompt with no empty rubrics — and a cap would
+break the guarantee that a declared collection always appears in the packet's shape.
+
+</details>
+
+### Contradictions
+
+Similarity alone never archives anything. An earlier implementation treated "close" as
+"contradictory" and silently destroyed compatible preferences — *"short emails"* and *"emails
+in French"* sit around 0.85 cosine. Today the cosine is only a **pre-filter** that bounds how
+many candidates reach a pluggable judge; archiving requires an **explicit verdict**, and the
+judge is fail-closed (no judge configured → nothing is archived). A `supersedes_by` edge
+records what replaced what, so an archive is never indistinguishable from a disappearance.
+
+<br>
+
+## API reference
+
+Base path `/v1`. Unversioned aliases are kept for backward compatibility.
+
+| Method | Endpoint | Role |
+|:---:|---|---|
+| `GET` | `/v1/health` | Postgres, Redis and **ingestion** status. `degraded` if any is unhealthy. |
+| `POST` | `/v1/events` | Async ingestion, transactional outbox, idempotent via `idempotency_key`. |
+| `POST` | `/v1/memories` | Direct write of a consolidated memory. Returns the resolved `collection`. |
+| `POST` | `/v1/retrieve` | Hybrid search (vector + full-text, RRF), filterable by family and collection. |
+| `POST` | `/v1/context/build` | Q-EM context packet under a token budget. `explain=true` adds a `retrieval_trace`. |
+| `GET` | `/v1/collections` | The agent's taxonomy: volumes, quota, dormant shelves. |
+| `POST` | `/v1/collections` | Declare a collection. |
+| `POST` | `/v1/collections/merge` | Pour one collection into another; the source is dropped. |
+| `DELETE` | `/v1/memories` | GDPR purge — `admin` scope **and** `?confirm=<tenant_id>`. Optional `?agent_id=`. |
+| `GET` | `/metrics` | Prometheus exposition. |
+
+Interactive schema at `http://127.0.0.1:8000/docs`.
+
+<br>
+
+## SDKs
+
+### Python — `synaptiq-sdk`
 
 ```python
 from synaptiq_sdk import SynaptiqClient
 
 client = SynaptiqClient("http://127.0.0.1:8000", api_key="your_api_key")
 
-# 1. Capture raw agent interaction (async consolidation by worker)
-client.capture(
-    agent_id="george",
-    session_id="sess_1",
-    content="User prefers concise progress reports in English.",
-)
+# Capture a raw interaction — consolidated asynchronously by the worker
+client.capture(agent_id="george", session_id="s1",
+               content="User prefers concise progress reports in English.")
 
-# 2. Rehydrate compact context packet before calling LLM
-ctx = client.build_context(
-    agent_id="george",
-    session_id="sess_1",
-    task="Draft weekly status update",
-    query="format and language preferences",
-)
+# Give the agent its own shelf
+client.create_collection(agent_id="george", name="clients_paca", family="semantic",
+                         description="Clients and prospects in the PACA region.")
 
-packet = ctx["context_packet"]                 # facts / preferences / rules / errors...
-print(ctx["token_estimate"], packet["preferences"])
+# Rehydrate a compact context packet before calling the LLM
+ctx = client.build_context(agent_id="george", session_id="s1",
+                           task="Draft the weekly update",
+                           query="format and language preferences")
+
+for section, items in ctx["context_packet"].items():   # iterate — the keys are dynamic
+    for item in items:
+        print(f"[{section}] {item}")
+print(ctx["token_estimate"])
 ```
 
-### TypeScript (`@synaptiq/sdk`)
+### TypeScript — `@synaptiq/sdk`
 
 ```typescript
 import { SynaptiqClient } from "@synaptiq/sdk";
@@ -281,426 +331,203 @@ const client = new SynaptiqClient({
   apiKey: "your_api_key",
 });
 
-await client.capture({
-  agentId: "george",
-  sessionId: "sess_1",
-  content: "User prefers concise progress reports in English.",
-});
+await client.capture("george", "s1", "User prefers concise progress reports in English.");
 
-const ctx = await client.buildContext({
-  agentId: "george",
-  sessionId: "sess_1",
-  task: "Draft weekly status update",
-  query: "format and language preferences",
-});
+const ctx = await client.buildContext("george", "s1",
+  "Draft the weekly update", "format and language preferences",
+  { maxTokens: 1200 });
+
+for (const [section, items] of Object.entries(ctx.context_packet)) {
+  for (const item of items) console.log(`[${section}] ${item}`);
+}
 ```
 
 <br>
 
-## 📡 API Reference (`/v1`)
+## MCP server
 
-| Method | Endpoint | Role |
-|:---:|---|---|
-| `GET` | `/v1/health` | Service health status (Postgres + Redis) |
-| `POST` | `/v1/events` | Async event ingestion (idempotent, queued to Redis Streams) |
-| `POST` | `/v1/memories` | Direct write of pre-consolidated memory (returns the target `collection`) |
-| `POST` | `/v1/retrieve` | Semantic vector search + Full-Text Search (FTS) |
-| `POST` | `/v1/context/build` | Q-EM context packet assembly under token budget |
-| `GET` | `/v1/collections` | The agent's own taxonomy: system collections + the ones it declared |
-| `POST` | `/v1/collections` | Declare a new collection — the agent structures its own memory |
-| `POST` | `/v1/collections/merge` | Pour one collection into another and drop the source |
-| `DELETE` | `/v1/memories` | GDPR purge — requires `admin` scope **and** `?confirm=<tenant_id>` (optional `?agent_id=` filter) |
+Six tools, exposed to Claude Desktop, Cursor, Codex CLI, antigravity CLI, or any MCP client:
 
-### 🗃️ Collections — the agent structures its own memory
-
-A memory carries a **family** and a **collection**. The distinction is the whole design:
-
-- **Family** (`semantic`, `episodic`, `procedural`, `working`) — closed, owned by the
-  engine. It is not a filing category, it is **behaviour**: whether the memory is entangled
-  into the graph, how it decays, which section it falls back to.
-- **Collection** — free, owned by the agent. It declares its own shelves via
-  `POST /v1/collections`, and each one gets **its own section in the context packet**.
-
-```bash
-curl -X POST http://127.0.0.1:8000/v1/collections -H 'Content-Type: application/json' -d '{
-  "agent_id": "my_agent", "name": "clients_paca", "family": "semantic",
-  "description": "Clients and prospects in the PACA region.", "entangle": true }'
-```
-
-> [!IMPORTANT]
-> **`context_packet` no longer has a fixed number of keys.** The seven canonical sections
-> (`facts`, `preferences`, `episodes`, `rules`, `best_practices`, `errors`, `examples`) are
-> always present, and every collection the agent declared adds one more — **even when
-> empty**, so the shape of the response never depends on whether there were hits. Iterate
-> over the packet's entries instead of reading seven hardcoded keys.
-
-`entangle` is the setting that matters for recall quality. It used to be the instance-wide
-`QEM_ENTANGLE_TYPES`, so `episodic` wove **no graph edges at all, for anyone**. An agent can
-now mark one episodic collection as structuring (meeting notes, say) while raw interaction
-logs stay out — feeding the multi-hop path, which is where Q-EM actually separates from the
-baseline, without polluting the graph.
-
-Writing to an undeclared collection is accepted and routed to the family's fallback section
-— and the write response says so explicitly (`collection`, `canonical_subtype`), so an agent
-is never left believing in a filing that did not happen.
-
-#### Keeping a self-built taxonomy readable
-
-Give a model the right to create a category and it will create one per nuance:
-`clients_paca`, then `clients_region_paca`, then `prospects_paca`. None is wrong, and the
-result is a memory where nothing can be found. Four guardrails, none optional:
-
-| Guardrail | What it does |
+| Tool | Purpose |
 |---|---|
-| **Semantic duplicate check** | Descriptions are embedded and compared. Above `COLLECTION_DUP_THRESHOLD` (0.85), creation is refused **and names the near collection**. Unique names protect nothing here — the engine is turned against its own drift. |
-| **Cap** | `MAX_COLLECTIONS_PER_AGENT` (50), exposed in the listing so the agent anticipates it rather than hitting it. |
-| **Merge** | `POST /v1/collections/merge` — the garbage collector. Without it a taxonomy can only grow. Memories are relabelled, never destroyed; system collections and cross-family merges are refused. |
-| **Dormant collections** | Declared but still empty after `COLLECTION_STALE_DAYS` (14) → flagged `stale`. A flaw nobody sees is a flaw nobody fixes. |
+| `store_memory` | Write a memory — and report which section it landed in. |
+| `recall_memories` | Hybrid search, filterable by family and collection. |
+| `build_context` | Assemble a Q-EM packet under a token budget. |
+| `list_collections` | The agent's taxonomy, with volumes, quota and dormant shelves. |
+| `create_collection` | Declare a new shelf. |
+| `merge_collections` | Pour one collection into another. |
 
-There is deliberately **no cap on the number of packet sections**: rendering only prints
-sections that have content, so an agent with forty collections still produces a prompt with
-no empty rubrics — and capping would break the guarantee that a declared collection always
-appears in the packet's shape.
+```json
+{ "mcpServers": { "synaptiq": { "serverUrl": "http://127.0.0.1:8765/mcp/" } } }
+```
+
+No tool takes `agent_id`. Identity comes from `SYNAPTIQ_AGENT_ID` in the server environment,
+so no prompt can make the model act as another agent.
+
+📖 **[Full MCP guide](docs/mcp-server.md)** — transports (`stdio` vs `http` and their measured
+trade-off), Docker and host installs, client configuration, verification, troubleshooting.
 
 <br>
 
-## 🧰 Installing the MCP Server
+## Configuration
 
-The MCP server (`apps/mcp/server.py`) exposes three tools to any MCP client —
-`store_memory`, `recall_memories`, `build_context`. It is a **thin HTTP client over the
-SynaptiQ API**: it never touches PostgreSQL or Redis itself. That single fact dictates the
-install order, and most failed setups are a violation of it:
-
-```
-  docker compose (Postgres + Redis)  →  API on :8000  →  MCP server  →  MCP client
-```
-
-If the API is not reachable, every tool call returns an `[ERROR]` string — the server itself
-still starts and still lists its tools. Diagnose from the API outwards, never from the client
-inwards.
-
-### Configuration reference
-
-| Variable | Required | Default | Role |
-|---|:---:|---|---|
-| `SYNAPTIQ_AGENT_ID` | **yes** | *none* | Memory identity this server reads and writes under. |
-| `SYNAPTIQ_API_URL` | no | `http://127.0.0.1:8000` | Base URL of the SynaptiQ API. |
-| `SYNAPTIQ_API_KEY` | for `http` | *empty* | Bearer key forwarded to the API. Mandatory when the transport is not `stdio`. |
-| `MCP_TRANSPORT` | no | `stdio` | `stdio` or `http`. See below — this choice matters. |
-| `MCP_HOST` / `MCP_PORT` | no | `0.0.0.0` / `8765` | Listen address in `http` transport. |
-| `SYNAPTIQ_AUTOSTART_API` | no | `true` | Spawn `uvicorn` if the API does not answer. Set to `false` whenever a supervisor already owns the API. |
-
-> [!IMPORTANT]
-> **`SYNAPTIQ_AGENT_ID` has no default, on purpose.** It once defaulted to a fixed value, and
-> a deployment whose memories had been written under a different identity read an empty
-> partition and answered *"no memory found"* — no error, no warning. For a memory engine that
-> symptom is indistinguishable from a genuinely empty store, so it is undebuggable from the
-> outside.
->
-> The server nevertheless **starts** without it and fails at *tool-call* time with a full
-> explanation. That is also deliberate: an MCP server that exits on boot only shows the client
-> `exit status 1`, stderr is discarded, and the server vanishes from the list. Failing fast is
-> only worth it if somebody reads the failure.
->
-> Find the identity your existing memories were written under:
-> ```sql
-> SELECT agent_id, count(*) FROM memories GROUP BY 1 ORDER BY 2 DESC;
-> ```
-
-### Choosing a transport
-
-| | `stdio` | `http` |
-|---|---|---|
-| Process model | Client spawns a child process | Long-lived server, client just connects |
-| Client entry | `command` + `args` | `serverUrl` |
-| Needs `SYNAPTIQ_API_KEY` | no | **yes** |
-| Best for | Claude Desktop, Cursor | antigravity CLI, containers, several clients sharing one server |
-
-> [!WARNING]
-> **Known limitation of `stdio` with antigravity CLI.** After stdin closes, `mcp.run()` takes
-> 141–250 ms to unwind (measured; the time is spent in fastmcp's anyio loop, so an `os._exit()`
-> changes nothing). antigravity CLI grants roughly a 100 ms grace window before calling
-> `Kill()`; on Windows `TerminateProcess(handle, 1)` reads as `exit status 1`, and its manager
-> then abandons the reload of **every** MCP server it owns. Node servers fit under that window,
-> Python does not.
->
-> With that client, use the `http` transport. There is no child process to stop, so there is no
-> grace window to respect. The same change fixed the same symptom on the Obsidian MCP server.
-
-<br>
-
-### Reference install — Windows, self-hosted, antigravity CLI
-
-This is a real, running deployment: one instance directory, Docker for storage only, Python
-services in a local venv, LM Studio on the host for embeddings, and the MCP server exposed over
-HTTP on `127.0.0.1:8765`.
-
-<table>
-<tr><td><strong>Instance dir</strong></td><td><code>C:\Users\jimmy\synaptiq</code> (a <code>git clone</code>, updated with <code>git pull</code> — never edited locally)</td></tr>
-<tr><td><strong>Storage</strong></td><td>Docker: Postgres <code>127.0.0.1:5435</code>, Redis <code>127.0.0.1:6399</code></td></tr>
-<tr><td><strong>Embeddings</strong></td><td>LM Studio on the host, <code>http://localhost:1234/v1</code>, 384-dim multilingual model</td></tr>
-<tr><td><strong>API</strong></td><td><code>127.0.0.1:8000</code>, venv process</td></tr>
-<tr><td><strong>MCP</strong></td><td><code>127.0.0.1:8765</code>, <code>http</code> transport, venv process</td></tr>
-<tr><td><strong>Client</strong></td><td>antigravity CLI, <code>~/.gemini/antigravity-cli/mcp_config.json</code></td></tr>
-</table>
-
-**1 — Clone the instance and create the venv (Python 3.11)**
-
-```powershell
-git clone https://github.com/Jimmyjoe13/synaptiq.git C:\Users\jimmy\synaptiq
-cd C:\Users\jimmy\synaptiq
-py -3.11 -m venv .venv
-# fastmcp MUST be installed in the SAME command as requirements.txt. Installed separately,
-# the resolver bumps starlette past what fastapi==0.115.6 supports, and the API then dies
-# with: TypeError: Router.__init__() got an unexpected keyword argument 'on_startup'
-.\.venv\Scripts\pip install -r requirements.txt fastmcp
-```
-
-**2 — Write the instance `.env`**
+All settings are environment variables in the repository-root `.env`
+([`.env.example`](.env.example) is the annotated template).
 
 ```env
-DATABASE_URL=postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db
-REDIS_URL=redis://127.0.0.1:6399/0
-
-EMBEDDING_PROVIDER=lmstudio
+EMBEDDING_PROVIDER=lmstudio                 # lmstudio | openrouter | openai | mock
 EMBEDDING_BASE_URL=http://localhost:1234/v1
 EMBEDDING_MODEL=text-embedding-paraphrase-multilingual-minilm-l12-v2.gguf
-EMBEDDING_DIM=384
+EMBEDDING_DIM=384                           # must match the VECTOR(n) column
 
 SYNAPTIQ_TENANT=default
 SYNAPTIQ_AUTH_REQUIRED=true
-
-# --- MCP server ---
-SYNAPTIQ_API_URL=http://127.0.0.1:8000
-SYNAPTIQ_AGENT_ID=antigravity_orchestrator
-SYNAPTIQ_API_KEY=sk-synaptiq-...
-MCP_TRANSPORT=http
-MCP_HOST=127.0.0.1
-MCP_PORT=8765
 ```
+
+📖 **[Full configuration reference](docs/configuration.md)** — storage, embeddings, LLM
+extraction, retrieval, Q-EM thresholds, collections, ingestion, security, observability.
 
 > [!CAUTION]
-> **Keep this file pure ASCII on Windows.** `slowapi` re-reads it through
-> `starlette.config.Config`, which opens it *without* specifying an encoding — so cp1252. A
-> single non-representable UTF-8 byte (one emoji is enough: `0x8f`, from the U+FE0F variation
-> selector) crashes the API at boot on an opaque `UnicodeDecodeError`, far from its cause.
->
 > **Never change `EMBEDDING_MODEL` on a populated instance without re-embedding.** Two
-> different 384-dim models raise no error at all — the stored vectors simply stop being
-> comparable and recall degrades *in silence*. Verify with the cosine between a stored vector
-> and the one recomputed by the current model: it must be `1.000`.
-
-**3 — Create the API key for the MCP server**
-
-Give it exactly what an agent needs — `read` + `write`, scoped to that one agent, and **no
-`admin`**, so the GDPR purge stays out of the model's reach:
-
-```powershell
-.\.venv\Scripts\python scripts\create_api_key.py --name "mcp-antigravity" `
-    --scopes read write --agents antigravity_orchestrator
-```
-
-Copy the printed key into `SYNAPTIQ_API_KEY`. It is stored only as a SHA-256 hash and is never
-recoverable.
-
-**4 — Start storage, then the services**
-
-```powershell
-docker compose up -d postgres redis migrate
-.\scripts\start_services.ps1 -WaitForInfra 300
-```
-
-`start_services.ps1` is idempotent (a port already listening is left alone) and starts both the
-API and the MCP server in `http` transport. `-WaitForInfra 300` is what makes it safe at logon:
-Docker Desktop often needs one to two minutes to raise its containers, and an API started
-before them keeps a NULL pool and answers `503` to everything, forever — it never recovers on
-its own.
-
-To run it at every logon, register it as a scheduled task:
-
-```powershell
-$action  = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument '-NoProfile -WindowStyle Hidden -File "C:\Users\jimmy\synaptiq\scripts\start_services.ps1" -WaitForInfra 300'
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-Register-ScheduledTask -TaskName "SynaptiQ - services (instance)" -Action $action -Trigger $trigger
-```
-
-**5 — Declare the server in the client**
-
-`~/.gemini/antigravity-cli/mcp_config.json` — with the `http` transport the whole entry is one
-line, because there is no process for the client to manage:
-
-```json
-{
-  "mcpServers": {
-    "synaptiq": {
-      "serverUrl": "http://127.0.0.1:8765/mcp/"
-    }
-  }
-}
-```
-
-<details>
-<summary><strong>Same install with the <code>stdio</code> transport (Claude Desktop, Cursor)</strong></summary>
+> *different* models of the *same* dimension raise no error at all — the stored vectors just
+> stop being comparable and recall degrades in silence. The worker refuses to start on such a
+> mismatch (`EMBEDDING_COHERENCE_CHECK`).
 
 <br>
 
-Skip step 4's MCP process — the client spawns it. Set `MCP_TRANSPORT=stdio` and declare:
+## Security
 
-```json
-{
-  "mcpServers": {
-    "synaptiq": {
-      "command": "C:\\Users\\jimmy\\synaptiq\\.venv\\Scripts\\python.exe",
-      "args": ["C:\\Users\\jimmy\\synaptiq\\apps\\mcp\\server.py"],
-      "env": {
-        "SYNAPTIQ_API_URL": "http://127.0.0.1:8000",
-        "SYNAPTIQ_API_KEY": "sk-synaptiq-...",
-        "SYNAPTIQ_AGENT_ID": "antigravity_orchestrator",
-        "MCP_TRANSPORT": "stdio",
-        "SYNAPTIQ_AUTOSTART_API": "false"
-      }
-    }
-  }
-}
-```
-
-Two rules here:
-
-- Use the **absolute path to the venv's `python.exe`** and the **absolute path to
-  `server.py`** — not `-m apps.mcp.server` with a `cwd`. The script fixes up `sys.path`
-  itself and runs from any working directory; clients that ignore `cwd` would otherwise fail
-  with `ModuleNotFoundError`, which surfaces only as an opaque `exit status 1`.
-- Set `SYNAPTIQ_AUTOSTART_API=false` when a supervisor already owns the API, otherwise the
-  MCP server will spawn a second `uvicorn` that loses the race on port 8000.
-
-</details>
-
-<br>
-
-### Verifying the install
-
-Run all three — each one clears a different failure mode, and the first two can pass while the
-memory is still silently empty.
-
-```powershell
-# 1. Both services listening
-.\scripts\start_services.ps1 -Status
-
-# 2. The API is actually healthy (not just bound to the port)
-curl http://127.0.0.1:8000/v1/health      # -> {"status":"ok","services":{...}}
-
-# 3. THE ONE THAT MATTERS: the configured identity owns the memories
-docker exec synaptiq-postgres psql -U synaptiq -d synaptiq_db `
-  -c "SELECT agent_id, count(*) FROM memories GROUP BY 1 ORDER BY 2 DESC;"
-```
-
-Check that `SYNAPTIQ_AGENT_ID` appears in that list with a non-zero count. A mismatch is the
-one failure the tools cannot report: `recall_memories` answers *"no matching memory found"*,
-which reads exactly like a fresh install.
-
-Then, from the client, ask the agent to call `recall_memories` on a subject you know is stored.
-
-### Troubleshooting
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| Client shows `exit status 1`, all MCP servers stop reloading | `stdio` shutdown exceeds the client's grace window | Switch to `MCP_TRANSPORT=http` and declare `serverUrl` |
-| `[ERROR] ... SYNAPTIQ_AGENT_ID n'est pas defini` | No identity configured | Set `SYNAPTIQ_AGENT_ID` in the server env |
-| *"No matching memory found"*, no error | Identity mismatch, **or** `EMBEDDING_MODEL` differs from the one that wrote the vectors | Check #3 above; verify the cosine of a stored vector against a recomputed one is `1.000` |
-| `[ERROR] ... Connection refused` | API down, or `SYNAPTIQ_API_URL` wrong | `curl /v1/health`; check `api_error.log` in the instance root |
-| `401 Clé API requise` on every tool | `SYNAPTIQ_AUTH_REQUIRED=true` and no `SYNAPTIQ_API_KEY` in the MCP env | Create a key (step 3) and set it |
-| `403 Permission 'write' absente` | Key issued read-only | Re-issue with `--scopes read write` |
-| API dies at boot on `UnicodeDecodeError` | Non-ASCII byte in `.env` on Windows | Rewrite `.env` in pure ASCII |
-| `TypeError: Router.__init__() ... 'on_startup'` | `fastmcp` installed separately, starlette bumped | Reinstall: `pip install -r requirements.txt fastmcp` in one command |
-| Tools work, `/events` never becomes a memory | The `relay` and `worker` services are not running | `docker compose up -d relay worker` — `/events` returns `201` and queues in the outbox even when nothing consumes it |
-
-The MCP server logs to **stderr** (`mcp_error.log` when started by `start_services.ps1`), never
-to stdout — in `stdio` transport stdout carries the JSON-RPC frames and a single log line would
-corrupt the session.
-
-<br>
-
-## 🧬 Embedding Providers
-
-Configurable via `EMBEDDING_PROVIDER` (`lmstudio` by default, `openrouter`, `openai`, `mock`).
-
-```env
-# Local LM Studio (default)
-EMBEDDING_PROVIDER=lmstudio
-EMBEDDING_BASE_URL=http://localhost:1234/v1
-EMBEDDING_MODEL=text-embedding-paraphrase-multilingual-minilm-l12-v2.gguf
-EMBEDDING_DIM=384
-
-# OpenRouter (Cloud)
-EMBEDDING_PROVIDER=openrouter
-EMBEDDING_API_KEY=sk-or-v1-your_openrouter_key
-EMBEDDING_MODEL=openai/text-embedding-3-small
-EMBEDDING_DIM=1536
-```
-
-<br>
-
-## 🔐 Security
-
-SynaptiQ is **self-hosted: 1 deployment = 1 security boundary**. Tenant scoping is server-side (`SYNAPTIQ_TENANT`) and **never** trusted from client payloads. Agent separation within a tenant is isolated via `agent_id`.
+Tenant scoping is server-side (`SYNAPTIQ_TENANT`) and **never** read from a client payload.
+Agents within a tenant are isolated by `agent_id` — including their taxonomy.
 
 ```bash
-# Generate a new Bearer API Key (default permissions: read + write)
-python scripts/create_api_key.py --name "agent-prod"
-
-# Read-only key
-python scripts/create_api_key.py --name "dashboard" --scopes read
-
-# Key restricted to a single agent's memory
-python scripts/create_api_key.py --name "agent-A" --agents agentA
-
-# Key allowed to run the GDPR purge (must be requested explicitly)
-python scripts/create_api_key.py --name "ops" --scopes read write admin
-
-# Include in HTTP requests: Authorization: Bearer <key>
+python scripts/create_api_key.py --name "agent-prod"                       # read + write
+python scripts/create_api_key.py --name "dashboard" --scopes read          # read-only
+python scripts/create_api_key.py --name "agent-A" --agents agentA          # one agent only
+python scripts/create_api_key.py --name "ops" --scopes read write admin    # may purge
 ```
 
-`SYNAPTIQ_AUTH_REQUIRED=true` (default) ensures secure endpoints out of the box.
-
-**Key scopes.** Every key carries permissions (`read`, `write`, `admin`) and an optional
-agent whitelist. Two consequences worth knowing:
+Keys are stored as SHA-256 hashes and shown once. Send them as `Authorization: Bearer <key>`.
 
 - **`agent_id` is enforced, not advisory.** A key created with `--agents agentA` gets `403`
-  if it tries to read or write as `agentB`. Without `--agents`, the key reaches every agent
-  of its tenant (historical behaviour, and the normal case for a single-agent instance).
-- **The GDPR purge needs `admin` plus `?confirm=<tenant_id>`.** Keys issued before this
-  change keep read and write, and lose the ability to wipe the instance.
+  when acting as `agentB`. Without `--agents`, it reaches every agent of its tenant.
+- **The GDPR purge needs `admin` *and* `?confirm=<tenant_id>`**, and writes an `audit_log` row
+  in the same transaction. No purge without a trace, no trace without a purge.
+- **`SYNAPTIQ_AUTH_REQUIRED=false` does not open the purge.** It is a convenience for a
+  trusted localhost instance; `admin` still requires a key. A convenience flag must never
+  unlock an irreversible endpoint.
+- **`SYNAPTIQ_AGENT_ID` has no default.** It once had one, and an instance whose memories were
+  written under another identity answered *"no memory found"* — with no error. For a memory
+  engine, that symptom is indistinguishable from an empty store.
 
-The MCP server's agent identity comes from `SYNAPTIQ_AGENT_ID` in its environment — it is no
-longer a tool parameter, so no prompt can make the model act as another agent.
-
-**`SYNAPTIQ_AGENT_ID` is required and has no default.** Without it every tool call fails with
-an actionable message. This is deliberate: it used to default to a fixed value, and a
-deployment whose memories had been written under a different identity would read an empty
-partition and answer *"no memory found"* — with no error. For a memory engine that symptom is
-indistinguishable from a genuinely empty store, so it is undebuggable from the outside. See
-[Installing the MCP Server](#-installing-the-mcp-server) for why the server still *boots*
-without it rather than exiting. Find the identity of existing memories with:
-
-```sql
-SELECT agent_id, count(*) FROM memories GROUP BY 1;
-```
+Vulnerability reports: [`SECURITY.md`](SECURITY.md).
 
 <br>
 
-## 🧪 Testing & CI
+## Observability
+
+- **`/metrics`** (Prometheus): event counters, context-build latency histogram, auth cache
+  hit ratio, degraded extractions — plus three gauges that predict incidents rather than
+  merely count them: `synaptiq_outbox_pending`, `synaptiq_outbox_oldest_age_seconds`,
+  `synaptiq_dlq_depth`.
+- **`/v1/health`** reports `ingestion` alongside Postgres and Redis. A dead relay makes
+  `/events` a silent black hole — accepted, persisted, never consolidated — so the check lives
+  where people actually look.
+- **Structured logs** (`LOG_FORMAT=json`) with a `trace_id` propagated through a contextvar
+  across the API and the core, and returned to the client. Every error path carries
+  `exc_info`.
+
+<br>
+
+## Benchmarks
+
+### LOCOMO — Q-EM vs. a vector baseline
+
+One conversation: 419 dialogue turns, 152 evaluated questions, fixed 1500-token budget,
+identical answering model on both arms.
+
+| Category | Vector baseline (top-k) | SynaptiQ (Q-EM) | Difference |
+|:---|:---:|:---:|:---:|
+| **Overall accuracy** | 48.03 % | 51.32 % | +3.29 pts · 95% CI **[−7.9, +14.5]** |
+| Multi-hop (graph) | 18.75 % | 25.00 % | +6.25 pts |
+| Temporal reasoning | 78.38 % | 83.78 % | +5.40 pts |
+| Single-hop | 47.14 % | 52.86 % | +5.72 pts |
+
+> [!WARNING]
+> **Read this before quoting those numbers. None of these differences is statistically
+> significant.** On 152 questions, the 95% confidence interval on the overall gain spans
+> −7.9 to +14.5 points — it contains zero, so this run **cannot** establish that Q-EM beats
+> the baseline. Per-category intervals are wider still (multi-hop rests on 16 questions).
+>
+> We publish it anyway, with its uncertainty, because that is what the measurement says. The
+> direction is consistent with what the algorithm does — the largest gains land on multi-hop
+> and temporal questions, exactly what the entanglement graph and `occurred_at` are for — but
+> *consistent* is not *demonstrated*.
+>
+> A ±2 point margin needs ~2,400 questions, i.e. the full 10-conversation LOCOMO set. That run
+> is the next milestone; until it lands, treat this table as a smoke test, not as proof.
+>
+> Intervals are Wilson intervals computed by `synaptiq_core.stats` and emitted by the harness
+> itself, so a result can no longer be published without its uncertainty.
+
+Run details: 1,420 entanglement edges built by the worker, **0.0 % degraded extractions**
+(every memory came from structured LLM extraction, none from the regex fallback — a run with
+degraded extractions measures a handicapped Q-EM). Fixed seed, dedicated tenant. Reproduce
+with `make bench` (`.\scripts\dev.ps1 bench` on Windows).
+
+### Knowledge evolution vs. static Markdown search
+
+Two scenarios where stored knowledge is later contradicted:
+
+| Scenario | Obsidian MCP (Markdown) | SynaptiQ (Q-EM) |
+|:---|:---:|:---:|
+| DB migration contradiction | ❌ keeps both MySQL and Postgres | ✅ supersedes MySQL (`supersedes_by`) |
+| Style rule update | ❌ returns contradictory advice | ✅ filters the obsolete rule out |
+
+Two scenarios is a demonstration of the mechanism, not a measurement — the sample is far too
+small to generalise.
+
+<br>
+
+## Development
 
 ```bash
-# Unit tests (no external services needed)
+# Unit tests — no infrastructure required
 pytest tests/unit
 
-# Full test suite (requires Postgres + Redis running)
-docker compose up -d postgres redis
-pytest tests/
+# Full suite — needs Postgres + Redis
+docker compose up -d postgres redis migrate
+EMBEDDING_PROVIDER=mock \
+DATABASE_URL=postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db \
+REDIS_URL=redis://127.0.0.1:6399/0 \
+pytest tests
+
+# Lint, types, coverage
+ruff check apps packages scripts tests benchmarks migrations examples
+mypy
+pytest tests/unit --cov=synaptiq_core --cov-fail-under=90
 ```
 
-CI workflows (`.github/workflows/ci.yml`) run `ruff` linting and test execution on every commit.
+`make <target>` or `.\scripts\dev.ps1 <target>` (same names): `lint`, `types`, `test`,
+`coverage`, `bench`, `bench-explain`.
+
+**377 tests** (307 unit, 70 integration), core coverage **96 %**, mypy clean, ruff with
+`E,W,F,I,B,UP,S,C4,RUF`. Anything outside `tests/unit/` is auto-marked `integration` and
+requires Postgres + Redis.
+
+The schema is owned **solely** by Alembic (`migrations/`). `infra/postgres/init.sql` only
+creates the pgvector extension — never add DDL there.
+
+Contributions welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+<br>
+
+## Roadmap
+
+- Full 10-conversation LOCOMO run (~1,990 questions) to settle the significance question.
+- Compose profiles `minimal` / `local-ai` (Ollama).
+- Typed SDK errors and pagination; OpenTelemetry traces.
+- Retention and export policies; LangGraph example.
 
 <br>
 
@@ -710,6 +537,6 @@ CI workflows (`.github/workflows/ci.yml`) run `ruff` linting and test execution 
 
 **MIT License** — see [`LICENSE`](LICENSE).
 
-<sub>Built for AI agents that cannot afford to forget. 🧠</sub>
+<sub>Built for agents that cannot afford to forget. 🧠</sub>
 
 </div>
