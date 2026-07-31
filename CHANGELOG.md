@@ -46,6 +46,24 @@ surcharge (le cas de la regression), surcharge explicite vers un fournisseur dis
 > aucun conteneur ne l'atteindra meme avec la bonne URL. Dans LM Studio, activer « Serve on
 > Local Network ».
 
+### MCP : une panne ne doit plus ressembler a un souvenir
+
+Remonte de l'instance de production, ou le correctif avait ete ecrit en local.
+
+Les outils MCP renvoyaient `"[ERROR] ..."` pour **tout** echec. Cote client, cette chaine est
+un resultat valide : le 30/07, un `Read timed out` s'est affiche dans la conversation de
+l'agent comme s'il s'agissait du contenu de la memoire. Une panne sort desormais en
+`ToolError` (`isError: true`) sur les six outils.
+
+L'exception est deliberee : une **identite manquante** (`SYNAPTIQ_AGENT_ID` absent) reste un
+message texte, parce que c'est un defaut de configuration dont le message porte la marche a
+suivre — et non une panne.
+
+Cause de ce timeout : `_poster`/`_lire` plafonnaient a **5 s en dur**, alors que le premier
+appel d'une session paie le chargement du modele d'embedding (mesure a plus de 5 s a froid,
+~2,6 s ensuite). Le premier `recall_memories` de chaque session echouait donc — precisement
+celui qui construit le contexte initial de l'agent. Nouveau defaut : `SYNAPTIQ_TIMEOUT_S=30`.
+
 ## 0.3.0 — 2026-07-31 — l'agent structure sa propre memoire
 
 Jusqu'ici une « collection » n'existait nulle part : c'etait le resultat d'une cascade de

@@ -7,6 +7,7 @@ import time
 import requests
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 
 # Rendre packages/core importable (meme hack sys.path que l'API et le worker).
 _racine = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -172,9 +173,17 @@ def ensure_api_running(timeout_s: float | None = None) -> bool:
 # arriver pendant que l'API finit de demarrer.
 RETRY_DELAI_S = float(os.getenv("SYNAPTIQ_RETRY_DELAI_S", "2.0"))
 
+# Le premier appel d'une session paie le chargement du modele d'embedding (LM Studio, en
+# local) : mesure a plus de 5 s a froid, ~2,6 s une fois chaud. L'ancien defaut de 5 s en dur
+# faisait donc echouer le premier `recall_memories` de chaque session -- precisement celui qui
+# construit le contexte initial de l'agent, quand la memoire lui est la plus utile.
+TIMEOUT_S = float(os.getenv("SYNAPTIQ_TIMEOUT_S", "30"))
 
-def _poster(url: str, payload: dict, timeout: int = 5):
+
+def _poster(url: str, payload: dict, timeout: float | None = None):
     """POST vers l'API, avec UNE nouvelle tentative si la connexion est refusee."""
+    if timeout is None:
+        timeout = TIMEOUT_S
     try:
         return requests.post(url, json=payload, headers=HEADERS, timeout=timeout)
     except requests.ConnectionError:
@@ -183,14 +192,35 @@ def _poster(url: str, payload: dict, timeout: int = 5):
         return requests.post(url, json=payload, headers=HEADERS, timeout=timeout)
 
 
-def _lire(url: str, params: dict, timeout: int = 5):
+def _lire(url: str, params: dict, timeout: float | None = None):
     """GET vers l'API, avec UNE nouvelle tentative si la connexion est refusee."""
+    if timeout is None:
+        timeout = TIMEOUT_S
     try:
         return requests.get(url, params=params, headers=HEADERS, timeout=timeout)
     except requests.ConnectionError:
         logger.info("API pas encore joignable, nouvelle tentative dans %.1f s.", RETRY_DELAI_S)
         time.sleep(RETRY_DELAI_S)
         return requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+
+
+def _echec(operation: str, err: Exception) -> str:
+    """Traduit une exception d'outil en reponse MCP, selon qu'elle est corrigeable ou non.
+
+    Une identite manquante (`RuntimeError` de `require_agent_id`) reste un message texte :
+    c'est un defaut de CONFIGURATION, dont le message porte la marche a suivre, et le
+    commentaire de `require_agent_id` explique pourquoi il ne doit pas traverser le protocole.
+
+    Tout le reste -- timeout, API injoignable, 5xx -- est une PANNE, et doit sortir en
+    `isError: true`. Rendu en texte, un echec est indiscernable d'un resultat : le timeout du
+    30/07 est ainsi remonte jusqu'a l'agent, qui a affiche « [ERROR] Read timed out » comme
+    s'il s'agissait d'un souvenir. Une memoire qui echoue en silence est pire qu'une memoire
+    absente.
+    """
+    if isinstance(err, RuntimeError):
+        return f"[ERROR] {operation} : {err}"
+    logger.error("%s : %s", operation, err, exc_info=True)
+    raise ToolError(f"{operation} : {err}") from err
 
 
 @mcp.tool()
@@ -241,7 +271,7 @@ def store_memory(content: str, memory_type: str, subtype: str | None = None) -> 
                         f"family='{memory_type}', description=...).")
         return message
     except Exception as e:
-        return f"[ERROR] Echec de l'enregistrement de la memoire : {e}"
+        return _echec("Echec de l'enregistrement de la memoire", e)
 
 
 @mcp.tool()
@@ -293,7 +323,7 @@ def list_collections() -> str:
                 f"Les reutiliser, ou les verser dans un autre rayon via merge_collections.")
         return "\n".join(lignes)
     except Exception as e:
-        return f"[ERROR] Echec de la lecture des collections : {e}"
+        return _echec("Echec de la lecture des collections", e)
 
 
 @mcp.tool()
@@ -327,7 +357,7 @@ def merge_collections(source: str, target: str) -> str:
         return (f"[SUCCESS] '{data.get('source')}' versee dans '{data.get('target')}' : "
                 f"{data.get('moved_memories')} souvenir(s) deplace(s).")
     except Exception as e:
-        return f"[ERROR] Echec de la fusion : {e}"
+        return _echec("Echec de la fusion", e)
 
 
 @mcp.tool()
@@ -378,7 +408,7 @@ def create_collection(name: str, family: str, description: str,
                 f"Pour y ecrire : store_memory(content=..., "
                 f"memory_type='{usage.get('type')}', subtype='{usage.get('subtype')}').")
     except Exception as e:
-        return f"[ERROR] Echec de la creation de la collection : {e}"
+        return _echec("Echec de la creation de la collection", e)
 
 @mcp.tool()
 def recall_memories(query: str, limit: int = 5, memory_type: str | None = None,
@@ -416,7 +446,7 @@ def recall_memories(query: str, limit: int = 5, memory_type: str | None = None,
             output.append(f"- [{mem['type'].upper()} / {mem['subtype'] or 'general'}] {mem['content']} (Confidence: {mem['confidence']})")
         return "\n".join(output)
     except Exception as e:
-        return f"[ERROR] Echec de la recherche de souvenirs : {e}"
+        return _echec("Echec de la recherche de souvenirs", e)
 
 
 # Libelles lisibles des sept sections livrees avec le moteur. Les sections creees par
@@ -457,7 +487,7 @@ def build_context(task: str, query: str, max_tokens: int = 1200,
             "query": query,
             "constraints": contraintes,
         }
-        response = _poster(url, payload, timeout=10)
+        response = _poster(url, payload)
         response.raise_for_status()
         data = response.json()
         packet = data.get("context_packet", {})
@@ -476,7 +506,7 @@ def build_context(task: str, query: str, max_tokens: int = 1200,
                 lines.append(f"- [{libelle}] {item}")
         return "\n".join(lines) if len(lines) > 1 else "Aucun contexte pertinent trouve."
     except Exception as e:
-        return f"[ERROR] Echec de la construction du contexte : {e}"
+        return _echec("Echec de la construction du contexte", e)
 
 
 if __name__ == "__main__":

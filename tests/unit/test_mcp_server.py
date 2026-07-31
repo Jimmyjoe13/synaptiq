@@ -17,6 +17,8 @@ sys.path.insert(0, str(ROOT))
 
 pytest.importorskip("fastmcp", reason="serveur MCP non installé (requirements-dev)")
 
+from fastmcp.exceptions import ToolError
+
 import apps.mcp.server as mcp_server
 
 
@@ -250,9 +252,9 @@ def test_le_retry_ne_masque_pas_une_panne_durable(monkeypatch):
     monkeypatch.setattr(mcp_server.time, "sleep", lambda s: None)
     monkeypatch.setattr(mcp_server, "SYNAPTIQ_AGENT_ID", "agent_de_test")
 
-    resultat = mcp_server.recall_memories.fn(query="q")
+    with pytest.raises(ToolError):
+        mcp_server.recall_memories.fn(query="q")
     assert len(tentatives) == 2
-    assert resultat.startswith("[ERROR]")
 
 
 # ─── Contrats d'appel ────────────────────────────────────────────────────────
@@ -301,14 +303,22 @@ def test_build_context_aplati_les_7_collections(appels):
     assert "[ERREURS] une erreur" in resultat
 
 
-def test_erreur_reseau_rendue_lisible_pour_l_agent(monkeypatch):
-    """Un outil MCP ne doit pas lever : l'agent doit recevoir un message exploitable."""
+def test_une_panne_sort_en_erreur_de_protocole(monkeypatch):
+    """RÉGRESSION : une panne rendue en TEXTE est indiscernable d'un souvenir.
+
+    Ces outils renvoyaient `"[ERROR] ..."` pour tout échec, y compris un timeout ou une API
+    morte. Côté client MCP, cette chaîne est un résultat valide : le 30/07, un `Read timed
+    out` s'est ainsi affiché dans la conversation comme s'il s'agissait du contenu de la
+    mémoire. Une panne doit sortir en `isError: true` — d'où `ToolError`.
+
+    Le défaut de CONFIGURATION reste du texte, lui : cf.
+    `test_les_outils_refusent_de_travailler_sans_identite`.
+    """
     monkeypatch.setattr(mcp_server, "SYNAPTIQ_AGENT_ID", "agent_de_test")
 
     def _post_casse(*a, **kw):
         raise ConnectionError("API injoignable")
 
     monkeypatch.setattr(mcp_server.requests, "post", _post_casse)
-    resultat = mcp_server.store_memory.fn(content="x", memory_type="semantic")
-    assert resultat.startswith("[ERROR]")
-    assert "injoignable" in resultat
+    with pytest.raises(ToolError, match="injoignable"):
+        mcp_server.store_memory.fn(content="x", memory_type="semantic")

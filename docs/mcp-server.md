@@ -43,6 +43,7 @@ parameter — otherwise the model itself would choose whose memory it reads and 
 | `MCP_HOST` / `MCP_PORT` | no | `0.0.0.0` / `8765` | Listen address in `http` transport. |
 | `SYNAPTIQ_AUTOSTART_API` | no | `true` | Spawn `uvicorn` if the API does not answer. Set `false` whenever a supervisor already owns the API. |
 | `SYNAPTIQ_AUTOSTART_WAIT_S` | no | `0` | Seconds to wait for the spawned API. `0` = don't block the MCP handshake. |
+| `SYNAPTIQ_TIMEOUT_S` | no | `30` | Timeout of API calls. The first call of a session pays for loading the embedding model — measured above 5 s cold. |
 
 > [!IMPORTANT]
 > **`SYNAPTIQ_AGENT_ID` has no default, on purpose.**
@@ -288,8 +289,8 @@ Then, from the client, ask the agent to recall something you know is stored.
 | Client shows `exit status 1`, all MCP servers stop reloading | `stdio` shutdown exceeds the client's grace window (§3) | Switch to `MCP_TRANSPORT=http`, declare `serverUrl` |
 | `[ERROR] ... SYNAPTIQ_AGENT_ID n'est pas defini` | No identity configured | Set `SYNAPTIQ_AGENT_ID` in the server env |
 | *"No matching memory found"*, no error | Identity mismatch, **or** `EMBEDDING_MODEL` differs from the one that wrote the vectors | Check §7 step 3; the cosine of a stored vector vs. a recomputed one must be `1.000` |
-| `[ERROR] ... Connection refused` | API down, or wrong `SYNAPTIQ_API_URL` | `curl /v1/health`; read `api_error.log` |
-| `[ERROR] ... Read timed out` on the first call | Cold model load in LM Studio exceeds the tool timeout | Warm the model, or raise the MCP tool timeouts |
+| Tool call fails with `Connection refused` | API down, or wrong `SYNAPTIQ_API_URL` | `curl /v1/health`; read `api_error.log` |
+| Tool call fails with `Read timed out` on the first call | Cold model load exceeds `SYNAPTIQ_TIMEOUT_S` | Warm the model, or raise `SYNAPTIQ_TIMEOUT_S` |
 | `401 Clé API requise` on every tool | `SYNAPTIQ_AUTH_REQUIRED=true` and no `SYNAPTIQ_API_KEY` in the MCP env | Issue a key (§5 step 3) and set it |
 | `403 Permission 'write' absente` | Key issued read-only | Re-issue with `--scopes read write` |
 | `[INFO] '<x>' n'est pas une collection declaree` | Writing to an undeclared shelf; the memory landed in the family's fallback section | `create_collection(...)`, or reuse an existing one |
@@ -299,3 +300,16 @@ Then, from the client, ask the agent to recall something you know is stored.
 
 The MCP server logs to **stderr**, never stdout — in `stdio` transport stdout carries the
 JSON-RPC frames, and a single log line there corrupts the session.
+
+> [!IMPORTANT]
+> **A breakdown and a misconfiguration do not exit through the same door.**
+>
+> A **breakdown** — timeout, API unreachable, 5xx — raises a `ToolError`, so the client sees
+> `isError: true`. These tools used to return `"[ERROR] ..."` as ordinary text for every
+> failure, and to a client that string is a perfectly valid *result*: a `Read timed out` once
+> surfaced in an agent's conversation as though it were the content of the memory. For a
+> memory engine that confusion is the worst possible one — a silent failure is
+> indistinguishable from an empty memory.
+>
+> A **misconfiguration** — `SYNAPTIQ_AGENT_ID` missing — stays plain text on purpose. Nothing
+> is broken; the message carries the fix, and the agent can relay it verbatim.
