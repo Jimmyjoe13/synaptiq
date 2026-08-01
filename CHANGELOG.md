@@ -82,6 +82,47 @@ appel d'une session paie le chargement du modele d'embedding (mesure a plus de 5
 ~2,6 s ensuite). Le premier `recall_memories` de chaque session echouait donc — precisement
 celui qui construit le contexte initial de l'agent. Nouveau defaut : `SYNAPTIQ_TIMEOUT_S=30`.
 
+### L'ecriture directe ne construisait aucun graphe d'intrication
+
+Meme motif que le doublon ci-dessous, meme journee, autre fonction : `_entangle` etait DEFINIE
+dans `apps/worker/worker.py` et appelee de nulle part ailleurs. L'API lisait `relationships`
+pour la phase d'intrication mais n'y ecrivait jamais une ligne. Consequence : **tout agent
+ecrivant par `store_memory` (donc `POST /v1/memories`) n'avait aucun voisin**, la phase 2 de
+Q-EM — la propagation d'activation — tournait sur un graphe vide, et le rappel retombait
+silencieusement sur recherche hybride + interference. Mesure sur une instance reelle : l'agent
+`antigravity_orchestrator` comptait **28 souvenirs et 0 arete** apres des semaines d'usage.
+
+Troisieme occurrence du meme motif dans ce depot, apres la taxonomie et `content_hash` : une
+regle implementee dans un seul des deux chemins d'ecriture.
+
+**Lot 1 — les deux chemins tissent.** `_entangle` remonte dans
+`synaptiq_core.entanglement.entangle()` et `POST /v1/memories` l'appelle dans la MEME
+transaction que l'insertion. Le flag `entangle` de la collection decide (`registry.entangle_pour`,
+desormais cable aux DEUX chemins) : `scratch` et `interaction`, livrees a `False`, ne tissent
+donc rien. Le seuil quitte les constantes du worker pour `seuil_intrication()`, lu a chaque
+appel comme le veut la convention du depot — le figer a l'import en faisait un reglage que seul
+le worker voyait.
+
+**Lot 2 — `scripts/rebuild_entanglement.py`.** Necessaire et pas seulement pratique :
+l'intrication est un effet d'ECRITURE, donc rien ne remplit retroactivement le graphe d'une
+instance anterieure, et **un changement de seuil ne s'applique qu'aux ecritures suivantes**.
+`--dry-run` affiche l'histogramme des similarites des plus proches voisins avec le seuil
+courant marque, seule facon honnete d'en choisir un. Idempotent, honore le flag `entangle`, et
+n'emet **que** des aretes `entangled_with` : rejouer en masse la regle `supersedes_by` du
+chemin d'ecriture ferait annuler par la phase d'interference des souvenirs encore valides.
+`--purge` existe pour resserrer un graphe, en sachant qu'il detruit aussi les aretes posees
+legitimement a l'ecriture.
+
+**Lot 3 — un graphe vide devient visible.** Nouvelles jauges
+`synaptiq_graph_edges{agent_id}` et `synaptiq_graph_edges_per_memory{agent_id}`. C'est
+l'absence de cette metrique qui a laisse le probleme durer des semaines sans aucun signe.
+
+Le defaut `QEM_ENTANGLE_THRESHOLD=0.7` est **volontairement inchange** : il est calibre sur des
+corpus anglophones et ne se transpose pas (8 aretes a 0.70 contre 52 a 0.62 sur 55 souvenirs
+francais en MiniLM multilingue), mais l'abaisser dans la configuration livree modifierait le
+rappel de tous les deploiements existants en silence — precisement la classe de probleme que ce
+lot corrige. Il est documente, outille et mesurable a la place.
+
 ### `POST /v1/memories` etait dupliquable en silence
 
 Signale par un utilisateur, reproduit puis corrige le 01/08. Le chemin d'ecriture directe

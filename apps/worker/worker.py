@@ -21,10 +21,10 @@ for _p in (_root, os.path.join(_root, "packages", "core")):
 
 from synaptiq_core import (
     content_hash,
+    entangle,
     get_embedder,
     handle_contradictions,
     link_supersedes,
-    to_pgvector,
 )
 
 # Registre des collections : l'intrication est décidée par collection, plus par instance
@@ -72,8 +72,10 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
 LLM_RETRY_BACKOFF_S = float(os.getenv("LLM_RETRY_BACKOFF_S", "2.0"))
 
-# Seuil de similarité cosinus au-delà duquel deux mémoires sont automatiquement intriquées.
-QEM_ENTANGLE_THRESHOLD = float(os.getenv("QEM_ENTANGLE_THRESHOLD", "0.7"))
+# Le seuil d'intrication n'est plus une constante de ce module : il vit dans
+# `synaptiq_core.entanglement.seuil_intrication()`, lu à chaque appel (convention du dépôt) et
+# partagé avec l'API, qui intrique désormais aussi. Le figer à l'import ici en faisait un
+# réglage que seul le worker voyait.
 
 # Types de mémoire éligibles à l'intrication automatique (liste séparée par des virgules).
 # Défaut 'procedural,semantic' : les souvenirs DURABLES (règles, erreurs, bonnes pratiques,
@@ -447,42 +449,14 @@ _INSERT_MEMORY = """
 
 
 def _entangle(cur, tenant_id: str, agent_id: str, new_mem_id, fact: dict, embedding) -> None:
-    """Relie un souvenir à ses plus proches voisins sémantiques (graphe Q-EM)."""
-    embedding_str = to_pgvector(embedding)
-    # `ORDER BY embedding <=> %s` et non `ORDER BY similarity DESC` : pgvector n'utilise
-    # l'index HNSW que sur l'opérateur de distance. Trier sur l'alias forçait un scan
-    # complet des mémoires de l'agent À CHAQUE fait extrait — le coût de l'intrication
-    # croissait donc linéairement avec la taille de la mémoire.
-    cur.execute("""
-        SELECT id, type, subtype, (1 - (embedding <=> %s::vector)) AS similarity
-        FROM memories
-        WHERE tenant_id = %s AND agent_id = %s AND id != %s AND status = 'active'
-        ORDER BY embedding <=> %s::vector
-        LIMIT 3;
-    """, (embedding_str, tenant_id, agent_id, new_mem_id, embedding_str))
+    """Relie un souvenir à ses plus proches voisins sémantiques (graphe Q-EM).
 
-    for rel_row in cur.fetchall():
-        similarity = float(rel_row[3] or 0.0)
-        if similarity <= QEM_ENTANGLE_THRESHOLD:
-            continue
-        target_id, target_subtype = rel_row[0], rel_row[2]
-        relation_type = "entangled_with"
-        inverse = False
-        # Une bonne pratique résout/remplace l'erreur associée (et réciproquement).
-        if fact['subtype'] == 'coding_best_practices' and target_subtype == 'code_error_resolution':
-            relation_type = "supersedes_by"
-        elif fact['subtype'] == 'code_error_resolution' and target_subtype == 'coding_best_practices':
-            relation_type, inverse = "supersedes_by", True
-
-        insert_rel = """
-            INSERT INTO relationships (source_memory_id, target_memory_id, relation_type, weight)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (source_memory_id, target_memory_id) DO NOTHING;
-        """
-        pair = (target_id, new_mem_id) if inverse else (new_mem_id, target_id)
-        cur.execute(insert_rel, (*pair, relation_type, similarity))
-        logger.info("Intrication Q-EM : %s --(%s)--> %s (sim=%.2f)",
-                    pair[0], relation_type, pair[1], similarity)
+    Le corps vit dans `synaptiq_core.entanglement` : il était DÉFINI ici, donc seul le chemin
+    `/v1/events` tissait des arêtes et une écriture directe n'en construisait aucune. Cette
+    enveloppe ne fait qu'adapter la signature historique (`fact` complet) à celle du cœur,
+    qui ne prend que le `subtype` dont la règle a besoin.
+    """
+    entangle(cur, tenant_id, agent_id, new_mem_id, fact.get('subtype'), embedding)
 
 
 def process_event(event: dict) -> bool:

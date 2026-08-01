@@ -210,10 +210,10 @@ class CollectionRegistry:
     def entangle_pour(self, family: str, name: str | None) -> bool:
         """L'intrication est-elle souhaitée pour ce couple ?
 
-        Non câblé au worker dans ce lot : la décision reste portée par
-        `QEM_ENTANGLE_TYPES` jusqu'au lot 2. La propriété est déjà lisible ici pour que la
-        migration et le registre soient complets, et pour que le basculement du worker ne
-        soit qu'un changement d'appelant.
+        Câblé aux DEUX chemins d'écriture : le worker (`_is_entanglement_candidate`) et,
+        depuis le 01/08, `POST /v1/memories`. La décision appartient donc à la collection
+        déclarée par l'agent, et non plus à la variable d'instance `QEM_ENTANGLE_TYPES` —
+        celle-ci ne sert plus que de repli pour une collection libre.
         """
         declaree = self.get(family, name)
         if declaree is not None:

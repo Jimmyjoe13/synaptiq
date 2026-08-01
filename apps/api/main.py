@@ -31,6 +31,7 @@ from psycopg2.extras import RealDictCursor
 # Logique partagée (embeddings pluggables + gouvernance), plus d'import depuis le worker
 from synaptiq_core import (
     content_hash,
+    entangle,
     get_embedder,
     handle_contradictions,
     link_supersedes,
@@ -119,6 +120,13 @@ OUTBOX_PENDING = Gauge("synaptiq_outbox_pending", "Committed events not yet publ
 OUTBOX_OLDEST_AGE = Gauge("synaptiq_outbox_oldest_age_seconds",
                           "Age of the oldest unpublished outbox entry")
 DLQ_DEPTH = Gauge("synaptiq_dlq_depth", "Messages parked in the dead-letter queue")
+# Densité du graphe Q-EM, par agent. Un graphe vide ne produit aucune erreur : la phase
+# d'intrication tourne simplement à vide et le rappel perd le multi-hop, en silence. C'est
+# resté invisible des semaines sur une instance réelle faute de cette métrique.
+GRAPH_EDGES = Gauge("synaptiq_graph_edges", "entangled_with edges per agent", ["agent_id"])
+GRAPH_EDGES_PER_MEMORY = Gauge("synaptiq_graph_edges_per_memory",
+                               "entangled_with edges divided by active memories, per agent",
+                               ["agent_id"])
 
 
 @contextmanager
@@ -785,6 +793,34 @@ def _refresh_pipeline_gauges() -> None:
     except Exception:
         logger.warning("Jauge DLQ non rafraîchie (Redis injoignable).", exc_info=True)
 
+    # Densité du graphe d'intrication, PAR AGENT. C'est la métrique qui manquait : un graphe
+    # vide ne lève aucune erreur et dégrade le rappel en silence (la phase 2 de Q-EM tourne
+    # simplement à vide). Un agent resté à 0 alors qu'il compte des centaines de souvenirs
+    # signale soit une instance antérieure au 01/08, soit un `QEM_ENTANGLE_THRESHOLD` trop
+    # haut pour sa langue — voir `scripts/rebuild_entanglement.py`.
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT s.agent_id,
+                           count(DISTINCT s.id) AS souvenirs,
+                           count(r.source_memory_id) AS aretes
+                    FROM memories s
+                    LEFT JOIN relationships r
+                           ON r.source_memory_id = s.id AND r.relation_type = 'entangled_with'
+                    WHERE s.tenant_id = %s AND s.status = 'active'
+                    GROUP BY 1
+                """, (_instance_tenant(),))
+                lignes = cur.fetchall()
+            conn.rollback()  # lecture seule
+        for agent_id, souvenirs, aretes in lignes:
+            GRAPH_EDGES.labels(agent_id).set(aretes or 0)
+            GRAPH_EDGES_PER_MEMORY.labels(agent_id).set(
+                (aretes or 0) / souvenirs if souvenirs else 0.0)
+    except Exception:
+        logger.warning("Jauges du graphe non rafraîchies (PostgreSQL injoignable).",
+                       exc_info=True)
+
 
 @app.get("/metrics", include_in_schema=False)
 def metrics() -> Response:
@@ -989,13 +1025,16 @@ def _memoire_existante(cur, tenant: str, agent_id: str, empreinte: str,
     return ligne[0] if ligne is not None else None
 
 
-def _reponse_memoire(cur, tenant: str, memory: "MemoryInput", memory_id: str, statut: str):
+def _reponse_memoire(memory: "MemoryInput", memory_id: str, statut: str, registre):
     """Corps de réponse de `POST /v1/memories`, identique quel que soit le statut.
 
     `duplicate` rend la MÊME forme que `created`, avec l'identifiant de la ligne déjà en
     base : un appelant qui relance après timeout obtient un identifiant exploitable, et la
     seule différence visible est `status`. Deux formes de réponse pour un même endpoint
     obligeraient chaque client à traiter le cas dégradé séparément — et donc à l'oublier.
+
+    Le registre est PASSÉ et non rechargé : le chemin de création en a déjà besoin pour
+    décider de l'intrication, et le relire ici doublerait la lecture sur le chemin chaud.
     """
     return {
         "status": statut,
@@ -1006,8 +1045,7 @@ def _reponse_memoire(cur, tenant: str, memory: "MemoryInput", memory_id: str, st
         # produit le routage fin qu'il imaginait.
         # Routage résolu par le REGISTRE de cet agent, et non plus par la cascade
         # de `if` : une collection qu'il a déclarée lui-même est donc honorée ici.
-        "collection": route_memory(memory.type, memory.subtype,
-                                   charger_registre(cur, tenant, memory.agent_id)),
+        "collection": route_memory(memory.type, memory.subtype, registre),
         "canonical_subtype": is_canonical(memory.type, memory.subtype),
     }
 
@@ -1051,7 +1089,9 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             if existant is not None:
                 # Réponse construite AVANT le rollback : `_reponse_memoire` lit le registre
                 # de collections, donc il lui faut la transaction encore ouverte.
-                reponse = _reponse_memoire(cur, tenant, memory, str(existant), "duplicate")
+                reponse = _reponse_memoire(
+                    memory, str(existant), "duplicate",
+                    charger_registre(cur, tenant, memory.agent_id))
                 conn.rollback()      # lecture seule : ne rien laisser en transaction
                 MEMORY_WRITES.labels("duplicate").inc()
                 logger.info("Écriture directe déjà présente : relance traitée en no-op.",
@@ -1104,8 +1144,9 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                 # ce verdict-là est valide indépendamment de qui a gagné la course.
                 gagnante = _memoire_existante(cur, tenant, memory.agent_id, empreinte,
                                               memory.idempotency_key)
-                reponse = _reponse_memoire(cur, tenant, memory,
-                                           str(gagnante) if gagnante else "", "duplicate")
+                reponse = _reponse_memoire(
+                    memory, str(gagnante) if gagnante else "", "duplicate",
+                    charger_registre(cur, tenant, memory.agent_id))
                 conn.commit()
                 MEMORY_WRITES.labels("duplicate").inc()
                 logger.info("Course d'insertion perdue sur un contenu identique : no-op.",
@@ -1117,9 +1158,22 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             # Traçabilité : relier la nouvelle mémoire aux préférences qu'elle remplace.
             if superseded:
                 link_supersedes(cur, new_id, superseded)
+
+            # ── Graphe d'intrication ──────────────────────────────────────────────────────
+            # Tissé ICI depuis le 01/08. Auparavant `_entangle` n'existait que dans le worker,
+            # donc une écriture directe ne construisait AUCUNE arête : la phase 2 de Q-EM
+            # (propagation d'activation) tournait sur un graphe vide pour tout agent écrivant
+            # par `store_memory`, sans erreur ni log. Mesuré sur une instance réelle : 28
+            # souvenirs, 0 arête, après des semaines d'usage.
+            # Dans la même transaction que l'insertion : une arête sans son souvenir n'a pas
+            # de sens, et l'inverse non plus.
+            registre = charger_registre(cur, tenant, memory.agent_id)
+            if registre.entangle_pour(memory.type, memory.subtype):
+                entangle(cur, tenant, memory.agent_id, new_id, memory.subtype, embedding)
+
             # Réponse assemblée dans la MÊME transaction que l'insertion : `charger_registre`
             # lit en base, et le faire après le commit ouvrirait une transaction de plus.
-            reponse = _reponse_memoire(cur, tenant, memory, str(new_id), "created")
+            reponse = _reponse_memoire(memory, str(new_id), "created", registre)
             conn.commit()
             MEMORY_WRITES.labels("created").inc()
 

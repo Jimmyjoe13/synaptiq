@@ -80,12 +80,34 @@ scale, so combining their raw values would be meaningless.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `QEM_ENTANGLE_THRESHOLD` | `0.7` | Cosine above which the worker links two memories. |
+| `QEM_ENTANGLE_THRESHOLD` | `0.7` | Cosine above which two memories are linked, on **both** write paths. Read at call time. ⚠️ Calibrated on English — see below. |
 | `QEM_ENTANGLE_DAMPING` | `0.5` | Activation attenuation per hop. |
 | `QEM_ENTANGLE_MAX_HOPS` | `2` | `1` = historical single-hop behaviour; `0` disables spreading. |
 | `QEM_ENTANGLE_TYPES` | `procedural,semantic` | Legacy instance-wide fallback — superseded by each collection's `entangle` flag. |
 | `QEM_REDUNDANCY_THRESHOLD` | `0.75` | Above this cosine, only the higher-priority candidate survives. |
 | `QEM_RECENCY_HALFLIFE_DAYS` | `90` | Decay half-life since last access. `0` disables decay. |
+
+> [!WARNING]
+> **`QEM_ENTANGLE_THRESHOLD=0.7` does not transfer to every language or embedding model.**
+>
+> Field measurement on 55 short, non-redundant French memories with
+> `paraphrase-multilingual-MiniLM-L12-v2`: **8 edges at `0.70`, 52 at `0.62`** — nearest
+> neighbours peaked around 0.68, so almost nothing cleared the default and the graph stayed
+> effectively empty. A sparse graph raises no error; the entanglement phase simply has nothing
+> to spread through.
+>
+> The default is left as-is on purpose: lowering it in the shipped configuration would change
+> recall for every existing deployment, silently. Look at your own distribution instead:
+>
+> ```bash
+> python scripts/rebuild_entanglement.py --agent my_agent --dry-run
+> ```
+>
+> Two consequences to internalise. The threshold applies to **subsequent writes only** — after
+> changing it, re-run the same script without `--dry-run`, or the existing memory stays exactly
+> as connected as before. And watch `synaptiq_graph_edges_per_memory` (see Observability):
+> aiming for roughly 1 edge per memory is a reasonable target, while too low a threshold
+> spreads activation into unrelated memories and fills the packet with plausible noise.
 
 ## Collections
 

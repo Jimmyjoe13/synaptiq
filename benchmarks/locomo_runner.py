@@ -52,6 +52,7 @@ from apps.worker import worker
 from benchmarks.budget import fit_to_budget
 
 # Intervalles de confiance : une exactitude sans incertitude n'est pas exploitable.
+from synaptiq_core.entanglement import seuil_intrication
 from synaptiq_core.stats import Difference, Proportion, required_sample_size
 
 logging.getLogger("synaptiq-worker").setLevel(logging.WARNING)
@@ -405,7 +406,9 @@ def run(args) -> dict:
         # Seuils EFFECTIFS lus dans les modules (pas os.getenv, qui rendrait "" quand la
         # valeur vient du défaut codé) : un score n'est reproductible qu'avec eux.
         "qem_settings": {
-            "entangle_threshold": worker.QEM_ENTANGLE_THRESHOLD,
+            # Lu par la fonction du cœur : le seuil n'est plus une constante figée à
+            # l'import du worker, il est partagé avec l'API qui intrique aussi désormais.
+            "entangle_threshold": seuil_intrication(),
             "entangle_types": sorted(worker.QEM_ENTANGLE_TYPES),
             "entangle_damping": api.QEM_ENTANGLE_DAMPING,
             "entangle_max_hops": api.QEM_ENTANGLE_MAX_HOPS,

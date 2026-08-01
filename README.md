@@ -438,6 +438,14 @@ Vulnerability reports: [`SECURITY.md`](SECURITY.md).
   hit ratio, degraded extractions — plus three gauges that predict incidents rather than
   merely count them: `synaptiq_outbox_pending`, `synaptiq_outbox_oldest_age_seconds`,
   `synaptiq_dlq_depth`.
+- **`synaptiq_graph_edges_per_memory{agent_id}`** — entanglement density, per agent. An agent
+  sitting at `0` with hundreds of memories has no graph at all, so the multi-hop phase of Q-EM
+  runs empty and recall degrades **in silence**. That state went unnoticed for weeks on a real
+  instance for want of this one number. Fix it with
+  [`scripts/rebuild_entanglement.py`](scripts/rebuild_entanglement.py).
+- **`synaptiq_memory_writes_total{outcome}`** — `created` vs. `duplicate` on direct writes.
+  Without it, idempotency is unverifiable from the outside: a no-op and a creation look alike
+  to the caller.
 - **`/v1/health`** reports `ingestion` alongside Postgres and Redis. A dead relay makes
   `/events` a silent black hole — accepted, persisted, never consolidated — so the check lives
   where people actually look.

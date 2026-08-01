@@ -22,7 +22,7 @@ Both endpoints create memories. They do **not** create the same thing.
 | Embedding | worker | API, before the insert |
 | LLM extraction | yes — content is split into facts | none, you wrote the memory yourself |
 | Contradictions | yes, **`preference` only** (§2) | yes, **`preference` only** (§2) |
-| `entangled_with` edges | **yes** | **no** |
+| `entangled_with` edges | yes | yes — **since 0.3.1 only**, see below |
 | Retry safety | per **event** (`idempotency_key`) | per **content** (`content_hash`) — §1.1 |
 | Caller waits | no | yes, for one embedding |
 
@@ -32,63 +32,53 @@ benchmark corpus shows the difference plainly: `Melanie thanked Caroline.` exist
 from 14 distinct events. Content-level duplication is possible on both paths — they simply
 protect against different failures.
 
-> [!IMPORTANT]
-> **An agent that writes only through `store_memory` builds no graph at all.**
->
-> `_entangle()` lives in `apps/worker/worker.py` and is called from nowhere else. The API
-> reads `relationships` for the entanglement phase (`apps/api/main.py`, `fetch_relationships`)
-> but never writes a row to it. So phase 2 of Q-EM — activation spreading, the mechanism that
-> surfaces a related memory the query never mentioned — has nothing to spread through.
->
-> Recall silently degrades to phase 1 + phase 3: hybrid search plus interference. That is
-> still a working memory, and it is *not* what the benchmark measured.
+Both paths build the graph. That is recent, and it matters for any instance created before
+2026-08-01.
 
-Nothing reports this. Check it directly:
+> [!IMPORTANT]
+> **Before this fix, an agent that wrote only through `store_memory` built no graph at all.**
+>
+> `_entangle()` lived in `apps/worker/worker.py` and was called from nowhere else. The API read
+> `relationships` for the entanglement phase but never wrote a row to it. So phase 2 of Q-EM —
+> activation spreading, the mechanism that surfaces a related memory the query never mentioned
+> — had nothing to spread through, and recall silently degraded to phase 1 + phase 3. Measured
+> on a real instance: **28 memories, 0 edges**, after weeks of use.
+>
+> Nothing reported it, and **nothing fills it in retroactively** — entanglement is a
+> write-time effect. If your instance predates the fix, rebuild once.
+
+Check any instance directly:
 
 ```sql
 SELECT m.agent_id, count(DISTINCT m.id) AS memories, count(r.source_memory_id) AS edges
 FROM memories m
-LEFT JOIN relationships r ON r.source_memory_id = m.id
+LEFT JOIN relationships r
+       ON r.source_memory_id = m.id AND r.relation_type = 'entangled_with'
 WHERE m.status = 'active'
 GROUP BY 1 ORDER BY 2 DESC;
 ```
 
-A row with hundreds of memories and `0` edges is an agent whose graph was never built.
+Or read `synaptiq_graph_edges_per_memory{agent_id="..."}` from `/metrics` — that gauge exists
+so an empty graph stops being invisible.
 
-**Three ways out**, in decreasing order of purity:
+**To fill an existing graph**, or after changing the threshold:
 
-1. **Write through `/v1/events`.** You get the full pipeline. The cost is that an LLM
-   re-extracts your content: if the agent already produced a clean atomic memory, extraction
-   can only degrade it, and with `LLM_PROVIDER=mock` the regex fallback will mangle it.
-   Sensible for raw conversation capture, wrong for deliberate agent writes.
-2. **Write directly and re-entangle periodically.** Keep `store_memory` for its precision and
-   run a maintenance pass that replays the worker's logic. Idempotent, so schedule it on
-   session end or on a timer:
+```bash
+python scripts/rebuild_entanglement.py --agent my_agent --dry-run   # state + distribution
+python scripts/rebuild_entanglement.py --agent my_agent
+```
 
-   ```sql
-   INSERT INTO relationships (source_memory_id, target_memory_id, relation_type, weight)
-   SELECT s.id, n.id, 'entangled_with', n.sim
-   FROM memories s
-   CROSS JOIN LATERAL (
-       SELECT m.id, (1 - (m.embedding <=> s.embedding)) AS sim
-       FROM memories m
-       WHERE m.tenant_id = s.tenant_id AND m.agent_id = s.agent_id
-         AND m.id <> s.id AND m.status = 'active'
-       ORDER BY m.embedding <=> s.embedding
-       LIMIT 3
-   ) n
-   WHERE s.agent_id = :agent AND s.status = 'active' AND n.sim > :threshold
-   ON CONFLICT (source_memory_id, target_memory_id) DO NOTHING;
-   ```
+`--dry-run` prints the nearest-neighbour similarity histogram with your current threshold
+marked, which is the only honest way to choose one (§8). The script is idempotent, honours each
+collection's `entangle` flag, and emits **only** `entangled_with`: the write path also creates
+a `supersedes_by` edge between `coding_best_practices` and `code_error_resolution`, and
+replaying *that* in bulk would make the interference phase cancel memories that are still
+valid. Suppression stays a deliberate write, never a side effect of maintenance.
 
-   Mirror the worker: top-3 nearest neighbours, threshold above `QEM_ENTANGLE_THRESHOLD`
-   (see §8 before trusting the default). Emit **only** `entangled_with` — the worker also
-   creates a `supersedes_by` edge between `coding_best_practices` and
-   `code_error_resolution`, and replaying *that* in bulk makes the interference phase cancel
-   memories that are still valid. Suppression must stay a deliberate write, never a
-   side effect of a maintenance job.
-3. **Accept single-hop recall.** Legitimate if your memory is a flat set of unrelated facts.
-   Decide it, do not discover it.
+One thing the graph does **not** do: `propagate_entanglement` only activates a link when *both*
+endpoints are already in the candidate set. The graph therefore **re-ranks the candidate pool,
+it does not widen it** — it promotes a memory that matched weakly, it cannot retrieve one that
+hybrid search missed entirely. Worth knowing before attributing a recall miss to the graph.
 
 ### 1.1 Retries are safe, and that is recent
 
@@ -324,22 +314,26 @@ memories) built 1420 edges, about 1.43 per memory.
 
 This is one corpus with one model, not a benchmark. The transferable part is the method:
 before trusting the default, look at your own distribution and pick a threshold that lands
-near ~1 edge per memory.
+near ~1 edge per memory. The rebuild script prints exactly that histogram, with your current
+threshold marked:
 
-```sql
-SELECT round(n.sim::numeric, 2) AS sim, count(*)
-FROM memories s
-CROSS JOIN LATERAL (
-    SELECT (1 - (m.embedding <=> s.embedding)) AS sim FROM memories m
-    WHERE m.agent_id = s.agent_id AND m.id <> s.id AND m.status = 'active'
-    ORDER BY m.embedding <=> s.embedding LIMIT 3
-) n
-WHERE s.agent_id = :agent
-GROUP BY 1 ORDER BY 1 DESC;
+```bash
+python scripts/rebuild_entanglement.py --agent my_agent --dry-run
 ```
 
 Too low is not free either: spurious edges spread activation into unrelated memories and the
 packet fills with plausible noise.
+
+> [!WARNING]
+> **Changing the threshold does not touch memories already written.** It applies to subsequent
+> writes only, so lowering it and observing no improvement is the expected outcome, not a
+> refutation. Re-run `rebuild_entanglement.py` (without `--dry-run`) after any change —
+> and with `--purge` if you *raised* it and want the graph actually tightened, knowing that
+> purge also removes edges legitimately laid down at write time.
+
+The default is deliberately left at `0.7`. Lowering it in the shipped configuration would
+change recall for every existing deployment, silently — the same class of change this project
+has been fixing elsewhere.
 
 ---
 
@@ -352,7 +346,7 @@ Run all of it. The first three can pass while recall is quietly broken.
 | 1 | `curl /v1/health` | `postgres`, `redis` **and** `ingestion` all healthy |
 | 2 | MCP tool call, not just server start | a real `store_memory` returning its resolved `collection` |
 | 3 | `SELECT agent_id, count(*) FROM memories GROUP BY 1` | your `SYNAPTIQ_AGENT_ID`, non-zero |
-| 4 | **Edge count for that agent** (§1) | non-zero, roughly ~1 per memory |
+| 4 | **Edge count for that agent** — `synaptiq_graph_edges_per_memory` or the query in §1 | non-zero, roughly ~1 per memory |
 | 5 | Embedding coherence | cosine of a stored vector vs. one recomputed now = `1.000` |
 | 6 | **A real `build_context`** on a task you know is covered | the right packet, inside budget |
 
