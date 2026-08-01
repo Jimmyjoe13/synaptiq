@@ -29,7 +29,13 @@ from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor
 
 # Logique partagée (embeddings pluggables + gouvernance), plus d'import depuis le worker
-from synaptiq_core import get_embedder, handle_contradictions, link_supersedes, to_pgvector
+from synaptiq_core import (
+    content_hash,
+    get_embedder,
+    handle_contradictions,
+    link_supersedes,
+    to_pgvector,
+)
 
 # Registre des collections : le rangement est un objet que l'agent possède. Le chargement
 # vit dans le cœur (comme `handle_contradictions`), afin que l'API et le worker voient
@@ -96,6 +102,9 @@ RRF_WEIGHT_FTS = float(os.getenv("RRF_WEIGHT_FTS", "1.0"))
 db_pool: pg_pool.ThreadedConnectionPool | None = None
 redis_client = None
 EVENTS_CAPTURED = Counter("synaptiq_events_captured_total", "Events persisted in the transactional outbox")
+# `outcome=duplicate` compte les relances neutralisées. Sans ce compteur, l'idempotence est
+# invérifiable de l'extérieur : un no-op et une création se ressemblent trop côté client.
+MEMORY_WRITES = Counter("synaptiq_memory_writes_total", "Direct memory writes", ["outcome"])
 CONTEXT_BUILDS = Counter("synaptiq_context_builds_total", "Context builds", ["outcome"])
 CONTEXT_BUILD_SECONDS = Histogram("synaptiq_context_build_seconds", "Context build latency")
 
@@ -921,6 +930,13 @@ class MemoryInput(BaseModel):
     content: str = Field(..., min_length=1, max_length=12000, json_schema_extra={"example": "Jimmy préfère les e-mails courts."})
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     importance: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Idempotence EXPLICITE, en complément de la déduplication par contenu (voir
+    # `create_memory`). Réservée aux appelants qui possèdent une clé réellement stable —
+    # l'identifiant de la ligne source d'un import, par exemple. Un agent conversationnel
+    # n'en a pas : c'est pourquoi elle ne peut pas être le mécanisme principal, une clé
+    # régénérée à chaque tentative ne protégeant de rien.
+    idempotency_key: str | None = Field(default=None, max_length=128,
+                                        json_schema_extra={"example": "crm-row-4711"})
 
     @model_validator(mode="after")
     def _verifier_la_taxonomie(self):
@@ -939,10 +955,80 @@ class MemoryInput(BaseModel):
             raise ValueError(str(e)) from e
         return self
 
+def _memoire_existante(cur, tenant: str, agent_id: str, empreinte: str,
+                       cle_idempotence: str | None):
+    """Cherche une mémoire ACTIVE déjà écrite en direct pour ce contenu (ou cette clé).
+
+    Bornée à `status = 'active'` et à `source_event_id IS NULL`, exactement comme les index
+    uniques qu'elle double :
+
+      - `active` : archiver un fait puis le ré-affirmer plus tard est un cas LÉGITIME (une
+        décision revient, une préférence redevient vraie). Contraindre sur toutes les lignes
+        interdirait ce mouvement et rendrait un archivage définitif.
+      - `source_event_id IS NULL` : les mémoires issues du worker ont leur propre
+        déduplication, par événement. Deux événements distincts qui énoncent le même fait
+        sont deux souvenirs, et ce n'est pas à cet endpoint d'en juger.
+    """
+    if cle_idempotence:
+        cur.execute(
+            "SELECT id FROM memories "
+            "WHERE tenant_id = %s AND agent_id = %s AND idempotency_key = %s "
+            "AND status = 'active' AND source_event_id IS NULL LIMIT 1",
+            (tenant, agent_id, cle_idempotence),
+        )
+        ligne = cur.fetchone()
+        if ligne is not None:
+            return ligne[0]
+    cur.execute(
+        "SELECT id FROM memories "
+        "WHERE tenant_id = %s AND agent_id = %s AND content_hash = %s "
+        "AND status = 'active' AND source_event_id IS NULL LIMIT 1",
+        (tenant, agent_id, empreinte),
+    )
+    ligne = cur.fetchone()
+    return ligne[0] if ligne is not None else None
+
+
+def _reponse_memoire(cur, tenant: str, memory: "MemoryInput", memory_id: str, statut: str):
+    """Corps de réponse de `POST /v1/memories`, identique quel que soit le statut.
+
+    `duplicate` rend la MÊME forme que `created`, avec l'identifiant de la ligne déjà en
+    base : un appelant qui relance après timeout obtient un identifiant exploitable, et la
+    seule différence visible est `status`. Deux formes de réponse pour un même endpoint
+    obligeraient chaque client à traiter le cas dégradé séparément — et donc à l'oublier.
+    """
+    return {
+        "status": statut,
+        "memory_id": memory_id,
+        # Collection du context_packet où ce souvenir sera servi. Rendue explicite
+        # parce qu'un sous-type libre retombe sur la collection du TYPE : sans cette
+        # information, l'appelant ne peut pas savoir que son libellé métier n'a pas
+        # produit le routage fin qu'il imaginait.
+        # Routage résolu par le REGISTRE de cet agent, et non plus par la cascade
+        # de `if` : une collection qu'il a déclarée lui-même est donc honorée ici.
+        "collection": route_memory(memory.type, memory.subtype,
+                                   charger_registre(cur, tenant, memory.agent_id)),
+        "canonical_subtype": is_canonical(memory.type, memory.subtype),
+    }
+
+
 @v1_router.post("/memories", status_code=201)
 def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_auth)):
-    """
-    Permet à un agent IA d'enregistrer directement un souvenir consolidé.
+    """Enregistre directement un souvenir consolidé, sans passer par l'extraction.
+
+    **Idempotent sur le contenu.** Jusqu'au 01/08 c'était un `INSERT` nu : un client qui
+    relançait l'appel après un timeout perçu — alors que le premier avait abouti côté
+    serveur — créait une SECONDE ligne, sans erreur ni trace. Le coût n'était pas surtout
+    dans le rappel (la phase 3 de Q-EM annule les redondances au-dessus de 0,75, et deux
+    copies ont un cosinus de 1,0) mais dans le GRAPHE : un clone est fatalement le premier
+    des 3 voisins retenus par l'intrication, et cette arête-là ne porte aucune information.
+    Mesuré sur le corpus de benchmark : 67 arêtes sur 1420 reliaient une mémoire à un clone
+    d'elle-même. Rien ne l'annule, le graphe étant persistant.
+
+    Deux tentatives identiques renvoient donc désormais le même `memory_id`, la seconde avec
+    `status: "duplicate"`. Le code HTTP reste `201` : `/v1/events` a établi cette convention
+    (no-op signalé par le champ `status`), et en ouvrir une seconde dans la même API coûterait
+    plus cher en confusion que la rigueur HTTP n'y gagnerait.
     """
     tenant = resolve_tenant(auth)
     require_scope(auth, "write")
@@ -950,9 +1036,30 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
     if db_pool is None:
         raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
     conn = db_pool.getconn()
+    empreinte = content_hash(memory.content)
     try:
-        embedding = get_embedder().embed_one(memory.content)
         with conn.cursor() as cur:
+            # ── Pré-contrôle de doublon, AVANT l'embedding ────────────────────────────────
+            # Placé ici et pas après, pour deux raisons. D'abord la panne visée est un
+            # TIMEOUT côté client, et le temps est presque toujours passé dans l'embedding
+            # (mesuré au-delà de 5 s à froid) : la relance doit donc court-circuiter
+            # justement l'appel qui a expiré, sinon elle expire à son tour. Ensuite
+            # `handle_contradictions` archive : sur une relance, rien ne doit être archivé
+            # une seconde fois.
+            existant = _memoire_existante(cur, tenant, memory.agent_id, empreinte,
+                                          memory.idempotency_key)
+            if existant is not None:
+                # Réponse construite AVANT le rollback : `_reponse_memoire` lit le registre
+                # de collections, donc il lui faut la transaction encore ouverte.
+                reponse = _reponse_memoire(cur, tenant, memory, str(existant), "duplicate")
+                conn.rollback()      # lecture seule : ne rien laisser en transaction
+                MEMORY_WRITES.labels("duplicate").inc()
+                logger.info("Écriture directe déjà présente : relance traitée en no-op.",
+                            extra={"agent_id": memory.agent_id, "memory_id": str(existant)})
+                return reponse
+
+            embedding = get_embedder().embed_one(memory.content)
+
             # Gestion des contradictions
             new_mem_dict = {
                 "type": memory.type,
@@ -962,10 +1069,18 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             # Archivage sur verdict EXPLICITE de contradiction seulement (cf. governance).
             superseded = handle_contradictions(cur, tenant, memory.agent_id, new_mem_dict, embedding)
 
-            # Insertion
+            # Insertion. `ON CONFLICT DO NOTHING` SANS cible : deux index uniques partiels
+            # couvrent cette table (contenu et clé d'idempotence) et une clause `ON CONFLICT`
+            # ne peut en nommer qu'un. Sans cible, PostgreSQL neutralise l'insertion sur
+            # n'importe quelle violation d'unicité — donc sur les deux.
+            # Ce filet ne remplace pas le pré-contrôle ci-dessus : il rattrape la course
+            # entre deux requêtes concurrentes portant le même contenu, fenêtre que le
+            # SELECT seul laisse ouverte.
             query = """
-                INSERT INTO memories (tenant_id, agent_id, type, subtype, content, embedding, confidence, importance, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active')
+                INSERT INTO memories (tenant_id, agent_id, type, subtype, content, embedding,
+                                      confidence, importance, status, content_hash, idempotency_key)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s)
+                ON CONFLICT DO NOTHING
                 RETURNING id;
             """
             cur.execute(query, (
@@ -976,30 +1091,42 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                 memory.content,
                 embedding,
                 memory.confidence,
-                memory.importance
+                memory.importance,
+                empreinte,
+                memory.idempotency_key,
             ))
-            new_id = cur.fetchone()[0]
+            ligne = cur.fetchone()
+            if ligne is None:
+                # Course perdue : une requête concurrente a inséré le même contenu entre
+                # notre SELECT et notre INSERT. Le doublon est refusé, on rend la ligne
+                # gagnante — l'appelant obtient un identifiant utilisable, pas une erreur.
+                # `handle_contradictions` a pu archiver juste avant : on COMMIT, parce que
+                # ce verdict-là est valide indépendamment de qui a gagné la course.
+                gagnante = _memoire_existante(cur, tenant, memory.agent_id, empreinte,
+                                              memory.idempotency_key)
+                reponse = _reponse_memoire(cur, tenant, memory,
+                                           str(gagnante) if gagnante else "", "duplicate")
+                conn.commit()
+                MEMORY_WRITES.labels("duplicate").inc()
+                logger.info("Course d'insertion perdue sur un contenu identique : no-op.",
+                            extra={"agent_id": memory.agent_id,
+                                   "memory_id": str(gagnante) if gagnante else None})
+                return reponse
+
+            new_id = ligne[0]
             # Traçabilité : relier la nouvelle mémoire aux préférences qu'elle remplace.
             if superseded:
                 link_supersedes(cur, new_id, superseded)
+            # Réponse assemblée dans la MÊME transaction que l'insertion : `charger_registre`
+            # lit en base, et le faire après le commit ouvrirait une transaction de plus.
+            reponse = _reponse_memoire(cur, tenant, memory, str(new_id), "created")
             conn.commit()
+            MEMORY_WRITES.labels("created").inc()
 
             logger.info("Mémoire créée en direct par l'agent : %s", new_id,
                         extra={"agent_id": memory.agent_id, "memory_type": memory.type,
                                "subtype": memory.subtype})
-            return {
-                "status": "created",
-                "memory_id": str(new_id),
-                # Collection du context_packet où ce souvenir sera servi. Rendue explicite
-                # parce qu'un sous-type libre retombe sur la collection du TYPE : sans cette
-                # information, l'appelant ne peut pas savoir que son libellé métier n'a pas
-                # produit le routage fin qu'il imaginait.
-                # Routage résolu par le REGISTRE de cet agent, et non plus par la cascade
-                # de `if` : une collection qu'il a déclarée lui-même est donc honorée ici.
-                "collection": route_memory(memory.type, memory.subtype,
-                                           charger_registre(cur, tenant, memory.agent_id)),
-                "canonical_subtype": is_canonical(memory.type, memory.subtype),
-            }
+            return reponse
     except HTTPException:
         raise
     except Exception:

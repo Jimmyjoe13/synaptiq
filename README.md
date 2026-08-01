@@ -29,6 +29,7 @@
   <a href="#api-reference">API</a> ·
   <a href="#sdks">SDKs</a> ·
   <a href="#mcp-server">MCP</a> ·
+  <a href="docs/agent-integration.md">Agent integration</a> ·
   <a href="#security">Security</a> ·
   <a href="#benchmarks">Benchmarks</a>
 </p>
@@ -280,7 +281,7 @@ Base path `/v1`. Unversioned aliases are kept for backward compatibility.
 |:---:|---|---|
 | `GET` | `/v1/health` | Postgres, Redis and **ingestion** status. `degraded` if any is unhealthy. |
 | `POST` | `/v1/events` | Async ingestion, transactional outbox, idempotent via `idempotency_key`. |
-| `POST` | `/v1/memories` | Direct write of a consolidated memory. Returns the resolved `collection`. |
+| `POST` | `/v1/memories` | Direct write of a consolidated memory. **Idempotent on content** — a retry returns the same `memory_id` with `status: "duplicate"`. Returns the resolved `collection`. |
 | `POST` | `/v1/retrieve` | Hybrid search (vector + full-text, RRF), filterable by family and collection. |
 | `POST` | `/v1/context/build` | Q-EM context packet under a token budget. `explain=true` adds a `retrieval_trace`. |
 | `GET` | `/v1/collections` | The agent's taxonomy: volumes, quota, dormant shelves. |
@@ -366,6 +367,13 @@ so no prompt can make the model act as another agent.
 
 📖 **[Full MCP guide](docs/mcp-server.md)** — transports (`stdio` vs `http` and their measured
 trade-off), Docker and host installs, client configuration, verification, troubleshooting.
+
+📖 **[Agent integration guide](docs/agent-integration.md)** — the other half of the job: how to
+make an agent actually *use* the memory well. Designing its collections, writing memories that
+survive being recalled alone, `build_context` vs. raw search — and the four asymmetries that
+degrade recall in silence, starting with the one that matters most: **a direct write to
+`/v1/memories` builds no `entangled_with` edges**, so an agent that only calls `store_memory`
+never builds a graph and loses the multi-hop phase entirely.
 
 <br>
 

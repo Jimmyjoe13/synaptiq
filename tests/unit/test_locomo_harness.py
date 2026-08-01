@@ -166,3 +166,55 @@ def test_compteur_restaure_meme_en_cas_d_exception():
         with locomo._FallbackCounter():
             raise ValueError("panne pendant l'ingestion")
     assert worker._heuristic_extract is original
+
+
+# ─── Sélection des bras ───
+
+@pytest.mark.parametrize("choix,attendu", [
+    # `both` garde son sens historique : les scripts et le README l'utilisent déjà.
+    ("both", ["qem", "vector"]),
+    ("all", ["qem", "vector", "mem0"]),
+    ("qem", ["qem"]),
+    ("mem0", ["mem0"]),
+])
+def test_resolution_des_bras(choix, attendu):
+    assert locomo._resoudre_bras(choix) == attendu
+
+
+# ─── Écarts entre bras ───
+
+def _rows(arm, corrects, total):
+    return [{"arm": arm, "category": 1, "correct": i < corrects, "context_tokens": 10}
+            for i in range(total)]
+
+
+def test_deltas_conserve_les_cles_historiques():
+    """Le README et les rapports déjà publiés lisent `delta_qem_minus_vector`."""
+    results = _rows("qem", 60, 100) + _rows("vector", 50, 100)
+    deltas = locomo._deltas(results, ["qem", "vector"])
+
+    assert deltas["delta_qem_minus_vector"] == pytest.approx(0.10, abs=1e-6)
+    assert "delta_qem_minus_vector_ci" in deltas
+    assert deltas["comparisons"]["qem_minus_vector"]["delta_points"] == 10.0
+
+
+def test_deltas_compare_toutes_les_paires_de_bras():
+    results = _rows("qem", 60, 100) + _rows("vector", 50, 100) + _rows("mem0", 55, 100)
+    deltas = locomo._deltas(results, ["qem", "vector", "mem0"])
+
+    assert set(deltas["comparisons"]) == {"qem_minus_vector", "qem_minus_mem0",
+                                          "vector_minus_mem0"}
+    assert deltas["comparisons"]["qem_minus_mem0"]["delta_points"] == 5.0
+
+
+def test_deltas_publie_toujours_le_verdict_de_significativite():
+    """Un écart sans verdict serait lu comme une victoire — c'est le défaut d'origine."""
+    results = _rows("qem", 52, 100) + _rows("mem0", 50, 100)
+    comparaison = locomo._deltas(results, ["qem", "mem0"])["comparisons"]["qem_minus_mem0"]
+
+    assert comparaison["significant_at_95"] is False
+    assert "NON significatif" in comparaison["verdict"]
+
+
+def test_un_seul_bras_ne_produit_aucun_delta():
+    assert locomo._deltas(_rows("qem", 5, 10), ["qem"]) == {}

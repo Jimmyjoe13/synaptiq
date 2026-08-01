@@ -47,9 +47,9 @@ from apps.api import main as api
 from apps.api.main import app
 from apps.worker import worker
 
-# Même estimateur de tokens que le collapse Q-EM : indispensable pour que les deux bras
-# soient comparés à budget de contexte réellement identique.
-from synaptiq_core.qem import estimate_tokens
+# Règle de budget commune à TOUS les bras (elle s'appuie sur `estimate_tokens`, l'estimateur
+# du collapse Q-EM) : sans elle, un écart d'exactitude pourrait n'être qu'un écart de budget.
+from benchmarks.budget import fit_to_budget
 
 # Intervalles de confiance : une exactitude sans incertitude n'est pas exploitable.
 from synaptiq_core.stats import Difference, Proportion, required_sample_size
@@ -133,14 +133,19 @@ class _FallbackCounter:
 
 
 def ingest(conv: dict, tenant: str, agent: str, pace: float, limit_turns: int | None,
-           skip: int = 0) -> int:
-    """Capture chaque tour comme event puis consolide via le worker (extraction LLM).
+           skip: int = 0, *, synaptiq: bool = True, mem0_arm=None) -> int:
+    """Capture chaque tour de dialogue dans les moteurs demandés, dans le même ordre.
+
+    Les deux moteurs reçoivent la MÊME chaîne `[date] locuteur: texte`, construite une seule
+    fois : c'est ce qui rend la comparaison honnête. Une boucle par moteur aurait fini par
+    diverger sur un détail de formatage, et l'écart se serait lu comme une différence de
+    qualité de mémoire.
 
     `skip` saute les N premiers tours déjà ingérés (reprise après interruption). L'ordre
     de `_sessions` étant déterministe, reprendre au rang N redonne exactement la même
     séquence — le graphe d'intrication se construit donc à l'identique.
     """
-    db = psycopg2.connect(DATABASE_URL)
+    db = psycopg2.connect(DATABASE_URL) if synaptiq else None
     count = 0
     try:
         for skey, date, turns in _sessions(conv):
@@ -153,30 +158,38 @@ def ingest(conv: dict, tenant: str, agent: str, pace: float, limit_turns: int | 
                 if count <= skip:
                     continue          # déjà ingéré lors d'un run précédent
                 content = f"[{date}] {speaker}: {text}"
-                # L'event DOIT exister avant la mémoire (FK memories.source_event_id).
-                with db.cursor() as cur:
-                    cur.execute(
-                        "INSERT INTO events (tenant_id, agent_id, session_id, content) "
-                        "VALUES (%s, %s, %s, %s) RETURNING id",
-                        (tenant, agent, skey, content),
-                    )
-                    event_id = str(cur.fetchone()[0])
-                    db.commit()
-                time.sleep(pace)  # respecter le rate-limit LLM (extraction dans process_event)
-                worker.process_event({
-                    "id": event_id, "tenant_id": tenant, "agent_id": agent,
-                    "session_id": skey, "content": content,
-                    # Date de la session LOCOMO : référence pour résoudre « yesterday »,
-                    # « last week »… en dates absolues. Sans elle, aucune mémoire n'est
-                    # datée et les questions temporelles restent insolubles.
-                    "created_at": date,
-                })
+                if synaptiq:
+                    # L'event DOIT exister avant la mémoire (FK memories.source_event_id).
+                    with db.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO events (tenant_id, agent_id, session_id, content) "
+                            "VALUES (%s, %s, %s, %s) RETURNING id",
+                            (tenant, agent, skey, content),
+                        )
+                        event_id = str(cur.fetchone()[0])
+                        db.commit()
+                    time.sleep(pace)  # rate-limit LLM (extraction dans process_event)
+                    worker.process_event({
+                        "id": event_id, "tenant_id": tenant, "agent_id": agent,
+                        "session_id": skey, "content": content,
+                        # Date de la session LOCOMO : référence pour résoudre « yesterday »,
+                        # « last week »… en dates absolues. Sans elle, aucune mémoire n'est
+                        # datée et les questions temporelles restent insolubles.
+                        "created_at": date,
+                    })
+                if mem0_arm is not None:
+                    # mem0 fait lui aussi un appel LLM par ajout : il lui faut son propre
+                    # pacing, sinon les deux ingestions se cumulent sur la même fenêtre de
+                    # rate limit et c'est l'extraction SynaptiQ qui se dégrade en premier.
+                    time.sleep(pace)
+                    mem0_arm.ingest_turn(content, session_id=skey, date=date)
                 if count % 25 == 0:
                     log.info("Ingéré %d/%d tours…", count, skip + limit_turns if limit_turns else count)
                 if limit_turns and count >= limit_turns:
                     return count
     finally:
-        db.close()
+        if db is not None:
+            db.close()
     return count
 
 
@@ -206,22 +219,14 @@ def context_vector(client: TestClient, agent: str, question: str, max_tokens: in
     filtrage d'interférence, aucun collapse par densité d'utilité — on prend les k plus
     proches par cosinus et on remplit le budget dans cet ordre.
 
-    Le budget est tronqué avec `estimate_tokens`, l'estimateur EXACT qu'utilise Q-EM :
-    sans cela, un bras disposerait de plus de contexte que l'autre et la comparaison
-    d'exactitude ne voudrait rien dire.
+    La troncature passe par `fit_to_budget`, partagée avec le bras mem0 et fondée sur
+    l'estimateur EXACT qu'utilise Q-EM : sans cela, un bras disposerait de plus de contexte
+    que l'autre et la comparaison d'exactitude ne voudrait rien dire.
     """
     r = client.post("/retrieve", json={"agent_id": agent, "query": question, "limit": top_k})
     if r.status_code != 200:
         return "", 0
-    lines, total = [], 0
-    for mem in r.json().get("memories", []):
-        content = mem.get("content", "")
-        cost = estimate_tokens(content)
-        if total + cost > max_tokens:
-            continue  # même règle que collapse_by_utility : on saute, on ne s'arrête pas
-        lines.append(f"- {content}")
-        total += cost
-    return "\n".join(lines), total
+    return fit_to_budget((m.get("content", "") for m in r.json().get("memories", [])), max_tokens)
 
 
 def answer_question(context: str, question: str, pace: float) -> str:
@@ -248,12 +253,27 @@ def judge(question: str, gold: str, hyp: str, pace: float) -> bool:
     return bool(match) and match.group(1) in ("oui", "yes")
 
 
+ARMS_SYNAPTIQ = ("qem", "vector")
+
+
+def _resoudre_bras(choix: str) -> list[str]:
+    """Traduit `--arm` en liste de bras. `both` reste l'ancien couple (compat des scripts)."""
+    if choix == "both":
+        return ["qem", "vector"]
+    if choix == "all":
+        return ["qem", "vector", "mem0"]
+    return [choix]
+
+
 def run(args) -> dict:
     data = json.load(open(args.dataset, encoding="utf-8"))
     sample = data[args.conv]
     conv = sample["conversation"]
     tenant = args.tenant
     agent = f"conv{args.conv}"
+    arms = _resoudre_bras(args.arm)
+    besoin_synaptiq = any(a in ARMS_SYNAPTIQ for a in arms)
+    besoin_mem0 = "mem0" in arms
 
     # SynaptiQ décide du tenant CÔTÉ SERVEUR (jamais depuis le body) : l'API le relit dans
     # SYNAPTIQ_TENANT à chaque requête. Sans cette ligne, l'ingestion écrit sous
@@ -275,15 +295,51 @@ def run(args) -> dict:
             db.commit()
     db.close()
 
+    # Le bras mem0 est monté APRÈS le reset : ses tables sont supprimées puis recréées par
+    # le SDK à l'instanciation. Import tardif — mem0 est une dépendance optionnelle, et un
+    # run `--arm both` ne doit pas exiger son installation.
+    mem0_arm = None
+    if besoin_mem0:
+        from benchmarks.mem0_arm import Mem0Arm, reset_collection
+        if not args.resume:
+            # Purge AVANT instanciation : le SDK ouvre ses tables au démarrage, les détruire
+            # sous lui ensuite le laisserait avec un pool pointant sur des tables mortes.
+            reset_collection(DATABASE_URL, args.mem0_collection)
+        mem0_arm = Mem0Arm.from_env(user_id=agent, dsn=DATABASE_URL,
+                                    collection_name=args.mem0_collection)
+        etat = mem0_arm.stats()
+        log.info("Bras mem0 prêt : %s", etat)
+        if not etat["nlp"]["full_capacity"]:
+            # Avertissement bruyant plutôt qu'abandon : mesurer un mem0 purement sémantique
+            # reste légitime si c'est ASSUMÉ. Ce qui ne l'est pas, c'est de le publier
+            # comme le score de mem0. Le rapport porte l'information dans tous les cas.
+            log.warning(
+                "mem0 tourne SANS spaCy/en_core_web_sm : BM25 et liaison d'entités sont "
+                "hors service, deux des trois signaux de rappel de la v3. Le score obtenu "
+                "sous-estimera mem0. Corriger avec : python -m spacy download en_core_web_sm"
+            )
+
     t0 = time.time()
     with _FallbackCounter() as fallbacks:
-        n_turns = ingest(conv, tenant, agent, args.pace, args.limit_turns, skip=already)
+        n_turns = ingest(conv, tenant, agent, args.pace, args.limit_turns, skip=already,
+                         synaptiq=besoin_synaptiq, mem0_arm=mem0_arm)
     degraded = fallbacks.count
     traites = max(0, n_turns - already)   # tours ingérés par CE run
     degraded_ratio = round(degraded / traites, 4) if traites else 0.0
     log.info("Ingestion terminée : %d tours (%d par ce run) en %.0fs — %d dégradée(s), %.1f%%",
              n_turns, traites, time.time() - t0, degraded, 100 * degraded_ratio)
-    if degraded_ratio > args.max_degraded:
+    if besoin_mem0:
+        # Même exigence que pour les extractions dégradées de SynaptiQ : un corpus troué
+        # d'un côté produit un score bas qui ne mesure pas le moteur mais la panne.
+        mem0_ratio = round(mem0_arm.add_failures / traites, 4) if traites else 0.0
+        if mem0_ratio > args.max_degraded:
+            raise SystemExit(
+                f"Run ABANDONNÉ : {mem0_arm.add_failures} ajouts mem0 sur {traites} "
+                f"({100 * mem0_ratio:.1f}%) ont échoué, au-delà du seuil de "
+                f"{100 * args.max_degraded:.0f}%. Le corpus mem0 serait incomplet et son "
+                "score mesurerait les échecs d'ingestion, pas la qualité du rappel."
+            )
+    if besoin_synaptiq and degraded_ratio > args.max_degraded:
         raise SystemExit(
             f"Run ABANDONNÉ : {degraded} extractions sur {traites} ({100 * degraded_ratio:.1f}%) "
             f"sont retombées sur les heuristiques regex, au-delà du seuil de "
@@ -297,7 +353,6 @@ def run(args) -> dict:
     if args.limit_qa:
         qas = qas[:args.limit_qa]
 
-    arms = ["qem", "vector"] if args.arm == "both" else [args.arm]
     results: list[dict] = []
     done = 0
     done_lock = threading.Lock()
@@ -311,6 +366,8 @@ def run(args) -> dict:
         q, gold, cat = qa["question"], str(qa["answer"]), qa.get("category")
         if arm == "qem":
             ctx, ctx_tokens = context_qem(client, agent, q, args.max_tokens)
+        elif arm == "mem0":
+            ctx, ctx_tokens = mem0_arm.context(q, args.max_tokens, args.top_k)
         else:
             ctx, ctx_tokens = context_vector(client, agent, q, args.max_tokens, args.top_k)
         hyp = answer_question(ctx, q, args.pace)
@@ -368,18 +425,44 @@ def run(args) -> dict:
         "arms": {arm: _arm_report([r for r in results if r["arm"] == arm]) for arm in arms},
         "elapsed_seconds": round(time.time() - t0, 1),
     }
-    if len(arms) == 2:
-        qem_acc = report["arms"]["qem"]["accuracy_overall"]
-        vec_acc = report["arms"]["vector"]["accuracy_overall"]
-        report["delta_qem_minus_vector"] = round(qem_acc - vec_acc, 4)
-        # Le delta seul est trompeur : on publie son intervalle et un verdict explicite.
-        # Sur un run à une conversation (~152 questions), le verdict est « non significatif »
-        # — c'est une information, pas un échec : elle dit qu'il faut plus de questions.
-        difference = Difference(a=_proportion([r for r in results if r["arm"] == "qem"]),
-                                b=_proportion([r for r in results if r["arm"] == "vector"]))
-        report["delta_qem_minus_vector_ci"] = difference.as_dict()
-        report["sample_size_needed_for_2pts_margin"] = required_sample_size(2.0)
+    if besoin_mem0:
+        # Version, extras NLP et volume consolidé : sans eux, personne ne peut savoir si le
+        # bras mem0 tournait à pleine capacité ni reproduire le run.
+        report["mem0"] = mem0_arm.stats()
+    report.update(_deltas(results, arms))
     return {"report": report, "results": results}
+
+
+def _deltas(results: list[dict], arms: list[str]) -> dict:
+    """Écarts entre bras, chacun avec son intervalle de confiance et son verdict.
+
+    Le delta seul est trompeur : sur une conversation (~152 questions), la marge à 95 %
+    vaut ~±8 points et le verdict est « non significatif ». C'est une information, pas un
+    échec — elle dit combien de questions il faudrait pour conclure.
+
+    ⚠️ `Difference` traite les deux bras comme des échantillons INDÉPENDANTS, alors qu'ils
+    répondent aux mêmes questions. C'est conservateur (l'intervalle réel d'un test apparié
+    est plus étroit), donc jamais à l'avantage d'un bras — mais un écart déclaré non
+    significatif ici pourrait l'être avec le test apparié qui convient.
+
+    Les clés historiques `delta_qem_minus_vector*` sont conservées : des scripts et le
+    README les lisent.
+    """
+    sortie: dict = {}
+    if len(arms) < 2:
+        return sortie
+    sortie["sample_size_needed_for_2pts_margin"] = required_sample_size(2.0)
+    paires = [(a, b) for i, a in enumerate(arms) for b in arms[i + 1:]]
+    comparaisons = {}
+    for a, b in paires:
+        difference = Difference(a=_proportion([r for r in results if r["arm"] == a]),
+                                b=_proportion([r for r in results if r["arm"] == b]))
+        comparaisons[f"{a}_minus_{b}"] = difference.as_dict()
+        if (a, b) == ("qem", "vector"):
+            sortie["delta_qem_minus_vector"] = round(difference.delta, 4)
+            sortie["delta_qem_minus_vector_ci"] = difference.as_dict()
+    sortie["comparisons"] = comparaisons
+    return sortie
 
 
 def _accuracy(rows: list[dict]) -> float:
@@ -441,10 +524,14 @@ if __name__ == "__main__":
     ap.add_argument("--conv", type=int, default=0, help="Index de la conversation (0-9)")
     ap.add_argument("--limit-turns", type=int, default=None, help="Cap de tours ingérés (smoke test)")
     ap.add_argument("--limit-qa", type=int, default=None, help="Cap de questions évaluées")
-    ap.add_argument("--arm", choices=["qem", "vector", "both"], default="both",
-                    help="Bras évalué : moteur Q-EM, baseline top-k vectorielle, ou les deux")
+    ap.add_argument("--arm", choices=["qem", "vector", "mem0", "both", "all"], default="both",
+                    help="Bras évalué : Q-EM, baseline top-k vectorielle, mem0 (SDK open "
+                         "source), 'both' = qem+vector (défaut historique), 'all' = les trois")
+    ap.add_argument("--mem0-collection", default="mem0_bench_locomo",
+                    help="Nom de la collection pgvector du bras mem0. DOIT commencer par "
+                         "'mem0' : le reset supprime toutes les tables de ce préfixe.")
     ap.add_argument("--top-k", type=int, default=20,
-                    help="Candidats ramenés par la baseline vectorielle avant troncature au budget")
+                    help="Candidats ramenés par les bras vectoriel ET mem0 avant troncature au budget")
     # Groq plafonne à 8000 tokens/minute sur les modèles d'extraction : ~1 appel toutes
     # les 4-5s pour rester sous la limite sur un run soutenu.
     ap.add_argument("--pace", type=float, default=1.0, help="Délai (s) avant chaque appel LLM (rate-limit)")

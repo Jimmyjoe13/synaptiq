@@ -82,6 +82,62 @@ appel d'une session paie le chargement du modele d'embedding (mesure a plus de 5
 ~2,6 s ensuite). Le premier `recall_memories` de chaque session echouait donc — precisement
 celui qui construit le contexte initial de l'agent. Nouveau defaut : `SYNAPTIQ_TIMEOUT_S=30`.
 
+### `POST /v1/memories` etait dupliquable en silence
+
+Signale par un utilisateur, reproduit puis corrige le 01/08. Le chemin d'ecriture directe
+etait un `INSERT` nu : un client qui relancait l'appel apres un timeout percu — alors que le
+premier avait abouti cote serveur — creait une SECONDE ligne, meme contenu, sans erreur, sans
+log, sans metrique. L'index unique existant ne pouvait rien y faire : `idx_memories_event_fact`
+est PARTIEL sur `WHERE source_event_id IS NOT NULL`, et une ecriture directe a
+`source_event_id` nul.
+
+**Ou etait le vrai cout.** Pas d'abord dans le rappel : la phase 3 de Q-EM annule les
+redondances au-dessus de `QEM_REDUNDANCY_THRESHOLD` (0,75) et deux copies ont un cosinus de
+1,0, donc `build_context` n'en servait qu'une (`/v1/retrieve`, lui, rendait les deux). Le cout
+etait dans le GRAPHE : un clone est fatalement le premier des 3 voisins retenus par
+`_entangle`, et cette arete ne porte aucune information. Mesure sur le corpus de benchmark
+LOCOMO : **67 aretes sur 1420 (4,7 %) reliaient une memoire a un clone exact d'elle-meme** —
+le bras multi-hop publie tournait donc avec ~5 % de son graphe gaspille. Rien ne l'annule, le
+graphe etant persistant.
+
+**Correctif.** La deduplication porte sur le CONTENU, et non sur une cle fournie par
+l'appelant. Une cle d'idempotence ne protege que si elle est stable d'une tentative a l'autre,
+or l'appelant typique est un modele invoquant un outil MCP : il n'a aucune cle stable, et une
+cle regeneree a chaque tentative ne protege de rien. `content_hash` est desormais renseigne
+sur ce chemin (la colonne existait deja depuis `20260725_multifact` et n'etait jamais
+alimentee : 118 lignes sur 118 a NULL sur l'instance de reference), et deux index uniques
+partiels sont poses, bornes a `status = 'active'` et `source_event_id IS NULL` :
+`(tenant_id, agent_id, content_hash)` et `(tenant_id, agent_id, idempotency_key)`.
+
+Le pre-controle de doublon a lieu **avant** l'embedding : la panne visee est un timeout, et le
+temps est presque toujours passe dans l'embedding. Une relance doit court-circuiter justement
+l'appel qui a expire, sinon elle expire a son tour.
+
+`content_hash` remonte du worker vers `synaptiq_core.hashing`. Elle y etait DEFINIE, donc seul
+ce chemin l'appliquait — exactement la mesaventure de la taxonomie avant le 29/07 : deux
+chemins d'ecriture, une seule regle implementee.
+
+**RUPTURE DE COMPATIBILITE — ecrire deux fois le meme contenu ne cree plus deux lignes.** Le
+second appel renvoie le `memory_id` existant avec `status: "duplicate"`, meme forme de reponse
+et meme code `201` (convention posee par `/v1/events`, dont le no-op se signale aussi par le
+champ `status`). Un appelant qui comptait sur le doublon doit changer le contenu ou fournir des
+`idempotency_key` distinctes. Le bornage a `status = 'active'` est delibere : archiver un fait
+puis le re-affirmer reste possible, sinon tout archivage deviendrait definitif.
+
+**Second vecteur, corrige aussi.** `_poster` du serveur MCP rejouait sur toute
+`requests.ConnectionError`. Cette exception couvre aussi une connexion coupee APRES l'envoi,
+cas ou le serveur a pu committer avant la coupure : le serveur MCP fabriquait donc des
+doublons **tout seul**, sans relance du client. Seul un refus de connexion franc est desormais
+rejoue. `_lire` garde la relance large, un GET ne creant rien.
+
+Nouveau compteur `synaptiq_memory_writes_total{outcome="created"|"duplicate"}` : sans lui
+l'idempotence est inverifiable de l'exterieur. Migration `20260801_memory_idem`, dont le
+backfill est **en Python et non en SQL** — `content_hash` normalise via `str.split()`, qui
+decoupe sur tout blanc Unicode (U+00A0, U+202F), la ou le `\s` de PostgreSQL est ASCII-only.
+65 memoires sur 1015 contiennent U+202F et divergent entre les deux formules : un backfill SQL
+aurait produit des empreintes que le code ne recalcule pas, et l'index aurait cesse de couvrir
+precisement ces lignes.
+
 ## 0.3.0 — 2026-07-31 — l'agent structure sa propre memoire
 
 Jusqu'ici une « collection » n'existait nulle part : c'etait le resultat d'une cascade de

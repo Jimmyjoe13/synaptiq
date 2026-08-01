@@ -1,4 +1,3 @@
-import hashlib
 import json
 import logging
 import os
@@ -20,7 +19,13 @@ for _p in (_root, os.path.join(_root, "packages", "core")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from synaptiq_core import get_embedder, handle_contradictions, link_supersedes, to_pgvector
+from synaptiq_core import (
+    content_hash,
+    get_embedder,
+    handle_contradictions,
+    link_supersedes,
+    to_pgvector,
+)
 
 # Registre des collections : l'intrication est décidée par collection, plus par instance
 from synaptiq_core.collections import charger_registre
@@ -164,14 +169,10 @@ def _heuristic_extract(event_content: str) -> dict:
 MAX_FACTS_PER_EVENT = int(os.getenv("MAX_FACTS_PER_EVENT", "5"))
 
 
-def content_hash(content: str) -> str:
-    """Empreinte du contenu normalisé, clé de déduplication des faits d'un événement.
-
-    Combinée à `source_event_id` dans un index unique, elle autorise plusieurs mémoires
-    par événement tout en garantissant qu'un replay ne duplique rien : les mêmes faits
-    produisent les mêmes empreintes.
-    """
-    return hashlib.sha256(" ".join(content.split()).strip().lower().encode("utf-8")).hexdigest()
+# NOTE — `content_hash` est désormais importée de `synaptiq_core.hashing` (cf. imports en tête
+# de module). Elle était DÉFINIE ici, donc seul ce chemin l'appliquait : `POST /v1/memories`
+# n'écrivait aucun `content_hash` et rien n'y empêchait le doublon silencieux. Même histoire
+# que la taxonomie ci-dessous — une règle implémentée dans un seul des deux chemins d'écriture.
 
 
 # Taxonomie PARTAGÉE avec l'API (packages/core/synaptiq_core/taxonomy.py). Elle vivait ici,

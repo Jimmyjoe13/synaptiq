@@ -14,6 +14,11 @@ If the API is unreachable, every tool call returns an `[ERROR]` string while the
 itself still starts and still lists its tools. **Diagnose from the API outwards, never from
 the client inwards.**
 
+> This document gets the server running. Once the tools answer, see
+> **[`agent-integration.md`](agent-integration.md)** for the other half — configuring the
+> *agent* so the memory is actually good: its collections, how it should write and read, and
+> the behaviours that degrade recall without ever logging a warning.
+
 ---
 
 ## 1. Tools
@@ -297,6 +302,9 @@ Then, from the client, ask the agent to recall something you know is stored.
 | API dies at boot on `UnicodeDecodeError` | Non-ASCII byte in `.env` on Windows | Rewrite `.env` in pure ASCII |
 | `TypeError: Router.__init__() ... 'on_startup'` | `fastmcp` installed separately from `requirements.txt` | Reinstall both in one `pip install` |
 | Tools work, but `/events` never becomes a memory | `relay` and/or `worker` not running | `docker compose up -d relay worker`. `/events` returns `201` and queues in the outbox even when nothing consumes it — `/v1/health` reports `"ingestion":"stalled"` |
+| Recall works but never surfaces a *related* memory the query didn't mention | `store_memory` writes via `POST /v1/memories`, which builds **no `entangled_with` edges** — only the worker does, and it only sees `/v1/events`. The multi-hop phase has an empty graph | Count edges per agent and run the maintenance pass — [agent-integration.md §1](agent-integration.md#1-the-two-write-paths-are-not-equivalent) |
+| A corrected memory coexists with the stale one, both `active` | Automatic archiving covers `semantic`/`preference` **only**, and the judge is fail-closed without an LLM | Supersede explicitly — [agent-integration.md §2](agent-integration.md#2-contradiction-handling-only-covers-preference) |
+| `store_memory` answers `[DEJA PRESENT]` instead of confirming a write | Normal: direct writes are idempotent on content, so this exact text is already stored under this identity | Nothing to fix. To correct a memory, write a **new** one with the updated wording — [agent-integration.md §1.1](agent-integration.md#11-retries-are-safe-and-that-is-recent) |
 
 The MCP server logs to **stderr**, never stdout — in `stdio` transport stdout carries the
 JSON-RPC frames, and a single log line there corrupts the session.

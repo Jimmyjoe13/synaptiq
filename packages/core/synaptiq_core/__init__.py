@@ -32,6 +32,7 @@ from synaptiq_core.embeddings import (
     to_pgvector,
 )
 from synaptiq_core.governance import handle_contradictions, link_supersedes
+from synaptiq_core.hashing import content_hash, normalize_for_hash
 from synaptiq_core.qem import (
     apply_contradictions,
     collapse_by_utility,
@@ -67,6 +68,9 @@ __all__ = [
     "to_pgvector",
     "handle_contradictions",
     "link_supersedes",
+    # Empreinte de contenu : même règle de déduplication sur les DEUX chemins d'écriture
+    "content_hash",
+    "normalize_for_hash",
     # Verdict de contradiction (archivage sur décision explicite, jamais sur similarité)
     "ContradictionJudge",
     "LLMContradictionJudge",

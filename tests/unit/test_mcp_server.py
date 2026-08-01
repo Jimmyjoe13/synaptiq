@@ -222,13 +222,21 @@ def test_l_attente_reste_possible_explicitement(monkeypatch):
 
 
 def test_un_premier_appel_trop_tot_reessaie_une_fois(monkeypatch):
-    """L'API peut ne pas encore écouter : `_poster` réessaie au lieu d'échouer."""
+    """L'API peut ne pas encore écouter : `_poster` réessaie au lieu d'échouer.
+
+    L'erreur simulée est un REFUS de connexion, parce que c'est celle que produit
+    réellement une API pas encore levée — et parce que depuis le 01/08 `_poster` ne rejoue
+    que ce cas-là : une coupure survenue APRÈS l'envoi peut avoir été committée côté
+    serveur, et la rejouer fabriquait des doublons.
+    """
     tentatives = []
 
     def _post(url, **kw):
         tentatives.append(url)
         if len(tentatives) == 1:
-            raise mcp_server.requests.ConnectionError("pas encore d'ecoute")
+            raise mcp_server.requests.ConnectionError(
+                "HTTPConnectionPool(host='127.0.0.1', port=8000): "
+                "[Errno 111] Connection refused")
         return _Reponse({"memories": []})
 
     monkeypatch.setattr(mcp_server.requests, "post", _post)
@@ -241,12 +249,16 @@ def test_un_premier_appel_trop_tot_reessaie_une_fois(monkeypatch):
 
 
 def test_le_retry_ne_masque_pas_une_panne_durable(monkeypatch):
-    """Deux échecs de connexion doivent remonter une erreur, pas boucler."""
+    """Deux échecs de connexion doivent remonter une erreur, pas boucler.
+
+    Refus de connexion là aussi : c'est le seul cas rejoué, donc le seul où « deux
+    tentatives » a un sens à vérifier.
+    """
     tentatives = []
 
     def _post(url, **kw):
         tentatives.append(url)
-        raise mcp_server.requests.ConnectionError("API morte")
+        raise mcp_server.requests.ConnectionError("[Errno 111] Connection refused")
 
     monkeypatch.setattr(mcp_server.requests, "post", _post)
     monkeypatch.setattr(mcp_server.time, "sleep", lambda s: None)
@@ -322,3 +334,79 @@ def test_une_panne_sort_en_erreur_de_protocole(monkeypatch):
     monkeypatch.setattr(mcp_server.requests, "post", _post_casse)
     with pytest.raises(ToolError, match="injoignable"):
         mcp_server.store_memory.fn(content="x", memory_type="semantic")
+
+
+# ─── Idempotence de l'écriture directe (correctif du 01/08) ──────────────────
+
+def test_un_doublon_est_annonce_comme_tel_a_l_agent(appels):
+    """`status: duplicate` ne doit pas être présenté comme une création.
+
+    Sinon l'agent croit avoir ajouté un souvenir alors qu'il a réécrit le même, et peut
+    boucler en reformulant pour « corriger » un échec qui n'existe pas.
+    """
+    _, reponse = appels
+    reponse["charge"] = {"status": "duplicate", "memory_id": "mem-existante",
+                         "collection": "facts", "canonical_subtype": True}
+
+    message = mcp_server.store_memory.fn(content="un fait", memory_type="semantic")
+
+    assert "DEJA PRESENT" in message
+    assert "mem-existante" in message
+    assert "SUCCESS" not in message
+
+
+def test_une_creation_reste_annoncee_comme_un_succes(appels):
+    _, reponse = appels
+    reponse["charge"] = {"status": "created", "memory_id": "mem-1",
+                         "collection": "facts", "canonical_subtype": True}
+
+    message = mcp_server.store_memory.fn(content="un fait", memory_type="semantic")
+
+    assert "[SUCCESS]" in message
+    assert "DEJA PRESENT" not in message
+
+
+# ─── La relance de `_poster` ne doit pas fabriquer de doublons ───────────────
+
+def test_poster_rejoue_quand_la_connexion_est_refusee(monkeypatch):
+    """Cas historique : l'API pas encore levée. La requête n'est jamais partie."""
+    tentatives = []
+
+    def _post(url, json=None, headers=None, timeout=None):
+        tentatives.append(url)
+        if len(tentatives) == 1:
+            raise mcp_server.requests.ConnectionError(
+                "HTTPConnectionPool: [Errno 111] Connection refused")
+        return _Reponse({"status": "created"})
+
+    monkeypatch.setattr(mcp_server.requests, "post", _post)
+    monkeypatch.setattr(mcp_server, "RETRY_DELAI_S", 0.0)
+
+    reponse = mcp_server._poster("http://api/v1/memories", {"content": "x"})
+
+    assert len(tentatives) == 2
+    assert reponse.json()["status"] == "created"
+
+
+def test_poster_ne_rejoue_PAS_une_connexion_coupee_apres_envoi(monkeypatch):
+    """RÉGRESSION : le serveur MCP fabriquait des doublons tout seul.
+
+    `requests.ConnectionError` englobe aussi une coupure APRÈS l'envoi
+    (`ConnectionResetError`), cas où le serveur a très bien pu committer avant la coupure.
+    Rejouer là-dessus dupliquait le souvenir sans aucune relance du client. L'écriture est
+    d'issue INCONNUE : elle doit remonter à l'appelant, pas être rejouée.
+    """
+    tentatives = []
+
+    def _post(url, json=None, headers=None, timeout=None):
+        tentatives.append(url)
+        raise mcp_server.requests.ConnectionError(
+            "Connection aborted", ConnectionResetError(104, "Connection reset by peer"))
+
+    monkeypatch.setattr(mcp_server.requests, "post", _post)
+    monkeypatch.setattr(mcp_server, "RETRY_DELAI_S", 0.0)
+
+    with pytest.raises(mcp_server.requests.ConnectionError):
+        mcp_server._poster("http://api/v1/memories", {"content": "x"})
+
+    assert len(tentatives) == 1, "une coupure post-envoi ne doit JAMAIS être rejouée"

@@ -181,19 +181,62 @@ TIMEOUT_S = float(os.getenv("SYNAPTIQ_TIMEOUT_S", "30"))
 
 
 def _poster(url: str, payload: dict, timeout: float | None = None):
-    """POST vers l'API, avec UNE nouvelle tentative si la connexion est refusee."""
+    """POST vers l'API, avec UNE nouvelle tentative si la connexion a ete REFUSEE.
+
+    ⚠️ La relance ne couvre que le cas ou la requete n'a PAS pu partir. `ConnectionError` de
+    `requests` est plus large que ca : elle englobe aussi une connexion coupee APRES l'envoi
+    (`ConnectionResetError`, `ProtocolError`), cas ou le serveur a tres bien pu committer
+    avant la coupure. Relancer aveuglement sur toute `ConnectionError` faisait donc du
+    serveur MCP lui-meme un producteur de doublons, sans aucune relance du client.
+
+    On distingue les deux : seul un refus de connexion franc (`ConnectionRefusedError`, l'API
+    pas encore levee -- le scenario que cette relance existe pour couvrir) est rejoue. Toute
+    autre coupure remonte a l'appelant, qui saura que l'ecriture est d'issue INCONNUE.
+
+    L'ecriture directe est desormais idempotente sur le contenu cote API, donc une relance
+    legitime est un no-op ; mais une relance dont on ne sait pas si elle est legitime n'a rien
+    a faire ici -- le filet cote serveur ne dispense pas d'etre correct cote client.
+    """
     if timeout is None:
         timeout = TIMEOUT_S
     try:
         return requests.post(url, json=payload, headers=HEADERS, timeout=timeout)
-    except requests.ConnectionError:
+    except requests.ConnectionError as err:
+        if not _connexion_refusee(err):
+            raise
         logger.info("API pas encore joignable, nouvelle tentative dans %.1f s.", RETRY_DELAI_S)
         time.sleep(RETRY_DELAI_S)
         return requests.post(url, json=payload, headers=HEADERS, timeout=timeout)
 
 
+def _connexion_refusee(err: BaseException) -> bool:
+    """La requete n'a-t-elle jamais atteint le serveur ?
+
+    `requests` empile ses causes (`ConnectionError` -> `urllib3.NewConnectionError` ->
+    `OSError`), donc on descend la chaine `__cause__`/`__context__` a la recherche d'un
+    `ConnectionRefusedError`. Repondre False par defaut est le choix sur : on ne rejoue que
+    ce qu'on a formellement identifie comme n'etant jamais parti.
+    """
+    vu = set()
+    courant: BaseException | None = err
+    while courant is not None and id(courant) not in vu:
+        vu.add(id(courant))
+        if isinstance(courant, ConnectionRefusedError):
+            return True
+        # urllib3 emballe l'OSError sans la chainer : son texte reste le seul indice.
+        if "refused" in str(courant).lower():
+            return True
+        courant = courant.__cause__ or courant.__context__
+    return False
+
+
 def _lire(url: str, params: dict, timeout: float | None = None):
-    """GET vers l'API, avec UNE nouvelle tentative si la connexion est refusee."""
+    """GET vers l'API, avec UNE nouvelle tentative si la connexion est refusee.
+
+    NE PAS « harmoniser » avec `_poster` : la restriction que celui-ci s'impose n'a aucune
+    raison d'etre ici. Un GET ne cree rien, donc le rejouer ne peut pas dupliquer de
+    souvenir, quelle que soit l'etape ou la connexion a lache.
+    """
     if timeout is None:
         timeout = TIMEOUT_S
     try:
@@ -261,6 +304,17 @@ def store_memory(content: str, memory_type: str, subtype: str | None = None) -> 
         # et rien ne le detrompait. Un moteur de memoire ne doit pas laisser croire a un
         # classement qui n'a pas eu lieu.
         collection = res_data.get("collection")
+        # `duplicate` : ce contenu etait deja en base sous cette identite, l'API a neutralise
+        # l'ecriture et rend la ligne existante. C'est dit a l'agent plutot que presente comme
+        # une creation -- sinon il croit avoir ajoute un souvenir alors qu'il a reecrit le
+        # meme, et peut boucler en reformulant pour « corriger » un echec qui n'existe pas.
+        if res_data.get("status") == "duplicate":
+            message = (f"[DEJA PRESENT] Ce contenu est deja en memoire (ID: "
+                       f"{res_data.get('memory_id')}, section '{collection}'). Rien n'a ete "
+                       f"ajoute : l'ecriture directe est idempotente sur le contenu. Pour "
+                       f"corriger un souvenir, en ecrire un NOUVEAU qui enonce la version a "
+                       f"jour -- une reformulation a l'identique ne cree rien.")
+            return message
         message = (f"[SUCCESS] Memoire enregistree. ID: {res_data.get('memory_id')} | "
                    f"servie dans la section '{collection}'")
         if subtype and not res_data.get("canonical_subtype") and collection != subtype:
