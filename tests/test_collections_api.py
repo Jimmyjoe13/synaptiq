@@ -20,7 +20,7 @@ import apps.api.main as main
 from apps.api.main import app
 
 DATABASE_URL = os.getenv(
-    "DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db")
+    "DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_dev")
 TENANT = "col_test_tenant"
 
 

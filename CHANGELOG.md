@@ -46,6 +46,24 @@ surcharge (le cas de la regression), surcharge explicite vers un fournisseur dis
 > aucun conteneur ne l'atteindra meme avec la bonne URL. Dans LM Studio, activer « Serve on
 > Local Network ».
 
+### La suite de tests visait la base d'execution
+
+`test-integration` ecrit et supprime. Sa cible par defaut etait pourtant `synaptiq_db` et
+l'index Redis `0` — ceux d'une instance qui sert reellement. Pire que le defaut : les deux
+lanceurs (`Makefile`, `scripts/dev.ps1`) **forcaient** ces valeurs dans l'environnement.
+Un simple `dev.ps1 test` injectait donc les tenants `test_tenant` et `tenant_quantum` dans
+les donnees reelles.
+
+Constate le 31/07 sur l'instance de production : `purge_tenants` avait laisse quatre
+memoires residuelles, et elles ont **bloque le demarrage du worker**. Leurs vecteurs `mock`
+faisaient echouer le controle de coherence des embeddings, qui echantillonne la memoire la
+plus recente *toutes partitions confondues* — le verdict portait donc sur une donnee
+jetable, pas sur la memoire de l'agent.
+
+Le defaut est desormais `synaptiq_dev` / index `1` dans les cinq modules d'integration et
+dans les deux lanceurs. La separation ne repose plus sur la discipline de qui lance la
+commande.
+
 ### MCP : une panne ne doit plus ressembler a un souvenir
 
 Remonte de l'instance de production, ou le correctif avait ete ecrit en local.

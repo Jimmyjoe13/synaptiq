@@ -5,8 +5,10 @@
 # qu'un contributeur cherche en premier en arrivant sur un dépôt.
 
 PY ?= python
-DB_URL ?= postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db
-REDIS_URL_LOCAL ?= redis://127.0.0.1:6399/0
+# Base et index Redis JETABLES : `test-integration` écrit et supprime, il ne doit jamais
+# viser une instance qui sert réellement. Voir la note détaillée dans `scripts/dev.ps1`.
+DB_URL ?= postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_dev
+REDIS_URL_LOCAL ?= redis://127.0.0.1:6399/1
 
 .PHONY: help install up down migrate lint types test test-unit test-integration \
         coverage bench bench-explain clean

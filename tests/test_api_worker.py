@@ -16,8 +16,8 @@ from conftest import purge_tenants
 from apps.api.main import app as fastapi_app
 from apps.worker.worker import generate_mock_embedding, process_event
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db")
-REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6399/0")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_dev")
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6399/1")
 
 
 class _ConstEmbedder:

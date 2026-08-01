@@ -17,10 +17,20 @@ Set-Location $Racine
 $Py = Join-Path $Racine ".venv\Scripts\python.exe"
 if (-not (Test-Path $Py)) { $Py = "python" }
 
+# Base et index Redis JETABLES, distincts de ceux d'une instance qui sert réellement.
+#
+# ⚠️ Ces valeurs pointaient sur `synaptiq_db` et l'index Redis `0` — c'est-à-dire sur la
+# base d'exécution. Or `test-integration` écrit ET SUPPRIME : lancer la suite depuis ce
+# dépôt injectait des tenants de test (`test_tenant`, `tenant_quantum`) dans les données
+# réelles, et `purge_tenants` en laissait des résidus. Le 31/07, ces résidus ont bloqué le
+# démarrage du worker — leurs vecteurs `mock` faisaient échouer le contrôle de cohérence
+# des embeddings, qui échantillonne la mémoire la plus récente toutes partitions confondues.
+#
+# La séparation ne doit pas reposer sur la seule discipline de qui lance la commande.
 if (-not $env:DATABASE_URL) {
-    $env:DATABASE_URL = "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db"
+    $env:DATABASE_URL = "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_dev"
 }
-if (-not $env:REDIS_URL) { $env:REDIS_URL = "redis://127.0.0.1:6399/0" }
+if (-not $env:REDIS_URL) { $env:REDIS_URL = "redis://127.0.0.1:6399/1" }
 
 function Invoke-Etape($Titre, [scriptblock]$Bloc) {
     Write-Host "==> $Titre" -ForegroundColor Cyan

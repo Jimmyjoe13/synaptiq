@@ -3,6 +3,23 @@
 - Rend importables la racine du repo et les packages (core, sdk-python).
 - Marque automatiquement `integration` tout test hors de tests/unit/ (ceux-ci
   exigent Postgres + Redis actifs). Les tests unitaires tournent sans infra.
+
+## Sur quelle base cette suite a le droit d'écrire
+
+Les tests d'intégration écrivent ET SUPPRIMENT. Leur cible par défaut est donc
+`synaptiq_dev` / Redis index `1` — jamais `synaptiq_db` / index `0`, qui peuvent
+appartenir à une instance qui sert réellement.
+
+Ce défaut était l'inverse jusqu'au 31/07, dans les cinq modules d'intégration ET dans les
+deux lanceurs (`Makefile`, `scripts/dev.ps1`, qui *forçaient* la variable). Un simple
+`dev.ps1 test` injectait donc les tenants `test_tenant` et `tenant_quantum` dans les
+données réelles. `purge_tenants` en laissait des résidus, et ces résidus ont fini par
+bloquer le démarrage d'un worker : leurs vecteurs `mock` faisaient échouer le contrôle de
+cohérence des embeddings, qui échantillonne la mémoire la plus récente toutes partitions
+confondues.
+
+La leçon tenait déjà dans les notes du projet — « la séparation ne tient qu'à la discipline
+de `purge_tenants` » — mais restait une consigne, pas un défaut sûr.
 """
 import os
 import sys
