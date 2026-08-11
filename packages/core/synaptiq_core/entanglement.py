@@ -22,6 +22,27 @@ souvenir que la recherche hybride n'a pas sorti du tout. Utile pour calibrer les
 Le stockage est dirigé (`nouveau -> voisin`) mais la lecture est bidirectionnelle
 (`fetch_relationships` cherche en source OU cible, et l'adjacence de `propagate_entanglement`
 l'est aussi). **Une seule arête par paire suffit donc** — ne pas la doubler.
+
+## Ce module n'émet QUE des arêtes `entangled_with` (corrigé le 11/08)
+
+Il en émettait une seconde sorte : `supersedes_by`, dès qu'une `coding_best_practices` et une
+`code_error_resolution` dépassaient le seuil de cosinus. C'était le motif « similaire ⇒
+contradictoire » que le lot F5 a précisément banni de `governance.handle_contradictions`, où
+une supersession exige désormais le verdict EXPLICITE d'un juge fail-closed
+(`synaptiq_core.contradiction`). Ici, aucun juge : le cosinus décidait seul d'une destruction
+persistante, et `apply_contradictions` annulait ensuite le souvenir le plus ANCIEN du couple
+— donc la bonne pratique, à chaque `build_context` où les deux remontaient, sans un log
+d'alerte. Le `inverse=True` censé l'éviter n'avait aucun effet : l'interférence ignorait le
+sens de l'arête.
+
+Une bonne pratique et le journal d'erreur qui l'a motivée ne sont d'ailleurs pas
+contradictoires : ils sont **complémentaires**. Les relier par `entangled_with` est le bon
+geste — et le seul utile, puisque `propagate_entanglement` ne lit que ce type d'arête : la
+supersession les excluait de la propagation en plus d'en détruire une.
+
+Toute supersession passe donc par `governance` (juge explicite + trace `link_supersedes`).
+C'est aussi ce que `scripts/rebuild_entanglement.py` fait depuis toujours ; les deux chemins
+sont enfin cohérents.
 """
 import logging
 import os
@@ -30,11 +51,15 @@ from synaptiq_core.embeddings import to_pgvector
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["entangle", "seuil_intrication"]
+__all__ = ["RELATION_INTRICATION", "entangle", "seuil_intrication"]
 
 # Nombre de voisins examinés par souvenir. Volontairement bas : au-delà, le graphe se densifie
 # sans gain de pertinence et la propagation diffuse l'activation vers du bruit plausible.
 VOISINS_EXAMINES = 3
+
+# Le SEUL type d'arête que le tissage produit. Nommé plutôt que répété en littéral : c'est
+# aussi le seul type que `propagate_entanglement` sait lire.
+RELATION_INTRICATION = "entangled_with"
 
 # `LIMIT %s` en paramètre lié plutôt qu'interpolé : la valeur est une constante de ce module,
 # mais une requête sans concaténation ne se relit pas pour vérifier qu'elle est sûre.
@@ -76,11 +101,14 @@ def entangle(cur, tenant_id: str, agent_id: str, new_mem_id, subtype: str | None
     dans la MÊME transaction : une arête sans son souvenir n'a pas de sens, et le contraire
     non plus.
 
-    `subtype` porte la seule règle de typage : une bonne pratique résout l'erreur qu'elle
-    remplace, et réciproquement — cette paire-là produit un `supersedes_by`, pas une simple
-    intrication. Ne jamais rejouer cette règle en MASSE sur des données existantes : la phase
-    d'interférence annule la cible d'un `supersedes_by`, donc une reprise en bloc supprimerait
-    des souvenirs encore valides. C'est un effet d'ÉCRITURE, pas de maintenance.
+    **Toutes les arêtes produites ici sont des `entangled_with`** : le tissage constate une
+    proximité sémantique, il ne prononce aucun jugement de valeur entre deux souvenirs. Une
+    supersession détruit de la donnée à la lecture ; elle exige un verdict explicite et relève
+    de `governance` (cf. l'en-tête du module). Ne pas réintroduire de règle de typage ici.
+
+    `subtype` reste au contrat d'appel (les deux chemins d'écriture le passent) et n'est plus
+    utilisé que pour la journalisation : le garder évite de toucher `apps/` et laisse la porte
+    ouverte à un pré-filtre PAR TYPE — mais un pré-filtre ne serait toujours pas un verdict.
     """
     if threshold is None:
         threshold = seuil_intrication()
@@ -99,17 +127,11 @@ def entangle(cur, tenant_id: str, agent_id: str, new_mem_id, subtype: str | None
         if similarity <= threshold:
             continue
         target_id, target_subtype = rel_row[0], rel_row[2]
-        relation_type = "entangled_with"
-        inverse = False
-        # Une bonne pratique résout/remplace l'erreur associée (et réciproquement).
-        if subtype == 'coding_best_practices' and target_subtype == 'code_error_resolution':
-            relation_type = "supersedes_by"
-        elif subtype == 'code_error_resolution' and target_subtype == 'coding_best_practices':
-            relation_type, inverse = "supersedes_by", True
-
-        pair = (target_id, new_mem_id) if inverse else (new_mem_id, target_id)
-        cur.execute(_SQL_ARETE, (*pair, relation_type, similarity))
+        # Un seul type d'arête, dans un seul sens (nouveau -> voisin) : la lecture est
+        # bidirectionnelle, et aucune supersession ne se décide au cosinus (cf. en-tête).
+        cur.execute(_SQL_ARETE, (new_mem_id, target_id, RELATION_INTRICATION, similarity))
         aretes += 1
-        logger.info("Intrication Q-EM : %s --(%s)--> %s (sim=%.2f)",
-                    pair[0], relation_type, pair[1], similarity)
+        logger.info("Intrication Q-EM : %s (%s) --(%s)--> %s (%s, sim=%.2f)",
+                    new_mem_id, subtype, RELATION_INTRICATION, target_id, target_subtype,
+                    similarity)
     return aretes

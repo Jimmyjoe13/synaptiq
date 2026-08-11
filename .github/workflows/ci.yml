@@ -69,3 +69,26 @@ jobs:
         run: alembic upgrade head
       - name: Tests d'intégration
         run: pytest -m integration -q
+
+  images:
+    name: Images Docker (build + smoke import)
+    runs-on: ubuntu-latest
+    # Depuis le 11/08 : aucun job ne construisait les images, donc aucun ne pouvait
+    # attraper une dépendance manquante. La récidive F19 (ModuleNotFoundError à l'import
+    # de `synaptiq_core` dans l'image MCP) n'a été vue qu'au déploiement manuel — la
+    # seule validation que les images aient jamais eue. Un `docker build` ne suffit pas
+    # (il n'exécute pas le CMD) : le smoke import relance chaque image en remplaçant la
+    # commande, et vérifie que les imports de niveau module passent.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Construire l'image API
+        run: docker build -f apps/api/Dockerfile -t synaptiq-api .
+      - name: Construire l'image Worker
+        run: docker build -f apps/worker/Dockerfile -t synaptiq-worker .
+      - name: Construire l'image MCP
+        run: docker build -f apps/mcp/Dockerfile -t synaptiq-mcp .
+      - name: Smoke import du serveur MCP (récidive F19)
+        run: docker run --rm synaptiq-mcp python -c "import apps.mcp.server"
+      - name: Smoke import du worker
+        run: docker run --rm synaptiq-worker python -c "import apps.worker.worker"
+

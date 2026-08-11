@@ -5,7 +5,10 @@ Usage :
     python scripts/rebuild_entanglement.py --dry-run
     python scripts/rebuild_entanglement.py --agent claude_code_orchestrator
     python scripts/rebuild_entanglement.py --agent mon_agent --threshold 0.62
-    python scripts/rebuild_entanglement.py --all --threshold 0.62
+    python scripts/rebuild_entanglement.py --all --threshold 0.62 --yes
+
+`--all` et `--purge` agissent en masse : ils exigent `--yes`. La base visee vient de
+`DATABASE_URL` (`.env` racine ou environnement) et NON d'un defaut code en dur.
 
 ## Pourquoi ce script est nécessaire, et pas seulement pratique
 
@@ -46,9 +49,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
                                 "packages", "core"))
 from synaptiq_core.entanglement import VOISINS_EXAMINES, seuil_intrication
 
-load_dotenv()
+# `.env` RACINE, comme `main.py` / `worker.py` / `relay.py`. Un `load_dotenv()` nu cherche à
+# partir du répertoire COURANT : lancé depuis `scripts/`, il ne trouvait rien, et le défaut
+# ci-dessous décidait seul de la base visée. Pour un script qui sait faire `--all --purge`,
+# c'est le pire endroit du dépôt où laisser un défaut implicite.
+_RACINE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(_RACINE, ".env"))
+# Défaut sur `synaptiq_dev` : ce dépôt est celui de DÉVELOPPEMENT. `synaptiq_db` est la base
+# de production servie par l'instance `C:\\Users\\jimmy\\synaptiq`.
 DATABASE_URL = os.getenv(
-    "DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db"
+    "DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_dev"
 )
 TENANT = os.getenv("SYNAPTIQ_TENANT", "default")
 
@@ -117,6 +127,15 @@ WHERE r.source_memory_id = s.id AND r.relation_type = 'entangled_with'
 """
 
 
+def _masquer(url: str) -> str:
+    """`postgres://user:pass@hote:port/base` -> `hote:port/base`.
+
+    La base visee doit etre LISIBLE avant toute operation en masse (c'est tout l'enjeu de la
+    separation prod/dev), mais le mot de passe n'a rien a faire dans une sortie console.
+    """
+    return url.rsplit("@", 1)[-1] if "@" in url else url
+
+
 def _afficher_etat(cur, params, titre: str) -> None:
     cur.execute(SQL_ETAT, params)
     lignes = cur.fetchall()
@@ -144,7 +163,25 @@ def main() -> int:
                     help="Supprime les aretes 'entangled_with' existantes AVANT de "
                          "reconstruire. Necessaire pour RESSERRER un graphe, mais detruit "
                          "aussi les aretes posees legitimement a l'ecriture.")
+    ap.add_argument("--yes", action="store_true",
+                    help="Confirme une operation en masse (--all et/ou --purge).")
     args = ap.parse_args()
+
+    # Deux operations irreversibles a l'echelle du tenant : --purge detruit des aretes que
+    # personne ne reconstruira a l'identique, --all touche TOUS les agents de l'instance et
+    # pas seulement celui sur lequel on travaille. Elles exigent donc un accord explicite,
+    # jamais deduit du contexte. `--dry-run` en est dispense : il finit par un rollback.
+    if not args.dry_run and (args.purge or args.all):
+        operations = " + ".join(n for n, actif in (("--all", args.all),
+                                                   ("--purge", args.purge)) if actif)
+        if not args.yes:
+            print(f"Refus : {operations} agit en masse sur le tenant '{TENANT}' de la base\n"
+                  f"  {_masquer(DATABASE_URL)}\n"
+                  "  Relancer avec --dry-run pour inspecter, ou avec --yes pour confirmer.",
+                  file=sys.stderr)
+            return 2
+        print(f"Confirme (--yes) : {operations} sur le tenant '{TENANT}' de la base "
+              f"{_masquer(DATABASE_URL)}")
 
     seuil = args.threshold if args.threshold is not None else seuil_intrication()
     params = {"tenant": TENANT, "agent": args.agent, "seuil": seuil,

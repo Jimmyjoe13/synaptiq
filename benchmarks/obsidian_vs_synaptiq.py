@@ -35,7 +35,9 @@ from synaptiq_core import get_embedder
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://127.0.0.1:8899/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "dummy")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-oss-120b-medium")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db")
+# Défaut sur `synaptiq_dev` : ce dépôt est celui de DÉVELOPPEMENT. `synaptiq_db` est la base
+# de production (cf. `SynaptiQ_separation_prod_dev`).
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_dev")
 
 def _call_llm(prompt: str, system: str = "Tu es un assistant IA précis.") -> str:
     headers = {"Content-Type": "application/json"}

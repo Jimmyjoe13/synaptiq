@@ -78,7 +78,11 @@ class RetrievalConfig:
     entangle_damping: float = 0.5
     entangle_max_hops: int = 2
     redundancy_threshold: float = 0.75
-    recency_halflife_days: float = 90.0
+    # Demi-vie de la décroissance temporelle, en jours. Recalibrée de 90 → 14 le 11/08 :
+    # à 90 jours sur un corpus de 13 jours, la décroissance était inerte (amplitude
+    # 0,89–1,00 mesurée par l'audit) — elle ne triait rien. 14 jours la rend perceptible
+    # sur l'horizon réel d'une mémoire d'agent.
+    recency_halflife_days: float = 14.0
 
 
 class MemoryStore(Protocol):
@@ -162,6 +166,21 @@ def build_context_packet(
     scores_rrf = _scores_de_fusion(lignes, config)
     meilleur_rrf = max(scores_rrf.values()) if scores_rrf else 0.0
 
+    # La réponse à la question ne doit pas pouvoir sortir du paquet sous la pression du
+    # budget (audit 11/08 : le premier du rang fusionné disparaissait, noyé entre treize
+    # sections qui saturent `max_tokens`). Le meilleur candidat est déclaré prioritaire au
+    # collapse : il ne reste exclu que si l'interférence l'a annulé (score 0) ou si le
+    # budget est inférieur à son coût seul. En mode vectoriel pur (pas de fusion), la
+    # priorité est le plus proche voisin.
+    if scores_rrf:
+        # `__getitem__` plutôt que `.get` : la méthode surchargée (avec/sans défaut) ne se
+        # laisse pas passer comme fonction de clé par mypy, et ici les clés existent.
+        priorites = [max(scores_rrf, key=scores_rrf.__getitem__)]
+    elif lignes:
+        priorites = [str(max(lignes, key=lambda r: float(r.get("similarity") or 0.0))["id"])]
+    else:
+        priorites = []
+
     candidates: dict[str, dict] = {}
     for ligne in lignes:
         mem_id = str(ligne["id"])
@@ -216,7 +235,7 @@ def build_context_packet(
     apply_contradictions(candidates, relationships)
     filter_redundancy(candidates, config.redundancy_threshold)
     context_packet, selected_ids, token_count = collapse_by_utility(
-        candidates, max_tokens, registry)
+        candidates, max_tokens, registry, priorites)
 
     if selected_ids:
         store.mark_accessed(selected_ids)

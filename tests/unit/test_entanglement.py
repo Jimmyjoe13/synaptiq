@@ -1,8 +1,13 @@
 """La construction du graphe, testée sans base : le curseur est un double.
 
 `entangle()` n'est qu'une suite d'appels au curseur, donc un faux curseur suffit à verrouiller
-ce qui est réellement subtil : le seuil STRICT, la règle `supersedes_by` et son sens
-d'inversion, et le fait que le seuil soit relu à chaque appel.
+ce qui est réellement subtil : le seuil STRICT, le fait qu'AUCUNE arête destructrice ne sorte
+d'ici, et le fait que le seuil soit relu à chaque appel.
+
+⚠️ Ces tests n'assertaient que la DIRECTION des arêtes, jamais l'issue de la phase
+d'interférence qui les consomme. C'est ce trou-là qui a laissé passer la perte silencieuse
+de bonnes pratiques ; le pendant se trouve dans `test_qem.py`
+(`test_une_bonne_pratique_survit_a_l_erreur_ecrite_apres_elle`).
 
 Le comportement de bout en bout (l'API tisse bien, le flag de collection est honoré) est
 couvert par `tests/test_entanglement_direct_write.py`, qui exige Postgres.
@@ -61,28 +66,41 @@ def test_les_voisins_sous_le_seuil_sont_ignores():
     assert cur.aretes[0][1] == "proche"
 
 
-def test_une_bonne_pratique_supersede_l_erreur_associee():
-    """La seule règle de typage : une bonne pratique remplace l'erreur qu'elle résout."""
-    cur = _CurseurDouble([_voisin("erreur", 0.9, subtype="code_error_resolution")])
-    entangle(cur, "t", "a", "nouvelle_pratique", "coding_best_practices", [0.1] * 8,
-             threshold=0.7)
-    source, cible, relation, _ = cur.aretes[0]
-    assert relation == "supersedes_by"
-    assert (source, cible) == ("nouvelle_pratique", "erreur")
+@pytest.mark.parametrize("sujet, voisin_subtype", [
+    ("coding_best_practices", "code_error_resolution"),
+    ("code_error_resolution", "coding_best_practices"),
+])
+def test_la_paire_pratique_erreur_ne_produit_plus_de_supersession(sujet, voisin_subtype):
+    """RÉGRESSION — le cosinus ne prononce plus aucune supersession, dans AUCUN sens.
 
-
-def test_une_erreur_resolue_est_supersedee_par_la_pratique_existante():
-    """Sens INVERSÉ : c'est la bonne pratique déjà en base qui remplace la nouvelle erreur.
-
-    Si l'arête partait du nouveau souvenir, la phase d'interférence annulerait la bonne
-    pratique — l'inverse de l'intention.
+    Cette paire produisait un `supersedes_by`, donc une destruction à la lecture, décidée
+    par la seule similarité : le motif « similaire ⇒ contradictoire » banni par F5, qui
+    exige le verdict explicite d'un juge fail-closed. Toute supersession relève désormais
+    de `governance`.
     """
-    cur = _CurseurDouble([_voisin("pratique", 0.9, subtype="coding_best_practices")])
-    entangle(cur, "t", "a", "nouvelle_erreur", "code_error_resolution", [0.1] * 8,
-             threshold=0.7)
+    cur = _CurseurDouble([_voisin("voisin", 0.9, subtype=voisin_subtype)])
+    assert entangle(cur, "t", "a", "nouveau", sujet, [0.1] * 8, threshold=0.7) == 1
     source, cible, relation, _ = cur.aretes[0]
-    assert relation == "supersedes_by"
-    assert (source, cible) == ("pratique", "nouvelle_erreur")
+    assert relation == "entangled_with"
+    # Sens unique nouveau -> voisin : la lecture du graphe est bidirectionnelle.
+    assert (source, cible) == ("nouveau", "voisin")
+
+
+def test_aucune_arete_emise_n_est_destructrice():
+    """Verrou de forme : quelle que soit la paire de sous-types, un seul type d'arête sort.
+
+    Un test par paire particulière ne protège de rien — c'est une nouvelle règle de typage
+    qui serait le retour du bug, pas celle-ci en particulier.
+    """
+    from synaptiq_core.entanglement import RELATION_INTRICATION
+
+    sous_types = ["fact", "preference", "interaction", "rule",
+                  "coding_best_practices", "code_error_resolution", "scratch", "libre"]
+    for sujet in sous_types:
+        cur = _CurseurDouble([_voisin(f"v_{cible}", 0.9, subtype=cible) for cible in sous_types])
+        entangle(cur, "t", "a", "nouveau", sujet, [0.1] * 8, threshold=0.7)
+        assert {a[2] for a in cur.aretes} == {RELATION_INTRICATION}
+        assert all(a[0] == "nouveau" for a in cur.aretes)
 
 
 def test_aucun_voisin_aucune_arete():

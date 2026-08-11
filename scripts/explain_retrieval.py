@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.join(ROOT, "packages", "core"))
 load_dotenv(os.path.join(ROOT, ".env"))
 
 DATABASE_URL = os.getenv(
-    "DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db"
+    "DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_dev"
 )
 TENANT = "__explain_bench__"
 AGENT = "bench_agent"
@@ -94,6 +94,9 @@ REQUETE_AVANT = """
 # APRÈS : forme réellement en production (`_fetch_candidates`, apps/api/main.py). Chaque
 # chemin attaque `memories` directement et répète le filtre tenant/agent ; l'ORDER BY porte
 # donc sur la table, et le planificateur peut choisir l'index HNSW.
+# Le plein texte est passé en config 'french' + tsquery en OU pondéré le 11/08 (migration
+# 20260811_fts_french) : les mots vides sont retirés par la normalisation, un seul terme
+# suffit à matcher, et `ts_rank` récompense les souvenirs qui en portent plusieurs.
 REQUETE_APRES = """
     WITH vectoriel AS (
         SELECT id, row_number() OVER (ORDER BY distance) AS rank_vec
@@ -110,7 +113,10 @@ REQUETE_APRES = """
         SELECT id, row_number() OVER (ORDER BY score DESC) AS rank_fts
         FROM (
             SELECT m.id, ts_rank(m.content_tsv, q.query) AS score
-            FROM memories m, websearch_to_tsquery('simple', %(q)s) AS q(query)
+            FROM memories m, (
+                SELECT to_tsquery('french', string_agg(lexeme, ' | ')) AS query
+                FROM unnest(to_tsvector('french', %(q)s))
+            ) AS q
             WHERE m.tenant_id = %(tenant)s AND m.agent_id = %(agent)s
               AND m.type = ANY(%(types)s) AND m.status = 'active'
               AND m.content_tsv @@ q.query

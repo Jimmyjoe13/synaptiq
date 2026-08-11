@@ -23,6 +23,7 @@ d'os.getenv ici, afin de tester chaque phase de manière déterministe.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -136,24 +137,54 @@ def apply_contradictions(
     candidates: dict[str, dict],
     relationships: list[dict],
 ) -> None:
-    """Annule (score=0) la mémoire la plus ANCIENNE d'un couple en contradiction.
+    """Annule (score=0) le souvenir périmé d'un couple en conflit.
 
-    Concerne les relations 'contradicts' et 'supersedes_by'. La comparaison porte
-    sur `created_at` : la plus ancienne des deux voit son score remis à zéro.
+    Deux relations, **deux sémantiques différentes** — c'est la correction du 11/08 :
+
+    - `supersedes_by` est une arête **DIRIGÉE**. Son unique producteur légitime,
+      `governance.link_supersedes`, écrit `nouveau --(supersedes_by)--> ancien` : la SOURCE
+      remplace, la CIBLE est remplacée. C'est donc la **cible** qui est annulée, quel que
+      soit son âge.
+    - `contradicts` n'a pas de producteur automatique et le sens n'y porte aucune
+      convention : deux souvenirs qui se contredisent sont symétriques. On y garde donc
+      l'arbitrage par `created_at` — le plus ANCIEN cède.
+
+    ## Pourquoi ce n'était pas équivalent
+
+    L'ancienne version arbitrait TOUJOURS par `created_at`, en ignorant le sens de l'arête.
+    Sur les arêtes de `governance` le résultat coïncidait par construction (la source est le
+    nouveau souvenir, donc la cible est bien la plus ancienne) : la faute restait invisible.
+    Elle ne l'était plus dès qu'une arête `supersedes_by` partait du souvenir le plus ancien
+    — exactement ce que produisait `entanglement.entangle()` avec son `inverse=True`, qui
+    n'avait donc aucun effet sur l'issue. Résultat : la bonne pratique déjà en base était
+    annulée par le journal d'erreur écrit après elle.
+
+    Lire le sens rend `inverse` opérant — et rend surtout une supersession *explicable* :
+    l'arête dit qui gagne, l'horloge ne fait plus autorité contre elle.
+
+    Une arête dont une extrémité manque au vivier n'annule rien : sans le remplaçant sous les
+    yeux, retirer le remplacé serait une perte sèche.
     """
     for rel in relationships:
-        if rel['relation_type'] in ('contradicts', 'supersedes_by'):
-            src = str(rel['source_memory_id'])
-            tgt = str(rel['target_memory_id'])
-            if src in candidates and tgt in candidates:
-                c_src = candidates[src]
-                c_tgt = candidates[tgt]
-                if c_src['created_at'] < c_tgt['created_at']:
-                    c_src['score'] = 0.0
-                    logger.info(f"Q-EM: Interférence destructive (contradiction) : {src} annulé par {tgt}")
-                else:
-                    c_tgt['score'] = 0.0
-                    logger.info(f"Q-EM: Interférence destructive (contradiction) : {tgt} annulé par {src}")
+        type_relation = rel['relation_type']
+        if type_relation not in ('contradicts', 'supersedes_by'):
+            continue
+        src = str(rel['source_memory_id'])
+        tgt = str(rel['target_memory_id'])
+        if src not in candidates or tgt not in candidates:
+            continue
+
+        if type_relation == 'supersedes_by':
+            # Arête dirigée : la cible est le souvenir remplacé, point.
+            perdant, gagnant = tgt, src
+        elif candidates[src]['created_at'] < candidates[tgt]['created_at']:
+            perdant, gagnant = src, tgt
+        else:
+            perdant, gagnant = tgt, src
+
+        candidates[perdant]['score'] = 0.0
+        logger.info("Q-EM: Interférence destructive (%s) : %s annulé par %s",
+                    type_relation, perdant, gagnant)
 
 
 def filter_redundancy(
@@ -235,8 +266,9 @@ def filter_redundancy(
 # Phase 4 — Mesure : routage + collapse glouton sous budget de tokens
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Les 7 clés du context_packet (contrat stable côté consommateur).
-_PACKET_KEYS = ("facts", "preferences", "episodes", "rules", "best_practices", "errors", "examples")
+# Pas de liste des clés du paquet ici : elle est DÉRIVÉE du registre
+# (`collections.SYSTEM_PACKET_KEYS`). Une seconde liste écrite à la main est exactement le
+# motif interdit par le CLAUDE.md §3 — celui par lequel la taxonomie a déjà divergé.
 
 
 def estimate_tokens(content: str) -> int:
@@ -289,6 +321,7 @@ def collapse_by_utility(
     candidates: dict[str, dict],
     max_tokens: int,
     registry: CollectionRegistry | None = None,
+    priorites: Sequence[str] = (),
 ) -> tuple[dict[str, list], list[str], int]:
     """Collapse glouton : maximise l'utilité/token sous contrainte `max_tokens`.
 
@@ -304,6 +337,18 @@ def collapse_by_utility(
 
     Sans registre, on retombe sur le registre système : sept clés, routage identique à
     l'origine.
+
+    ## `priorites` : la réponse à la question ne sort jamais du paquet (audit 11/08)
+
+    La densité d'utilité par token favorise les souvenirs courts : sous un budget serré,
+    le meilleur candidat du rang fusionné pouvait être éliminé par une série de souvenirs
+    brefs — le paquet répondait alors à côté de la question, sans rien signaler
+    (dégradation invisible, cf. `build_context` vs `retrieve` dans l'audit).
+
+    Les ids listés dans `priorites` sont traités AVANT tous les autres, par score
+    décroissant. Ils ne dérogent à RIEN d'autre : une priorité dont le score a été annulé
+    par l'interférence (contradiction, redondance) reste exclue, et le budget de tokens
+    reste un plafond dur — une priorité plus coûteuse que le budget total n'entre pas.
     """
     from synaptiq_core.collections import REGISTRE_SYSTEME
     registre = registry or REGISTRE_SYSTEME
@@ -323,8 +368,13 @@ def collapse_by_utility(
                 "utility_density": utility_density,
             })
 
-    # Tri par densité d'utilité par token décroissante (stable sur l'ordre d'insertion).
-    collapsed_candidates.sort(key=lambda x: x['utility_density'], reverse=True)
+    # Les priorités d'abord (dans leur ordre), puis densité d'utilité décroissante (stable
+    # sur l'ordre d'insertion). Toute priorité avec score annulé n'est pas dans la liste :
+    # elle a été filtrée juste au-dessus par `score > 0.0`.
+    ordre_priorites = {m_id: i for i, m_id in enumerate(priorites)}
+    collapsed_candidates.sort(
+        key=lambda x: (ordre_priorites.get(x["id"], len(ordre_priorites)),
+                       -x["utility_density"]))
 
     # Sections issues du registre : canoniques puis celles de l'agent. Toujours toutes
     # présentes, y compris vides — un consommateur ne doit pas avoir à tester l'existence

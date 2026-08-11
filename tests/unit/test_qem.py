@@ -156,7 +156,11 @@ def test_contradiction_annule_la_plus_ancienne():
 
 
 def test_supersedes_by_traite_comme_contradiction():
-    """'supersedes_by' déclenche le même filtre que 'contradicts'."""
+    """'supersedes_by' déclenche le même filtre que 'contradicts'.
+
+    Cas PRODUCTION : `governance.link_supersedes` écrit `nouveau --(supersedes_by)--> ancien`.
+    Les arêtes réellement en base sont de cette forme — l'issue ne doit pas bouger.
+    """
     candidates = {
         "OLD": _cand("OLD", created_at=datetime(2026, 7, 9, 8), score=1.0),
         "NEW": _cand("NEW", created_at=datetime(2026, 7, 9, 9), score=1.0),
@@ -168,6 +172,130 @@ def test_supersedes_by_traite_comme_contradiction():
     apply_contradictions(candidates, relationships)
     assert candidates["OLD"]["score"] == 0.0
     assert candidates["NEW"]["score"] == 1.0
+
+
+def test_supersedes_by_annule_la_cible_meme_si_elle_est_la_plus_recente():
+    """RÉGRESSION — `supersedes_by` est DIRIGÉE : c'est la cible qui cède, pas la plus ancienne.
+
+    L'arbitrage se faisait sur `created_at` en ignorant le sens de l'arête. Sur les arêtes de
+    `governance` les deux règles coïncident (la source y est toujours le souvenir récent), ce
+    qui rendait la faute invisible ; elle éclatait dès qu'une arête partait du souvenir le
+    plus ANCIEN — c'était justement le `inverse=True` du tissage, resté sans effet.
+    """
+    candidates = {
+        "ANCIEN_GAGNANT": _cand("ANCIEN_GAGNANT", created_at=datetime(2026, 7, 9, 8), score=1.0),
+        "RECENT_PERDANT": _cand("RECENT_PERDANT", created_at=datetime(2026, 7, 9, 9), score=1.0),
+    }
+    relationships = [
+        {"source_memory_id": "ANCIEN_GAGNANT", "target_memory_id": "RECENT_PERDANT",
+         "relation_type": "supersedes_by", "weight": 1.0},
+    ]
+    apply_contradictions(candidates, relationships)
+    assert candidates["RECENT_PERDANT"]["score"] == 0.0
+    assert candidates["ANCIEN_GAGNANT"]["score"] == 1.0
+
+
+def test_contradicts_reste_symetrique_et_arbitre_par_l_age():
+    """`contradicts` n'a pas de convention de sens : le plus ancien cède, source ou cible.
+
+    Verrouille le pendant unitaire de `tests/test_q_em.py::…_contradiction`, qui insère
+    `ancien --(contradicts)--> recent` et attend l'annulation de l'ancien.
+    """
+    for src, tgt in (("OLD", "NEW"), ("NEW", "OLD")):
+        candidates = {
+            "OLD": _cand("OLD", created_at=datetime(2026, 7, 9, 8), score=1.0),
+            "NEW": _cand("NEW", created_at=datetime(2026, 7, 9, 9), score=1.0),
+        }
+        apply_contradictions(candidates, [
+            {"source_memory_id": src, "target_memory_id": tgt,
+             "relation_type": "contradicts", "weight": 1.0},
+        ])
+        assert candidates["OLD"]["score"] == 0.0, (src, tgt)
+        assert candidates["NEW"]["score"] == 1.0, (src, tgt)
+
+
+# ─── Le bug de perte silencieuse : tissage -> interférence, bout en bout ──────
+
+def _tisser(subtype_nouveau, id_nouveau, voisins):
+    """Rejoue `entangle()` sur un curseur double et rend les arêtes au format `qem`."""
+    from synaptiq_core import entangle
+
+    class _Cur:
+        def __init__(self):
+            self.aretes = []
+
+        def execute(self, sql, params):
+            if "INSERT INTO relationships" in sql:
+                self.aretes.append(params)
+
+        def fetchall(self):
+            return voisins
+
+    cur = _Cur()
+    entangle(cur, "t", "a", id_nouveau, subtype_nouveau, [0.1] * 8, threshold=0.7)
+    return [{"source_memory_id": s, "target_memory_id": c, "relation_type": r, "weight": p}
+            for s, c, r, p in cur.aretes]
+
+
+def _pratique_et_erreur(ordre_ecriture):
+    """Une bonne pratique et le journal d'erreur associé, cosinus 0,74, dans l'ordre donné."""
+    ecrit_en_premier, ecrit_en_second = ordre_ecriture
+    sous_types = {"PRATIQUE": "coding_best_practices", "ERREUR": "code_error_resolution"}
+    candidates = {
+        ecrit_en_premier: _cand(ecrit_en_premier, type="procedural",
+                                subtype=sous_types[ecrit_en_premier],
+                                created_at=datetime(2026, 7, 1), score=0.8, similarity=0.8),
+        ecrit_en_second: _cand(ecrit_en_second, type="procedural",
+                               subtype=sous_types[ecrit_en_second],
+                               created_at=datetime(2026, 8, 1), score=0.8, similarity=0.8),
+    }
+    # Le second souvenir écrit tisse vers le premier, déjà en base.
+    voisins = [(ecrit_en_premier, "procedural", sous_types[ecrit_en_premier], 0.74)]
+    relationships = _tisser(sous_types[ecrit_en_second], ecrit_en_second, voisins)
+    return candidates, relationships
+
+
+def test_une_bonne_pratique_survit_a_l_erreur_ecrite_apres_elle():
+    """LE test qui manquait : l'ISSUE de l'interférence, pas la direction de l'arête.
+
+    Scénario réel — « importer les modules réseau paresseusement sous Windows » (bonne
+    pratique), puis « crash à l'import de socket, corrigé par un import paresseux » (journal
+    d'erreur), cosinus ~0,74. Le tissage posait `pratique --(supersedes_by)--> erreur`, et
+    l'interférence annulait la plus ANCIENNE : la bonne pratique disparaissait du paquet à
+    chaque rappel, sans un log d'alerte.
+
+    Les tests existants ne regardaient que la direction posée en base, jamais qui survivait.
+    """
+    candidates, relationships = _pratique_et_erreur(("PRATIQUE", "ERREUR"))
+    apply_contradictions(candidates, relationships)
+    assert candidates["PRATIQUE"]["score"] == 0.8, "la bonne pratique a été annulée en silence"
+    assert candidates["ERREUR"]["score"] == 0.8, "le journal d'erreur a été annulé en silence"
+
+
+def test_un_journal_d_erreur_survit_a_la_bonne_pratique_ecrite_apres_lui():
+    """L'ordre d'écriture inverse — celui que couvrait `tests/test_q_em.py`.
+
+    Il « passait » pour la mauvaise raison : l'ancienne règle annulait la plus ancienne, donc
+    l'erreur, ce qui *ressemblait* au comportement voulu. Les deux souvenirs sont en réalité
+    complémentaires : l'erreur documente POURQUOI la pratique existe.
+    """
+    candidates, relationships = _pratique_et_erreur(("ERREUR", "PRATIQUE"))
+    apply_contradictions(candidates, relationships)
+    assert candidates["ERREUR"]["score"] == 0.8
+    assert candidates["PRATIQUE"]["score"] == 0.8
+
+
+def test_la_paire_pratique_erreur_se_renforce_au_lieu_de_s_annuler():
+    """Le gain collatéral : l'arête est désormais lisible par la propagation.
+
+    `propagate_entanglement` ne lit QUE `entangled_with` — un `supersedes_by` était donc à la
+    fois destructeur et exclu de la phase 2. La paire s'active maintenant mutuellement.
+    """
+    candidates, relationships = _pratique_et_erreur(("PRATIQUE", "ERREUR"))
+    candidates["PRATIQUE"]["similarity"] = 0.0  # ramenée par le graphe seul
+    candidates["PRATIQUE"]["score"] = 0.0
+    propagate_entanglement(candidates, relationships, damping=0.5, max_hops=1)
+    assert candidates["PRATIQUE"]["score"] > 0.0
 
 
 def test_redondance_annule_le_moins_important():
@@ -353,6 +481,68 @@ def test_collapse_ignore_score_nul():
     packet, selected_ids, _ = collapse_by_utility(candidates, max_tokens=1000)
     assert selected_ids == ["OK"]
     assert "jette" not in packet["facts"]
+
+
+# ─── Priorités : la réponse à la question ne sort pas du paquet (audit 11/08) ─
+
+def test_collapse_priorite_entre_meme_si_sa_densite_est_faible():
+    """RÉGRESSION — la réponse de rang 1 disparaissait sous la pression du budget.
+
+    La densité d'utilité par token favorise les souvenirs courts : une série de faits
+    brefs épuisait le budget avant que le meilleur candidat — long — ne soit examiné.
+    `build_context` répondait alors à côté de la question, sans erreur ni log.
+    """
+    longs = {"TOP": _cand("TOP", content="la reponse " + "mot " * 120, score=0.95)}
+    courts = {f"c{i}": _cand(f"c{i}", content=f"fait bref {i}", score=0.9)
+              for i in range(40)}
+    candidates = {**longs, **courts}
+    packet, selected_ids, _ = collapse_by_utility(
+        candidates, max_tokens=200, priorites=["TOP"])
+    assert "TOP" in selected_ids
+    assert "la reponse " in packet["facts"][0]
+
+
+def test_collapse_priorite_annulee_par_l_interference_reste_exclue():
+    """Une priorité dont l'interférence a annulé le score n'est pas ressuscitée."""
+    candidates = {
+        "TOP": _cand("TOP", content="contredit et annule", score=0.0),
+        "AUTRE": _cand("AUTRE", content="conserve", score=1.0),
+    }
+    _, selected_ids, _ = collapse_by_utility(
+        candidates, max_tokens=1000, priorites=["TOP"])
+    assert "TOP" not in selected_ids
+
+
+def test_collapse_priorite_au_dela_du_budget_reste_exclue():
+    """Le budget reste un plafond dur, même pour la réponse à la question."""
+    candidates = {
+        "GEOANT": _cand("GEOANT", content="pave " + "mot " * 4000, score=1.0),
+    }
+    _, selected_ids, _ = collapse_by_utility(
+        candidates, max_tokens=200, priorites=["GEOANT"])
+    assert selected_ids == []
+
+
+def test_collapse_priorites_suivent_l_ordre_de_la_liste():
+    """Entre priorités, l'ordre des ids est respecté (source du rang fusionné)."""
+    candidates = {
+        "P1": _cand("P1", content="premiere", score=0.5),
+        "P2": _cand("P2", content="deuxieme", score=0.9),
+        "X": _cand("X", content="troisieme", score=0.8),
+    }
+    _, selected_ids, _ = collapse_by_utility(
+        candidates, max_tokens=1000, priorites=["P1", "P2", "X"])
+    assert selected_ids == ["P1", "P2", "X"]
+
+
+def test_collapse_sans_priorites_comportement_inchange():
+    """Non-régression : l'ordre par densité d'utilité est conservé sans priorité."""
+    candidates = {
+        "FAIBLE": _cand("FAIBLE", content="long " + "mot " * 50, score=1.0),
+        "FORTE": _cand("FORTE", content="court", score=0.5),
+    }
+    _, selected_ids, _ = collapse_by_utility(candidates, max_tokens=1000)
+    assert selected_ids == ["FORTE", "FAIBLE"]
 
 
 # ─── Routage correct (helper pur) : type/subtype -> clé du packet ────────────

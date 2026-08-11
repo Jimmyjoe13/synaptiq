@@ -42,7 +42,7 @@ from synaptiq_core import (
 # vit dans le cœur (comme `handle_contradictions`), afin que l'API et le worker voient
 # forcément le MÊME registre — la taxonomie avait déjà divergé une fois entre les deux
 # chemins d'écriture, elle ne doit pas recommencer.
-from synaptiq_core.collections import charger_registre
+from synaptiq_core.collections import SYSTEM_COLLECTIONS, charger_registre
 
 # Orchestration des 4 phases Q-EM (sans SQL ni HTTP : testable en isolation)
 from synaptiq_core.context_builder import RetrievalConfig, build_context_packet
@@ -87,7 +87,7 @@ QEM_ENTANGLE_MAX_HOPS = int(os.getenv("QEM_ENTANGLE_MAX_HOPS", "2"))
 QEM_REDUNDANCY_THRESHOLD = float(os.getenv("QEM_REDUNDANCY_THRESHOLD", "0.75"))
 # Décroissance temporelle : demi-vie (en jours) du score de récence. Une mémoire non
 # ré-accédée voit sa pertinence divisée par 2 tous les N jours. 0 (ou négatif) = désactivé.
-QEM_RECENCY_HALFLIFE_DAYS = float(os.getenv("QEM_RECENCY_HALFLIFE_DAYS", "90"))
+QEM_RECENCY_HALFLIFE_DAYS = float(os.getenv("QEM_RECENCY_HALFLIFE_DAYS", "14"))
 # ─── Recherche hybride (vectoriel + plein texte) ───
 # Le vecteur ramène le « sémantiquement proche », le plein texte les correspondances
 # littérales (noms propres, dates, identifiants). Désactivable pour mesurer son apport.
@@ -454,9 +454,16 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
     rang dans chaque chemin (`rank_vec`, `rank_fts`, NULL quand le chemin ne l'a pas
     trouvée), ce qui permet la fusion RRF côté Python sur des fonctions pures testables.
 
-    `websearch_to_tsquery` est utilisé plutôt que `plainto_tsquery` : il tolère une requête
-    en langage naturel sans lever d'erreur de syntaxe, ce qui est indispensable ici où la
-    requête vient d'un agent et n'est jamais échappée à la main.
+    `websearch_to_tsquery` a été abandonné le 11/08 : il produisait un ET de tous les
+    termes, mots vides compris, sur une config 'simple' qui ne les retire pas — la
+    question « quel port pour le Postgres de SynaptiQ » ne remontait littéralement rien
+    (0/12 sur le banc de l'audit). Le tsquery est désormais un OU PONDÉRÉ de lexèmes :
+    construit depuis `to_tsvector('french', …)`, il est débarrassé des mots vides et
+    normalisé (stemming) ; `to_tsquery('french', 'a | b | c')` matche tout souvenir qui
+    porte AU MOINS un terme, et `ts_rank` classe plus haut ceux qui en portent plusieurs.
+    La question vient d'un agent et n'est jamais échappée à la main, mais il n'y a plus
+    rien à échapper : les lexèmes sortent de la normalisation PostgreSQL elle-même, ils
+    ne peuvent pas transporter de syntaxe de requête.
 
     ⚠️ Chaque chemin attaque `memories` DIRECTEMENT, et le filtre tenant/agent y est répété.
     C'est délibéré et non négociable : la version précédente factorisait ce filtre dans une
@@ -524,7 +531,13 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
             SELECT id, row_number() OVER (ORDER BY score DESC) AS rank_fts
             FROM (
                 SELECT m.id, ts_rank(m.content_tsv, q.query) AS score
-                FROM memories m, websearch_to_tsquery('simple', %s) AS q(query)
+                FROM memories m, (
+                    -- OU pondéré de lexèmes (cf. la note de `_fetch_candidates`) : les
+                    -- mots vides ont déjà été retirés par la config 'french', et un
+                    -- seul terme suffit à matcher.
+                    SELECT to_tsquery('french', string_agg(lexeme, ' | ')) AS query
+                    FROM unnest(to_tsvector('french', %s))
+                ) AS q
                 WHERE m.tenant_id = %s AND m.agent_id = %s AND m.type = ANY(%s) {filtre_col_m}
                   AND m.status = 'active' AND m.content_tsv @@ q.query
                 ORDER BY ts_rank(m.content_tsv, q.query) DESC
@@ -991,6 +1004,38 @@ class MemoryInput(BaseModel):
             raise ValueError(str(e)) from e
         return self
 
+def _charger_registre_isole(cur, tenant: str, agent_id: str):
+    """`charger_registre` encadré par un SAVEPOINT, pour le chemin d'ÉCRITURE.
+
+    `charger_registre` avale volontairement toute erreur SQL et se replie sur les
+    collections système (cf. `synaptiq_core.collections`) : la taxonomie ne doit pas être
+    une dépendance dure de l'écriture. Mais ce repli laisse la transaction psycopg2 en état
+    *aborted*, et PostgreSQL exécute alors le `conn.commit()` suivant comme un ROLLBACK
+    **sans lever la moindre exception**. `POST /v1/memories` répondait donc
+    `201 {"status": "created", "memory_id": …}` pour une ligne qui n'existait pas. Sur une
+    collection sans intrication (`working/scratch`, `episodic/interaction`) aucune requête
+    ne suit, donc rien ne révélait la perte.
+
+    Précondition réaliste : `memory_collections` illisible — typiquement une instance mise
+    à jour par `git pull` sans `alembic upgrade head`.
+
+    Le SAVEPOINT est préféré à un chargement anticipé dans une transaction séparée : il
+    conserve la propriété que le registre lu est celui de la MÊME transaction que
+    l'insertion (donc cohérent avec une collection créée juste avant), et il ferme la
+    classe de panne entière plutôt qu'un seul de ses points d'appel.
+
+    `ROLLBACK TO SAVEPOINT` est inconditionnel : `charger_registre` ne fait que LIRE, donc
+    rien d'utile n'est perdu, et c'est l'une des rares instructions que PostgreSQL accepte
+    encore sur une transaction avortée.
+    """
+    cur.execute("SAVEPOINT synaptiq_registre")
+    try:
+        return charger_registre(cur, tenant, agent_id)
+    finally:
+        cur.execute("ROLLBACK TO SAVEPOINT synaptiq_registre")
+        cur.execute("RELEASE SAVEPOINT synaptiq_registre")
+
+
 def _memoire_existante(cur, tenant: str, agent_id: str, empreinte: str,
                        cle_idempotence: str | None):
     """Cherche une mémoire ACTIVE déjà écrite en direct pour ce contenu (ou cette clé).
@@ -1091,7 +1136,7 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                 # de collections, donc il lui faut la transaction encore ouverte.
                 reponse = _reponse_memoire(
                     memory, str(existant), "duplicate",
-                    charger_registre(cur, tenant, memory.agent_id))
+                    _charger_registre_isole(cur, tenant, memory.agent_id))
                 conn.rollback()      # lecture seule : ne rien laisser en transaction
                 MEMORY_WRITES.labels("duplicate").inc()
                 logger.info("Écriture directe déjà présente : relance traitée en no-op.",
@@ -1146,7 +1191,7 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                                               memory.idempotency_key)
                 reponse = _reponse_memoire(
                     memory, str(gagnante) if gagnante else "", "duplicate",
-                    charger_registre(cur, tenant, memory.agent_id))
+                    _charger_registre_isole(cur, tenant, memory.agent_id))
                 conn.commit()
                 MEMORY_WRITES.labels("duplicate").inc()
                 logger.info("Course d'insertion perdue sur un contenu identique : no-op.",
@@ -1167,7 +1212,9 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             # souvenirs, 0 arête, après des semaines d'usage.
             # Dans la même transaction que l'insertion : une arête sans son souvenir n'a pas
             # de sens, et l'inverse non plus.
-            registre = charger_registre(cur, tenant, memory.agent_id)
+            # Isolé sur un SAVEPOINT : un registre illisible ne doit pas avorter la
+            # transaction qui porte l'INSERT (cf. `_charger_registre_isole`).
+            registre = _charger_registre_isole(cur, tenant, memory.agent_id)
             if registre.entangle_pour(memory.type, memory.subtype):
                 entangle(cur, tenant, memory.agent_id, new_id, memory.subtype, embedding)
 
@@ -1269,7 +1316,13 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
                     SELECT id, row_number() OVER (ORDER BY score DESC) AS rank_fts
                     FROM (
                         SELECT m.id, ts_rank(m.content_tsv, q.query) AS score
-                        FROM memories m, websearch_to_tsquery('simple', %s) AS q(query)
+                        FROM memories m, (
+                            -- OU pondéré de lexèmes, même forme que `_fetch_candidates` :
+                            -- la config 'french' retire les mots vides, un seul terme
+                            -- suffit à matcher, `ts_rank` récompense les multi-hits.
+                            SELECT to_tsquery('french', string_agg(lexeme, ' | ')) AS query
+                            FROM unnest(to_tsvector('french', %s))
+                        ) AS q
                         WHERE m.tenant_id = %s AND m.agent_id = %s {type_filter}
                           AND m.status = 'active' AND m.content_tsv @@ q.query
                         ORDER BY ts_rank(m.content_tsv, q.query) DESC
@@ -1335,6 +1388,12 @@ MAX_COLLECTIONS_PER_AGENT = int(os.getenv("MAX_COLLECTIONS_PER_AGENT", "50"))
 # une collection légitime est plus coûteux que d'en laisser passer une proche — l'agent peut
 # fusionner après coup, mais un refus le laisse sans rayon où ranger.
 COLLECTION_DUP_THRESHOLD = float(os.getenv("COLLECTION_DUP_THRESHOLD", "0.85"))
+
+# Sections canoniques du context_packet, DÉRIVÉES des collections livrées avec le moteur —
+# jamais réécrites à la main (même règle que `taxonomy.VALID_SUBTYPES`, cf. CLAUDE.md §3).
+# Elles sont interdites comme `packet_key` d'une collection d'agent : voir le refus dans
+# `create_collection`.
+CLES_PAQUET_CANONIQUES: frozenset[str] = frozenset(c.packet_key for c in SYSTEM_COLLECTIONS)
 
 # Jours sans écriture au-delà desquels une collection vide est signalée comme dormante.
 # Une collection créée puis jamais utilisée est le premier symptôme d'une taxonomie qui
@@ -1445,6 +1504,7 @@ def create_collection(payload: CollectionInput, auth: AuthContext | None = Depen
       un agent rerouter en silence tout ce qui est déjà rangé sous ce nom ;
     - un doublon exact pour ce même agent ;
     - le dépassement de `MAX_COLLECTIONS_PER_AGENT`.
+    - une `packet_key` CANONIQUE (`rules`, `facts`, `preferences`…), cf. ci-dessous.
     """
     tenant = resolve_tenant(auth)
     require_scope(auth, "write")
@@ -1456,6 +1516,24 @@ def create_collection(payload: CollectionInput, auth: AuthContext | None = Depen
             detail=f"'{payload.name}' est une collection système de la famille "
                    f"'{payload.family}' : elle existe déjà et sert tous les agents. "
                    f"Choisir un autre nom, ou écrire directement dedans.",
+        )
+
+    # Clé de paquet EFFECTIVE : à défaut de `packet_key`, c'est le nom qui la porte (même
+    # expression qu'à l'INSERT plus bas). Contrôler seulement le champ explicite laisserait
+    # passer une collection nommée `rules` — le contrôle `is_canonical` ci-dessus porte sur
+    # le NOM d'une collection (`rule`), pas sur la clé de section (`rules`).
+    cle_paquet = payload.packet_key or payload.name
+    if cle_paquet in CLES_PAQUET_CANONIQUES:
+        # Aucun enjeu d'isolation — c'est le paquet du même agent. L'enjeu est que
+        # `rules` est la rubrique la plus IMPÉRATIVE du prompt système : y greffer une
+        # collection d'agent transforme un contenu mémorisé (donc potentiellement dicté par
+        # un tiers) en consigne structurelle. Une section canonique n'est alimentée que par
+        # la collection système qui la porte.
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{cle_paquet}' est une section canonique du context_packet : une "
+                   f"collection d'agent ne peut pas s'y greffer. Laisser `packet_key` vide "
+                   f"(la collection aura sa propre section) ou en choisir une autre.",
         )
 
     if db_pool is None:
@@ -1737,6 +1815,13 @@ def purge_memories(
       2. `confirm` doit valoir l'identifiant du tenant — un appel involontaire échoue ;
       3. une ligne d'`audit_log` est écrite dans la MÊME transaction que la suppression.
 
+    Quatrième garde-fou (11/08) : le périmètre d'agents de la clé n'était consulté QUE si
+    l'appelant fournissait `agent_id`. Une clé `admin` bornée à un seul agent qui omettait
+    le paramètre tombait donc dans la branche « tout le tenant » et détruisait
+    physiquement la mémoire de tous les autres agents — son périmètre n'ayant jamais été
+    lu. Omettre un filtre ÉLARGISSAIT l'effet : exactement l'inverse de ce qu'une
+    restriction doit faire.
+
     La suppression reste physique et immédiate : c'est un endpoint RGPD, un effacement
     différé ou réversible irait à l'encontre de sa raison d'être.
     """
@@ -1744,6 +1829,18 @@ def purge_memories(
     require_scope(auth, "admin")
     if agent_id:
         resolve_agent(auth, agent_id)
+    elif auth is not None and auth.agent_scope:
+        # Purge globale demandée par une clé qui n'a pas le droit de parler pour tous les
+        # agents. Refusée AVANT le contrôle de `confirm` : c'est une question
+        # d'autorisation, pas d'intention. Le message indique la seule forme d'appel
+        # possible pour cette clé, faute de quoi l'appelant relancerait à l'identique.
+        raise HTTPException(
+            status_code=403,
+            detail="Cette clé API est restreinte aux agents "
+                   f"{', '.join(auth.agent_scope)} : la purge globale du tenant lui est "
+                   "interdite. Préciser ?agent_id=<agent> pour purger un agent de son "
+                   "périmètre.",
+        )
     if confirm != tenant:
         # Le tenant est nommé dans le message : ce n'est pas un secret (l'appelant est déjà
         # authentifié sur ce périmètre), et un message opaque ne ferait que provoquer des

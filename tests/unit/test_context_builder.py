@@ -212,3 +212,48 @@ def test_budget_de_tokens_respecte():
     resultat = _construire(store, max_tokens=2)
     assert resultat["selected_memory_ids"] == ["COURT"]
     assert resultat["token_estimate"] <= 2
+
+
+# ─── La réponse à la question ne sort pas du paquet (audit 11/08) ────────────
+
+def test_le_meilleur_candidat_reste_dans_le_paquet_sous_budget_serre():
+    """RÉGRESSION — le 1er du rang fusionné disparaissait, noyé entre les sections.
+
+    La densité d'utilité par token favorise les souvenirs courts : sous un budget serré,
+    une série de faits brefs épuisait le budget avant que le meilleur candidat (long) ne
+    soit examiné. `build_context` — l'endpoint que le MCP utilise — rappelait alors moins
+    bien que `retrieve`, sans erreur ni log (constat de l'audit : 6/12 vs 9/12).
+    """
+    top = _mem("TOP", contenu="la réponse " + "mot " * 120, similarity=0.95, rank_vec=1)
+    courts = [
+        _mem(f"c{i}", contenu=f"fait bref {i}", similarity=0.1, rank_vec=i + 2)
+        for i in range(40)
+    ]
+    config = RetrievalConfig(hybrid=True, recency_halflife_days=0.0)
+    resultat = _construire(InMemoryStore([top, *courts]), config=config, max_tokens=200)
+    assert "TOP" in resultat["selected_memory_ids"]
+    # Sans la priorité, le budget serait épuisé par les courts avant le candidat long.
+    assert resultat["token_estimate"] <= 200
+
+
+def test_le_meilleur_candidat_annule_reste_exclu():
+    """La priorité ne ressuscite pas une mémoire éliminée par l'interférence.
+
+    Scénario : la réponse de rang 1 a été supersedée par un souvenir plus récent
+    (arête dirigée de `governance`). Le rang fusionné la classe première, mais
+    `apply_contradictions` a annulé son score : la priorité n'y peut rien, et le
+    remplaçant — seule version valide — est sélectionné.
+    """
+    store = InMemoryStore(
+        memoires=[
+            _mem("TOP", similarity=0.95, rank_vec=1),
+            _mem("REMPLACANT", contenu="la version valide", similarity=0.8, rank_vec=2,
+                 embedding=[0.0, 1.0, 0.0], created_at=datetime(2026, 8, 1),
+                 last_accessed_at=datetime(2026, 8, 1)),
+        ],
+        relations=[{"source_memory_id": "REMPLACANT", "target_memory_id": "TOP",
+                    "relation_type": "supersedes_by", "weight": 1.0}],
+    )
+    resultat = _construire(store, config=RetrievalConfig(hybrid=True, recency_halflife_days=0.0))
+    assert "TOP" not in resultat["selected_memory_ids"]
+    assert "REMPLACANT" in resultat["selected_memory_ids"]

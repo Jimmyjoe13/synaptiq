@@ -1,3 +1,9 @@
 fastmcp==2.9.2
+# fastmcp 2.9.2 est incompatible avec pydantic > 2.10 : `Settings` déclare un champ avec
+# `default` ET `default_factory`, que pydantic 2.11+ refuse au moment de la définition de
+# classe. Sans épinglage, `pip install` résolvait la dernière version et l'image MCP
+# mourait à l'import (attrapé par le smoke import du CI le 11/08). Même pin que le
+# requirements.txt racine de l'API.
+pydantic==2.10.4
 requests==2.32.3
 python-dotenv>=1.1.0,<2

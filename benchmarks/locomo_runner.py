@@ -60,7 +60,9 @@ logging.getLogger("synaptiq-core.embeddings").setLevel(logging.WARNING)
 log = logging.getLogger("locomo")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_db")
+# Defaut sur la base de DEVELOPPEMENT : ce harness ingere des milliers de memoires (1011 des
+# 1025 memoires de la base de dev viennent d'ici). `synaptiq_db` est la base de production.
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://synaptiq:synaptiq_password@127.0.0.1:5435/synaptiq_dev")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
