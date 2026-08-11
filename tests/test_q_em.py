@@ -282,7 +282,9 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
         Test de la classification automatique et de l'intrication automatique (Q-EM) :
         1. On simule un log d'erreur de programmation (event) -> classifié en code_error_resolution.
         2. On simule une règle de bonne pratique de programmation proche sémantiquement -> classifiée en coding_best_practices.
-        3. On vérifie qu'une relation d'intrication 'supersedes_by' a été créée automatiquement.
+        3. On vérifie qu'une relation d'intrication 'entangled_with' a été créée automatiquement.
+        (Corrigé le 11/08 : l'ancienne version attendait un 'supersedes_by' — le bug de
+        destruction silencieuse par similarité, supprimé du tissage.)
         """
         from unittest.mock import patch
 
@@ -353,7 +355,13 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             self.assertEqual(bp_mem['type'], 'procedural')
             self.assertEqual(bp_mem['subtype'], 'coding_best_practices')
 
-            # Vérifier que la relation d'intrication 'supersedes_by' a été créée automatiquement !
+            # Vérifier que la relation d'intrication a été créée automatiquement.
+            # CORRIGÉ le 11/08 (audit) : le tissage ne produit plus JAMAIS de
+            # `supersedes_by` — une supersession détruit de la donnée à la lecture et
+            # exige le verdict explicite d'un juge (`governance`), jamais un cosinus.
+            # Une bonne pratique et le journal d'erreur qui l'a motivée sont
+            # COMPLÉMENTAIRES : l'arête les relie en `entangled_with`, et seule la
+            # propagation multi-hop la lit. Voir tests/unit/test_entanglement.py.
             cur.execute(
                 "SELECT source_memory_id, target_memory_id, relation_type FROM relationships WHERE source_memory_id = %s OR target_memory_id = %s;",
                 (err_mem['id'], err_mem['id'])
@@ -361,11 +369,15 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             rels = cur.fetchall()
             self.assertGreater(len(rels), 0, "Aucune relation d'intrication n'a été créée automatiquement !")
 
-            # La bonne pratique (bp_mem) remplace/résout l'erreur (err_mem), donc bp_mem --(supersedes_by)--> err_mem
+            # La bonne pratique et l'erreur sont intriquées (nouveau -> voisin), jamais en supersession.
             rel = rels[0]
-            self.assertEqual(str(rel['source_memory_id']), str(bp_mem['id']))
-            self.assertEqual(str(rel['target_memory_id']), str(err_mem['id']))
-            self.assertEqual(rel['relation_type'], 'supersedes_by')
+            self.assertEqual(rel['relation_type'], 'entangled_with')
+            self.assertTrue(
+                (str(rel['source_memory_id']) == str(bp_mem['id']) and str(rel['target_memory_id']) == str(err_mem['id']))
+                or (str(rel['source_memory_id']) == str(err_mem['id']) and str(rel['target_memory_id']) == str(bp_mem['id'])),
+                "Les deux souvenirs doivent être reliés par entangled_with.",
+            )
+            self.assertNotEqual(rel['relation_type'], 'supersedes_by')
 
             print("[SUCCESS] Classification de code et intrication automatique validées en BD !")
 

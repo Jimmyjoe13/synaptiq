@@ -68,12 +68,17 @@ def test_purge_d_un_agent_hors_perimetre_toujours_refusee():
     assert exc.value.status_code == 403
 
 
-def test_purge_globale_reste_possible_pour_une_cle_sans_perimetre():
+def test_purge_globale_reste_possible_pour_une_cle_sans_perimetre(monkeypatch):
     """Le cas légitime ne doit pas être fermé : clé admin non bornée, purge du tenant.
 
     Elle échoue plus loin (pas de pool en test unitaire) : ce qui compte est que le refus
-    ne soit PAS un 403 de périmètre.
+    ne soit PAS un 403 de périmètre. Le pool est forcé à None : la suite d'intégration,
+    qui tourne dans le même process, en crée un vrai — sans ce forçage l'assertion
+    « pool absent » ne tiendrait pas en run complet.
     """
+    import apps.api.main as main
+
+    monkeypatch.setattr(main, "db_pool", None)
     auth = AuthContext(tenant_id="t", scopes=["admin"], agent_scope=None)
     with pytest.raises(HTTPException) as exc:
         purge_memories(agent_id=None, confirm="t", auth=auth)
@@ -124,9 +129,16 @@ def test_nom_valant_une_cle_canonique_refuse_aussi():
     assert exc.value.status_code == 422
 
 
-def test_packet_key_libre_toujours_acceptee():
+def test_packet_key_libre_toujours_acceptee(monkeypatch):
     """Le cas normal ne doit pas être fermé : plusieurs collections peuvent partager une
-    section, tant qu'elle n'est pas canonique."""
+    section, tant qu'elle n'est pas canonique.
+
+    Pool forcé à None (cf. `test_purge_globale_reste_possible...`) : la suite
+    d'intégration crée un vrai pool dans le même process.
+    """
+    import apps.api.main as main
+
+    monkeypatch.setattr(main, "db_pool", None)
     payload = CollectionInput(agent_id="agentA", name="clients_paca", family="semantic",
                               description="Les clients de la région PACA.",
                               packet_key="clients")
