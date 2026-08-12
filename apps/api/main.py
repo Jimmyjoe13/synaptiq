@@ -1036,6 +1036,56 @@ def _charger_registre_isole(cur, tenant: str, agent_id: str):
         cur.execute("RELEASE SAVEPOINT synaptiq_registre")
 
 
+def _declarer_collection_manquante(cur, tenant: str, agent_id: str,
+                                   famille: str, nom: str) -> None:
+    """Déclare une collection à l'écriture quand l'agent range hors registre.
+
+    Contexte (audit 11/08) : 189 souvenirs étaient rangés dans des collections
+    jamais déclarées. La cause n'est pas le sous-type libre (voulu) mais la FAMILLE —
+    l'unicité porte sur (tenant, agent, name, family), donc `project_state` en
+    `procedural` et en `semantic` sont deux collections distinctes, et la seconde
+    n'avait aucune ligne. Le registre a été rattrapé une fois en base ; sans ce
+    mécanisme, il re-dériverait à la première écriture d'un nouveau sous-type.
+
+    Réglé pour rester silencieux : déclarer est un service rendu à l'agent, jamais une
+    condition d'écriture. L'écriture n'échoue pas ici — au pire la collection manque
+    (comportement d'avant) — et le plafond `MAX_COLLECTIONS_PER_AGENT` est respecté.
+    """
+    if not nom:
+        return
+    registre = _charger_registre_isole(cur, tenant, agent_id)
+    # Déjà couvert par une collection système ou une collection de l'agent.
+    if registre.get(famille, nom) is not None:
+        return
+    if len([c for c in registre.collections if c.created_by == "agent"]) >= MAX_COLLECTIONS_PER_AGENT:
+        logger.warning("Collection non déclarée %s/%s : plafond MAX_COLLECTIONS_PER_AGENT "
+                       "atteint pour %s.", famille, nom, agent_id)
+        return
+    # SAVEPOINT : une défaillance ici ne doit pas avorter la transaction qui porte
+    # l'INSERT de la mémoire (même classe de panne que `_charger_registre_isole`).
+    cur.execute("SAVEPOINT synaptiq_declare")
+    try:
+        cur.execute(
+            """INSERT INTO memory_collections
+               (tenant_id, agent_id, name, family, description, entangle, packet_key, created_by)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, 'agent')
+               ON CONFLICT (tenant_id, agent_id, name, family)
+               WHERE created_by = 'agent' DO NOTHING""",
+            (tenant, agent_id, nom, famille,
+             f"Rayon {nom} (famille {famille}) — déclaré automatiquement à l'écriture.",
+             famille in ("semantic", "procedural"), nom),
+        )
+        if cur.rowcount:
+            logger.info("Collection auto-déclarée à l'écriture : %s/%s (agent %s).",
+                        famille, nom, agent_id)
+    except Exception:
+        cur.execute("ROLLBACK TO SAVEPOINT synaptiq_declare")
+        logger.warning("Auto-déclaration impossible (%s/%s) : l'écriture continue sans "
+                       "collection déclarée.", famille, nom, exc_info=True)
+    finally:
+        cur.execute("RELEASE SAVEPOINT synaptiq_declare")
+
+
 def _memoire_existante(cur, tenant: str, agent_id: str, empreinte: str,
                        cle_idempotence: str | None):
     """Cherche une mémoire ACTIVE déjà écrite en direct pour ce contenu (ou cette clé).
@@ -1203,6 +1253,12 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             # Traçabilité : relier la nouvelle mémoire aux préférences qu'elle remplace.
             if superseded:
                 link_supersedes(cur, new_id, superseded)
+
+            # Registre : déclarer la collection si l'agent range hors registre (audit
+            # 11/08 — les rayons fantômes ne doivent pas re-dériver après le backfill).
+            # AVANT le chargement ci-dessous, pour que l'intrication lise le flag déclaré.
+            _declarer_collection_manquante(cur, tenant, memory.agent_id,
+                                           memory.type, memory.subtype)
 
             # ── Graphe d'intrication ──────────────────────────────────────────────────────
             # Tissé ICI depuis le 01/08. Auparavant `_entangle` n'existait que dans le worker,

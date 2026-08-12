@@ -24,6 +24,7 @@ from apps.api.main import (
     AuthContext,
     CollectionInput,
     _charger_registre_isole,
+    _declarer_collection_manquante,
     create_collection,
     purge_memories,
 )
@@ -253,3 +254,81 @@ def test_les_deux_drapeaux_ensemble_sont_refuses(capsys):
     with pytest.raises(SystemExit):
         _perimetre(["--name", "k", "--agents", "agentA", "--all-agents"])
     assert "s'excluent" in capsys.readouterr().err
+
+
+# ─── 5. Une collection manquante est déclarée à l'écriture (audit 11/08) ─────
+
+class CurseurRegistre:
+    """Curseur double : sert le registre à `charger_registre`, observe les INSERT.
+
+    Lignes au format POSITIONNEL attendu par `charger_registre` :
+    (name, family, packet_key, description, entangle, created_by).
+    """
+
+    def __init__(self, lignes_registre):
+        self.lignes_registre = lignes_registre
+        self.rowcount = 0
+        self.inserts: list[tuple] = []
+
+    def execute(self, sql, params=None):
+        debut = sql.strip().split("\n")[0]
+        if "SELECT name, family" in debut:
+            return
+        if "INSERT INTO memory_collections" in debut:
+            self.inserts.append(params)
+            self.rowcount = 1
+        else:
+            self.rowcount = 0
+
+    def fetchall(self):
+        return list(self.lignes_registre)
+
+
+def test_declaration_auto_quand_rayon_inconnu():
+    """Un sous-type libre sans ligne au registre se déclare lui-même à l'écriture."""
+    cur = CurseurRegistre([])
+    _declarer_collection_manquante(cur, "t", "agentA", "semantic", "clients_paca")
+    assert len(cur.inserts) == 1
+    tenant, agent, nom, famille, description, entangle, packet_key = cur.inserts[0]
+    assert (tenant, agent, nom, famille) == ("t", "agentA", "clients_paca", "semantic")
+    assert entangle is True                    # famille structurante
+    assert packet_key == "clients_paca"
+    assert "déclaré automatiquement" in description
+
+
+def test_declaration_auto_saute_si_collection_systeme():
+    """`rule`/`procedural` est couvert par la collection système : rien à déclarer."""
+    cur = CurseurRegistre([("rule", "procedural", "rules", "desc", True, "system")])
+    _declarer_collection_manquante(cur, "t", "agentA", "procedural", "rule")
+    assert cur.inserts == []
+
+
+def test_declaration_auto_saute_si_deja_declaree_par_l_agent():
+    """Le rayon existe déjà pour cet agent : pas de doublon."""
+    cur = CurseurRegistre([("clients_paca", "semantic", "clients_paca", "desc", True, "agent")])
+    _declarer_collection_manquante(cur, "t", "agentA", "semantic", "clients_paca")
+    assert cur.inserts == []
+
+
+def test_declaration_auto_respecte_le_plafond(monkeypatch):
+    """`MAX_COLLECTIONS_PER_AGENT` est un plafond dur, même à l'écriture."""
+    import apps.api.main as main
+
+    monkeypatch.setattr(main, "MAX_COLLECTIONS_PER_AGENT", 3)
+    lignes = [(f"c{i}", "semantic", f"c{i}", "desc", True, "agent") for i in range(3)]
+    cur = CurseurRegistre(lignes)
+    _declarer_collection_manquante(cur, "t", "agentA", "semantic", "clients_paca")
+    assert cur.inserts == []
+
+
+def test_declaration_auto_sans_soustype_ignoree():
+    cur = CurseurRegistre([])
+    _declarer_collection_manquante(cur, "t", "agentA", "semantic", None)
+    assert cur.inserts == []
+
+
+def test_declaration_auto_entangle_faux_pour_episodic():
+    """`episodic`/`working` ne tissent pas : la déclaration porte le flag à False."""
+    cur = CurseurRegistre([])
+    _declarer_collection_manquante(cur, "t", "agentA", "episodic", "session_log")
+    assert cur.inserts[0][5] is False
