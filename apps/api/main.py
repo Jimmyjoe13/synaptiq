@@ -664,14 +664,23 @@ class PostgresMemoryStore:
         return [self._normaliser(ligne) for ligne in lignes]
 
     def fetch_relationships(self, memory_ids: list[str]) -> list[dict]:
+        # UNION ALL au lieu d'OR : PostgreSQL utilise les index efficacement.
+        # Avec OR, le planner fait souvent un scan séquentiel. UNION ALL permet
+        # d'utiliser idx_relationships_source_type et idx_relationships_target.
+        # La condition `source_memory_id <> ALL(%s)` évite les doublons quand une
+        # arête a ses deux extrémités dans la liste.
         self._cur.execute(
             """
             SELECT source_memory_id, target_memory_id, relation_type, weight
             FROM relationships
             WHERE source_memory_id = ANY(%s::uuid[])
-               OR target_memory_id = ANY(%s::uuid[]);
+            UNION ALL
+            SELECT source_memory_id, target_memory_id, relation_type, weight
+            FROM relationships
+            WHERE target_memory_id = ANY(%s::uuid[])
+              AND source_memory_id <> ALL(%s::uuid[]);
             """,
-            (memory_ids, memory_ids),
+            (memory_ids, memory_ids, memory_ids),
         )
         return self._cur.fetchall()
 

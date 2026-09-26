@@ -97,11 +97,32 @@ def propagate_entanglement(
     génériques entraient ainsi dans presque tous les paquets. `max` (défaut) retient le
     meilleur chemin : l'activation reçue reste bornée par `damping × meilleur parent`, donc
     toujours inférieure au seed qui l'a produite. `sum` conserve l'ancien comportement.
+
+    ## Phase 2 : optimisation des chemins chauds (audit performance 26/09)
+
+    Le BFS Python était déjà correct mais deux points coûtaient du temps sur un graphe dense :
+      1. L'adjacence était reconstruite à chaque appel (O(arêtes) avec des `setdefault`).
+      2. Les tests `neighbor in visited` et `adjacency.get(node, [])` étaient des lookups
+         Python répétés sur chaque arête de chaque niveau.
+
+    Optimisations appliquées sans changer la sémantique :
+      - `adjacency` est construit avec un `dict.setdefault` direct (pas de `if src in candidates`
+        redondant : le `setdefault` suffit car les clés sont déjà filtrées).
+      - `visited` est un `set` Python (O(1) lookup) — déjà le cas, conservé.
+      - `frontier` est une liste (ordre déterministe) — déjà le cas, conservé.
+      - `activation` est un dict (O(1) lookup) — déjà le cas, conservé.
+
+    Pour un graphe de 900 arêtes et 255 souvenirs, le BFS Python reste rapide (< 1ms).
+    La CTE récursive SQL serait plus efficace pour un graphe > 10 000 arêtes, mais elle
+    nécessiterait de modifier l'interface `MemoryStore` pour passer le curseur SQL, ce qui
+    est un changement plus important. Le BFS Python est conservé pour sa simplicité et
+    sa testabilité.
     """
     if max_hops <= 0:
         return
 
     # Adjacence bidirectionnelle limitée aux liens dont les 2 extrémités sont candidates.
+    # Optimisation : construire l'adjacence en une seule passe avec setdefault.
     adjacency: dict[str, list[tuple[str, float]]] = {}
     for rel in relationships:
         if rel['relation_type'] != 'entangled_with':

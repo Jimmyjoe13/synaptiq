@@ -79,6 +79,14 @@ _SQL_ARETE = """
     ON CONFLICT (source_memory_id, target_memory_id) DO NOTHING;
 """
 
+# Version batch pour execute_values : un seul aller-retour SQL pour tous les voisins.
+# `%s` dans le template est remplacé par execute_values avec les tuples de valeurs.
+_SQL_ARETE_BATCH = """
+    INSERT INTO relationships (source_memory_id, target_memory_id, relation_type, weight)
+    VALUES %s
+    ON CONFLICT (source_memory_id, target_memory_id) DO NOTHING;
+"""
+
 
 def seuil_intrication() -> float:
     """Seuil de similarité au-delà duquel deux souvenirs sont intriqués.
@@ -134,16 +142,29 @@ def entangle(cur, tenant_id: str, agent_id: str, new_mem_id, subtype: str | None
                  VOISINS_EXAMINES))
 
     aretes = 0
+    voisins = []
     for rel_row in cur.fetchall():
         similarity = float(rel_row[3] or 0.0)
         if similarity <= threshold:
             continue
         target_id, target_subtype = rel_row[0], rel_row[2]
-        # Un seul type d'arête, dans un seul sens (nouveau -> voisin) : la lecture est
-        # bidirectionnelle, et aucune supersession ne se décide au cosinus (cf. en-tête).
-        cur.execute(_SQL_ARETE, (new_mem_id, target_id, RELATION_INTRICATION, similarity))
-        aretes += 1
+        voisins.append((new_mem_id, target_id, RELATION_INTRICATION, similarity))
         logger.info("Intrication Q-EM : %s (%s) --(%s)--> %s (%s, sim=%.2f)",
                     new_mem_id, subtype, RELATION_INTRICATION, target_id, target_subtype,
                     similarity)
+
+    # Batch INSERT avec execute_values : un seul aller-retour SQL pour tous les voisins.
+    # Avec INSERTs séquentiels, chaque voisin coûtait un round-trip réseau + parsing.
+    # Les curseurs de test (_CurseurDouble) n'ont pas d'attribut `connection` :
+    # on retombe sur des INSERTs séquentiels dans ce cas.
+    if voisins:
+        try:
+            from psycopg2.extras import execute_values
+            execute_values(cur, _SQL_ARETE_BATCH, voisins)
+        except AttributeError:
+            # Curseur de test ou wrapper sans `connection` : INSERTs séquentiels.
+            for voisin in voisins:
+                cur.execute(_SQL_ARETE, voisin)
+        aretes = len(voisins)
+
     return aretes
