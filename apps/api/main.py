@@ -158,11 +158,20 @@ def get_conn():
     Remplace l'ancienne connexion globale unique (non thread-safe) : chaque
     requête obtient sa propre connexion, évitant les conditions de course sous
     charge (FastAPI sert les routes sync dans un threadpool).
+
+    Paramètres HNSW appliqués à chaque session :
+    - `ef_search = 150` : le défaut (40) ne donne qu'un recall@10 d'environ 50%.
+      100-200 est la plage recommandée pour 95%+ de recall (benchmarks pgvector).
+    - `iterative_scan = relaxed_order` : permet à pgvector de continuer le scan
+      après filtrage, améliorant la latence des requêtes filtrées de 5-9x.
     """
     if db_pool is None:
         raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
     conn = db_pool.getconn()
     try:
+        with conn.cursor() as cur:
+            cur.execute("SET hnsw.ef_search = %s", (os.getenv("HNSW_EF_SEARCH", "150"),))
+            cur.execute("SET hnsw.iterative_scan = %s", (os.getenv("HNSW_ITERATIVE_SCAN", "relaxed_order"),))
         yield conn
     finally:
         db_pool.putconn(conn)
@@ -984,6 +993,34 @@ def capture_event(event: EventInput, auth: AuthContext | None = Depends(get_auth
         logger.error("Erreur lors de la capture de l'événement.", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
 
+# ─── Cache Redis pour /context/build ─────────────────────────────────────────
+# Les requêtes d'un agent sont souvent répétées (même question, même contexte).
+# Le cache évite de refaire tout le calcul Q-EM (recherche hybride + intrication +
+# interférence + collapse) pour une requête identique dans la fenêtre TTL.
+#
+# Clé : `ctx_cache:{tenant}:{agent}:{hash(query + memory_types + max_tokens + project)}`
+# TTL : 60s (défaut, configurable via CONTEXT_CACHE_TTL)
+# Sérialisation : JSON (le résultat est déjà un dict sérialisable)
+#
+# Le cache est invalidé automatiquement par le TTL. Une invalidation proactive
+# (purge à l'écriture) serait plus complexe et le TTL court suffit pour un usage
+# d'agent où les mémoires changent peu entre deux requêtes rapprochées.
+CONTEXT_CACHE_TTL = int(os.getenv("CONTEXT_CACHE_TTL", "60"))
+CONTEXT_CACHE_ENABLED = os.getenv("CONTEXT_CACHE_ENABLED", "true").lower() in ("1", "true", "yes")
+CONTEXT_CACHE_HITS = Counter("synaptiq_context_cache_total", "Context build cache", ["outcome"])
+
+
+def _context_cache_key(tenant: str, agent_id: str, request: ContextRequest) -> str:
+    """Clé de cache unique pour une requête de contexte.
+
+    Inclut tous les paramètres qui influencent le résultat : query, memory_types,
+    max_tokens, project, collections, include_global.
+    """
+    key_data = f"{request.query}|{','.join(request.constraints.memory_types)}|{request.constraints.max_tokens}|{request.constraints.project}|{','.join(request.constraints.collections or [])}|{request.constraints.include_global}"
+    key_hash = hashlib.sha256(key_data.encode("utf-8")).hexdigest()[:16]
+    return f"ctx_cache:{tenant}:{agent_id}:{key_hash}"
+
+
 @v1_router.post("/context/build")
 def build_context(request: ContextRequest, auth: AuthContext | None = Depends(get_auth)):
     """
@@ -996,6 +1033,9 @@ def build_context(request: ContextRequest, auth: AuthContext | None = Depends(ge
 
     L'orchestration des 4 phases vit dans `synaptiq_core.context_builder` : ce handler ne
     fait plus que resoudre le perimetre, ouvrir une transaction et fournir un magasin.
+
+    Cache Redis : les requêtes identiques dans la fenêtre TTL (60s par défaut) sont
+    servies depuis le cache, évitant de refaire tout le calcul Q-EM.
     """
     tenant = resolve_tenant(auth)
     require_scope(auth, "read")
@@ -1011,6 +1051,23 @@ def build_context(request: ContextRequest, auth: AuthContext | None = Depends(ge
     set_trace_id(trace_id)
     if db_pool is None:
         raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialise")
+
+    # ── Cache Redis ──
+    cache_key = _context_cache_key(tenant, request.agent_id, request)
+    if CONTEXT_CACHE_ENABLED and redis_client is not None:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                CONTEXT_CACHE_HITS.labels("hit").inc()
+                resultat = json.loads(cached)
+                # La trace_id doit rester unique par requête, même en cas de cache hit.
+                # Elle sert à corréler les logs à une requête spécifique.
+                resultat["trace_id"] = trace_id
+                logger.info("Cache hit pour %s (trace=%s).", cache_key, trace_id)
+                return resultat
+        except Exception:
+            logger.warning("Cache Redis indisponible pour la lecture.", exc_info=True)
+
     conn = db_pool.getconn()
     try:
         query_vector = get_embedder().embed_one(request.query)
@@ -1037,6 +1094,13 @@ def build_context(request: ContextRequest, auth: AuthContext | None = Depends(ge
             )
             # `mark_accessed` a ecrit dans la transaction : la valider.
             conn.commit()
+
+        # ── Mise en cache ──
+        if CONTEXT_CACHE_ENABLED and redis_client is not None:
+            try:
+                redis_client.setex(cache_key, CONTEXT_CACHE_TTL, json.dumps(resultat, default=str))
+            except Exception:
+                logger.warning("Cache Redis indisponible pour l'écriture.", exc_info=True)
 
         CONTEXT_BUILDS.labels("success" if resultat["selected_memory_ids"] else "empty").inc()
         return resultat

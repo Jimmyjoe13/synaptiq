@@ -12,6 +12,10 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-synaptiq}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-synaptiq_password}
       POSTGRES_DB: ${POSTGRES_DB:-synaptiq_db}
+      # Paramètres HNSW : ef_search=150 (défaut 40, recall ~50% → 95%+)
+      # iterative_scan=relaxed_order (latence requêtes filtrées -5 à -9x)
+      HNSW_EF_SEARCH: ${HNSW_EF_SEARCH:-150}
+      HNSW_ITERATIVE_SCAN: ${HNSW_ITERATIVE_SCAN:-relaxed_order}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
