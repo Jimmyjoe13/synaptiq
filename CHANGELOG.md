@@ -13,6 +13,33 @@
 >   OpenRouter) et `a0b844b`. Le journal avait ces trous avant les tags ; les combler
 >   a posteriori aurait demande d'inventer des notes de version.
 
+## Unreleased — famille `reflective` : ce que l'agent pense (lot C du 26/09)
+
+Decision de Jimmy du 26/09 : un compartiment pour ce que l'agent pense de l'utilisateur et
+des humains. Ce sont des CROYANCES, pas des faits, d'ou une cinquieme famille cognitive
+(un comportement du moteur) plutot que deux collections de `semantic`. L'invariant
+« familles fermees » est rouvert pour le moteur ; il reste ferme aux agents (aucune
+collection d'agent possible dans `reflective`).
+
+- Collections systeme `user_model` (l'utilisateur) et `human_insights` (les humains, les
+  tiers) ; migration `20260927_reflective_family`. Le paquet porte desormais **9 sections
+  canoniques** (7 + 2), toujours presentes meme vides ; `PACKET_VIDE` derive de
+  `SYSTEM_PACKET_KEYS`.
+- Comportement : pas de decroissance temporelle, score x confiance, hors graphe
+  d'intrication, quota `QEM_REFLECTIVE_MAX_SHARE` (15 % du budget), rendu
+  « (hypothese, confiance x) … », jamais comme un fait. Incluse par defaut dans
+  `context/build`.
+- `synaptiq_core.belief_guard` : refus des inferences sensibles (sante, politique,
+  religion, orientation, origine, syndicat — lexique FR/EN), confiance plafonnee a 0,9,
+  indices (`evidence`) obligatoires au-dela de 0,5. Les tiers nommes sont autorises.
+- Revision par `replaces` (l'ancienne croyance est archivee + arete `supersedes_by`).
+- `GET /v1/beliefs` et `POST /v1/beliefs/{id}/contest` : l'utilisateur voit tout ce que
+  l'agent pense de lui et peut le contester ; une croyance contestee (`status='contested'`)
+  ne peut pas etre reecrite a l'identique (409). Contestation tracee dans `audit_log`
+  (longueur du motif seulement).
+- Le worker n'extrait jamais de croyance (`FAMILLES_EXTRACTIBLES`).
+- MCP : `note_belief`, `list_beliefs`, `contest_belief`. SDK Python et TS : idem.
+
 ## Unreleased — dimension PROJET (lot B du 26/09)
 
 Un agent generaliste melait tous ses projets dans une seule partition (`provenance` vide sur

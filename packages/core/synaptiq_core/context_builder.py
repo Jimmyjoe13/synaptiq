@@ -27,7 +27,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from synaptiq_core.collections import CollectionRegistry
+from synaptiq_core.collections import FAMILLE_REFLEXIVE, SYSTEM_PACKET_KEYS, CollectionRegistry
 from synaptiq_core.qem import (
     apply_contradictions,
     collapse_by_utility,
@@ -40,11 +40,11 @@ from synaptiq_core.retrieval import DEFAULT_RRF_K, reciprocal_rank_fusion
 
 logger = logging.getLogger("synaptiq-core.context")
 
-# Les 7 clés canoniques, pour la réponse vide en l'absence de registre (contrat stable).
-# Conservé comme constante : plusieurs tests et intégrations s'y réfèrent.
-PACKET_VIDE: dict[str, list[str]] = {
-    "facts": [], "preferences": [], "episodes": [],
-    "rules": [], "best_practices": [], "errors": [], "examples": []}
+# Les clés canoniques, pour la réponse vide en l'absence de registre (contrat stable).
+# Conservé comme constante : plusieurs tests et intégrations s'y réfèrent. DÉRIVÉ de
+# `SYSTEM_PACKET_KEYS` (9 clés depuis le 26/09) : une seconde liste écrite à la main avait
+# déjà divergé une fois, cf. CLAUDE.md §3.
+PACKET_VIDE: dict[str, list[str]] = {cle: [] for cle in SYSTEM_PACKET_KEYS}
 
 
 def packet_vide(registry: CollectionRegistry | None = None) -> dict[str, list[str]]:
@@ -83,6 +83,8 @@ class RetrievalConfig:
     # Collapse (cf. `qem.collapse_by_utility`) : meilleurs admis d'office, exposant β.
     collapse_top_k: int = 3
     density_exponent: float = 0.5
+    # Part max du budget pour les croyances (famille `reflective`, lot C).
+    reflective_max_share: float = 0.15
     # Demi-vie de la décroissance temporelle, en jours. Recalibrée de 90 → 14 le 11/08 :
     # à 90 jours sur un corpus de 13 jours, la décroissance était inerte (amplitude
     # 0,89–1,00 mesurée par l'audit) — elle ne triait rien. 14 jours la rend perceptible
@@ -198,8 +200,11 @@ def build_context_packet(
     for ligne in lignes:
         mem_id = str(ligne["id"])
         similarite = max(0.0, float(ligne.get("similarity") or 0.0))
-        recency_factor = compute_recency_factor(ligne.get("age_seconds"),
-                                                config.recency_halflife_days)
+        croyance = ligne.get("type") == FAMILLE_REFLEXIVE
+        # Une croyance ne s'use pas avec le temps : elle se RÉVISE (remplacement) ou se
+        # conteste. La décroissance la ferait disparaître sans que rien ne l'ait infirmée.
+        recency_factor = 1.0 if croyance else compute_recency_factor(
+            ligne.get("age_seconds"), config.recency_halflife_days)
         # Pertinence de départ. En hybride, elle vient du rang FUSIONNÉ (normalisé sur le
         # meilleur candidat) et non du seul cosinus : sans cela, un souvenir trouvé
         # uniquement par le plein texte entrerait avec un score faible et serait éliminé par
@@ -208,8 +213,11 @@ def build_context_packet(
             pertinence = scores_rrf[mem_id] / meilleur_rrf
         else:
             pertinence = similarite
-        candidates[mem_id] = _candidat_depuis_ligne(
-            ligne, initial_score(pertinence, recency_factor), recency_factor)
+        score = initial_score(pertinence, recency_factor)
+        if croyance:
+            # Une hypothèse peu assurée ne doit pas passer devant un fait aussi pertinent.
+            score *= float(ligne.get("confidence") or 0.0)
+        candidates[mem_id] = _candidat_depuis_ligne(ligne, score, recency_factor)
 
     if not candidates:
         return {
@@ -252,7 +260,8 @@ def build_context_packet(
                       journal=annulations)
     context_packet, selected_ids, token_count = collapse_by_utility(
         candidates, max_tokens, registry, priorites,
-        top_k=config.collapse_top_k, density_exponent=config.density_exponent)
+        top_k=config.collapse_top_k, density_exponent=config.density_exponent,
+        reflective_max_share=config.reflective_max_share)
 
     if selected_ids and record_access:
         store.mark_accessed(selected_ids)

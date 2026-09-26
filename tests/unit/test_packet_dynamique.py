@@ -59,7 +59,7 @@ def test_une_collection_declaree_ouvre_sa_propre_section():
 
     assert packet["clients_paca"] == ["Nana couvre Marseille"]
     assert packet["facts"] == []          # ne tombe plus dans le fourre-tout
-    assert tuple(packet.keys())[:7] == SYSTEM_PACKET_KEYS
+    assert tuple(packet.keys())[:len(SYSTEM_PACKET_KEYS)] == SYSTEM_PACKET_KEYS
 
 
 def test_une_collection_declaree_mais_vide_apparait_quand_meme():

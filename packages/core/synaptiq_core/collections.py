@@ -50,9 +50,25 @@ from typing import Protocol
 
 logger = logging.getLogger("synaptiq-core.collections")
 
-# Les quatre familles cognitives. Fermées, et c'est le point : chacune porte un
-# comportement du moteur, pas un thème.
-FAMILIES: tuple[str, ...] = ("semantic", "episodic", "procedural", "working")
+# Les familles cognitives. Fermées AUX AGENTS, et c'est le point : chacune porte un
+# comportement du moteur, pas un thème. Seul le moteur en ajoute une, quand un comportement
+# nouveau le justifie.
+#
+# `reflective` (26/09, décision de Jimmy) : ce que l'agent PENSE — de l'utilisateur, des
+# humains en général. Ce ne sont pas des faits mais des CROYANCES : chacune porte une
+# confiance, s'appuie sur des indices, se révise par remplacement plutôt que par
+# accumulation, ne décroît pas avec le temps, et n'est jamais présentée au modèle comme un
+# fait (« l'agent pense que… »). Cf. `belief_guard` et `qem.format_entry`.
+FAMILIES: tuple[str, ...] = ("semantic", "episodic", "procedural", "working", "reflective")
+
+# Familles qu'un LLM d'EXTRACTION (worker) a le droit de produire. Une croyance ne s'extrait
+# pas d'un tour de dialogue : elle est formulée délibérément par l'agent (`note_belief`),
+# passe par le garde-fou, et reste contestable. Un extracteur qui hallucinerait
+# `reflective` retombe donc sur `semantic`, comme toute famille inconnue.
+FAMILLES_EXTRACTIBLES: tuple[str, ...] = ("semantic", "episodic", "procedural", "working")
+
+# Famille des croyances : nommée ici pour que le moteur ne la répète pas en littéral.
+FAMILLE_REFLEXIVE = "reflective"
 
 # Section du context_packet servie par défaut pour une collection LIBRE de cette famille.
 # Reproduit exactement l'ancien comportement de `route_memory` sur un sous-type inconnu :
@@ -62,6 +78,7 @@ FAMILY_FALLBACK_KEY: dict[str, str] = {
     "episodic": "episodes",
     "procedural": "rules",
     "working": "examples",
+    "reflective": "user_model",
 }
 
 # Dernier recours, pour une famille elle-même inconnue (donnée corrompue, ou écrite par une
@@ -126,12 +143,27 @@ SYSTEM_COLLECTIONS: tuple[Collection, ...] = (
                description="Erreurs rencontrees et leur resolution."),
     Collection("scratch", "working", "examples", created_by="system", entangle=False,
                description="Memoire de travail volatile, exemples ponctuels."),
+    # Croyances (famille `reflective`). Hors graphe : une hypothèse ne doit pas propager
+    # d'activation vers des faits, ni en recevoir — elle entrerait dans le paquet par
+    # simple voisinage, sans avoir été jugée pertinente pour la question.
+    Collection("user_model", "reflective", "user_model", created_by="system", entangle=False,
+               description="Ce que l'agent pense de l'utilisateur : hypotheses sur sa facon "
+                           "de travailler, ses attentes, ses reactions (avec confiance)."),
+    Collection("human_insights", "reflective", "human_insights", created_by="system",
+               entangle=False,
+               description="Reflexions de l'agent sur les humains en general et sur les "
+                           "personnes qu'il cotoie (avec confiance)."),
 )
 
 # Ordre des sections canoniques dans le paquet. Le lot 2 y ajoutera les clés des
 # collections déclarées par l'agent ; en attendant, ce tuple est le contrat public.
+#
+# 26/09 : 7 -> 9 sections, avec les deux sections de croyances (`user_model`,
+# `human_insights`). Elles sont toujours présentes, même vides, comme les sept premières :
+# la forme de la réponse ne dépend pas de ce que l'agent a déjà noté.
 SYSTEM_PACKET_KEYS: tuple[str, ...] = (
-    "facts", "preferences", "episodes", "rules", "best_practices", "errors", "examples")
+    "facts", "preferences", "episodes", "rules", "best_practices", "errors", "examples",
+    "user_model", "human_insights")
 
 
 class CollectionStore(Protocol):

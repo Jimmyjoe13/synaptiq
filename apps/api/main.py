@@ -42,7 +42,12 @@ from synaptiq_core import (
 # vit dans le cœur (comme `handle_contradictions`), afin que l'API et le worker voient
 # forcément le MÊME registre — la taxonomie avait déjà divergé une fois entre les deux
 # chemins d'écriture, elle ne doit pas recommencer.
-from synaptiq_core.collections import SYSTEM_COLLECTIONS, charger_registre
+from synaptiq_core.belief_guard import CroyanceRefusee, valider_croyance
+from synaptiq_core.collections import (
+    FAMILLE_REFLEXIVE,
+    SYSTEM_COLLECTIONS,
+    charger_registre,
+)
 
 # Orchestration des 4 phases Q-EM (sans SQL ni HTTP : testable en isolation)
 from synaptiq_core.context_builder import RetrievalConfig, build_context_packet
@@ -100,6 +105,8 @@ QEM_REDUNDANCY_THRESHOLD = float(os.getenv("QEM_REDUNDANCY_THRESHOLD", "0.90"))
 # et exposant β de la densité score/tokens**β (1 = historique, <1 pénalise moins la longueur).
 QEM_COLLAPSE_TOP_K = int(os.getenv("QEM_COLLAPSE_TOP_K", "3"))
 QEM_DENSITY_EXPONENT = float(os.getenv("QEM_DENSITY_EXPONENT", "0.5"))
+# Part maximale du budget de tokens accordée aux croyances (famille `reflective`, lot C).
+QEM_REFLECTIVE_MAX_SHARE = float(os.getenv("QEM_REFLECTIVE_MAX_SHARE", "0.15"))
 # Décroissance temporelle : demi-vie (en jours) du score de récence. Une mémoire non
 # ré-accédée voit sa pertinence divisée par 2 tous les N jours. 0 (ou négatif) = désactivé.
 QEM_RECENCY_HALFLIFE_DAYS = float(os.getenv("QEM_RECENCY_HALFLIFE_DAYS", "14"))
@@ -706,11 +713,14 @@ def retrieval_config() -> RetrievalConfig:
         recency_halflife_days=QEM_RECENCY_HALFLIFE_DAYS,
         collapse_top_k=QEM_COLLAPSE_TOP_K,
         density_exponent=QEM_DENSITY_EXPONENT,
+        reflective_max_share=QEM_REFLECTIVE_MAX_SHARE,
     )
 
 
 # Modèles Pydantic
-MemoryType = Literal["semantic", "episodic", "procedural", "working"]
+# `reflective` (26/09) : croyances de l'agent sur l'utilisateur et les humains. Écrites
+# délibérément, validées par `belief_guard`, jamais extraites par le worker.
+MemoryType = Literal["semantic", "episodic", "procedural", "working", "reflective"]
 
 
 class EventInput(BaseModel):
@@ -735,7 +745,9 @@ class ContextConstraints(BaseModel):
     max_tokens: int = Field(default=1200, ge=1, le=8000)
     # Familles cognitives. Le plafond de 4 n'est pas arbitraire : c'est le nombre TOTAL de
     # familles, et elles restent fermées (chacune porte un comportement du moteur).
-    memory_types: list[MemoryType] = Field(default=["semantic", "episodic", "procedural", "working"], min_length=1, max_length=4)
+    # `reflective` inclus par défaut (lot C) : les croyances nuancent le paquet, sous le
+    # quota `QEM_REFLECTIVE_MAX_SHARE`. Plafond = nombre total de familles (5).
+    memory_types: list[MemoryType] = Field(default=["semantic", "episodic", "procedural", "working", "reflective"], min_length=1, max_length=5)
     # Filtrage FIN par collection (`memories.subtype`). C'est ici que la granularité s'ouvre :
     # un agent qui a déclaré `clients_paca` peut viser ce seul rayon au lieu de ratisser tout
     # `semantic`. Moins de candidats en entrée de Q-EM, donc moins de bruit à budget égal.
@@ -1067,6 +1079,36 @@ class MemoryInput(BaseModel):
     def _normaliser_projet(cls, valeur):
         return normaliser_projet(valeur)
 
+    # Croyances (famille `reflective`, lot C) : souvenirs à l'appui, et croyance remplacée
+    # (révision par supersession plutôt que par accumulation). Refusés hors de la famille.
+    evidence: list[str] | None = Field(default=None, max_length=20)
+    replaces: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _verifier_la_croyance(self):
+        """Applique `belief_guard` à toute croyance, et borne ses collections.
+
+        Dans le validateur (et non dans le handler) pour que le refus sorte en 422 avec le
+        motif, comme toute autre erreur de saisie : l'agent peut reformuler.
+        """
+        if self.type != FAMILLE_REFLEXIVE:
+            if self.evidence or self.replaces:
+                raise ValueError("`evidence` et `replaces` ne s'appliquent qu'aux croyances "
+                                 "(type='reflective').")
+            return self
+        if self.subtype is None:
+            self.subtype = "user_model"
+        if self.subtype not in ("user_model", "human_insights"):
+            raise ValueError("Une croyance se range dans 'user_model' (ce que l'agent pense "
+                             "de l'utilisateur) ou 'human_insights' (les humains, les tiers).")
+        try:
+            validee = valider_croyance(self.content, self.confidence, self.evidence)
+        except CroyanceRefusee as e:
+            raise ValueError(str(e)) from e
+        self.confidence = validee.confidence
+        self.evidence = list(validee.evidence)
+        return self
+
     @model_validator(mode="after")
     def _verifier_la_taxonomie(self):
         """Refuse un sous-type canonique rattaché au mauvais type.
@@ -1132,6 +1174,32 @@ def _declarer_collection_manquante(cur, tenant: str, agent_id: str,
                        "collection déclarée.", famille, nom, exc_info=True)
     finally:
         cur.execute("RELEASE SAVEPOINT synaptiq_declare")
+
+
+def _croyance_contestee(cur, tenant: str, agent_id: str, empreinte: str) -> bool:
+    """Une croyance de même contenu a-t-elle été contestée par l'utilisateur ?"""
+    cur.execute(
+        "SELECT 1 FROM memories WHERE tenant_id = %s AND agent_id = %s "
+        "AND content_hash = %s AND status = 'contested' LIMIT 1",
+        (tenant, agent_id, empreinte))
+    return cur.fetchone() is not None
+
+
+def _archiver_croyance_remplacee(cur, tenant: str, agent_id: str, ancienne: str) -> list[str]:
+    """Archive la croyance remplacée ; 404 si elle n'est pas une croyance active de l'agent.
+
+    Borné au (tenant, agent) et à la famille : `replaces` ne doit pas devenir un moyen
+    d'archiver n'importe quel souvenir par identifiant.
+    """
+    cur.execute(
+        "UPDATE memories SET status = 'archived', updated_at = CURRENT_TIMESTAMP "
+        "WHERE id = %s AND tenant_id = %s AND agent_id = %s AND type = %s "
+        "AND status = 'active' RETURNING id",
+        (ancienne, tenant, agent_id, FAMILLE_REFLEXIVE))
+    if cur.fetchone() is None:
+        raise HTTPException(status_code=404,
+                            detail=f"Aucune croyance active {ancienne} à remplacer.")
+    return [ancienne]
 
 
 def _memoire_existante(cur, tenant: str, agent_id: str, empreinte: str,
@@ -1243,6 +1311,17 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                             extra={"agent_id": memory.agent_id, "memory_id": str(existant)})
                 return reponse
 
+            # Une croyance CONTESTÉE par l'utilisateur ne se réécrit pas à l'identique : sans
+            # ce contrôle, l'agent la renoterait à la session suivante et la contestation
+            # n'aurait servi à rien. Reformuler (avec de nouveaux indices) reste possible.
+            if memory.type == FAMILLE_REFLEXIVE and _croyance_contestee(
+                    cur, tenant, memory.agent_id, empreinte):
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cette croyance a été contestée par l'utilisateur : elle ne peut "
+                           "pas être réenregistrée telle quelle.")
+
             embedding = get_embedder().embed_one(memory.content)
 
             # Gestion des contradictions
@@ -1265,8 +1344,8 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             query = """
                 INSERT INTO memories (tenant_id, agent_id, type, subtype, content, embedding,
                                       confidence, importance, status, content_hash, idempotency_key,
-                                      project)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s)
+                                      project, provenance)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
                 RETURNING id;
             """
@@ -1282,6 +1361,8 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                 empreinte,
                 memory.idempotency_key,
                 memory.project,
+                # Indices d'une croyance (ids de souvenirs) : c'est ce qui la rend contrôlable.
+                json.dumps({"evidence": memory.evidence} if memory.evidence else {}),
             ))
             ligne = cur.fetchone()
             if ligne is None:
@@ -1303,6 +1384,11 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                 return reponse
 
             new_id = ligne[0]
+            # Révision d'une croyance : l'ancienne est archivée et reliée à la nouvelle par
+            # `supersedes_by` (même mécanisme que les préférences contredites).
+            if memory.replaces is not None:
+                superseded = [*superseded, *_archiver_croyance_remplacee(
+                    cur, tenant, memory.agent_id, str(memory.replaces))]
             # Traçabilité : relier la nouvelle mémoire aux préférences qu'elle remplace.
             if superseded:
                 link_supersedes(cur, new_id, superseded)
@@ -1841,6 +1927,74 @@ def merge_collections(payload: MergeInput, auth: AuthContext | None = Depends(ge
         raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
     finally:
         db_pool.putconn(conn)
+
+
+# ─── Croyances : ce que l'agent pense (famille `reflective`, lot C) ─────────
+# Lecture et contestation exposées À PART de /retrieve : l'utilisateur doit pouvoir voir,
+# d'un seul appel, TOUT ce que l'agent pense de lui — et le contester. C'est la condition
+# pour qu'un agent ait le droit de se forger une opinion sur la personne qu'il sert.
+
+class ContestInput(BaseModel):
+    agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$")
+    # Motif libre, journalisé en longueur seulement (audit_log ne porte jamais de contenu).
+    reason: str | None = Field(default=None, max_length=500)
+
+
+@v1_router.get("/beliefs")
+def list_beliefs(agent_id: str, about: Literal["user", "humans"] | None = None,
+                 auth: AuthContext | None = Depends(get_auth)):
+    """Toutes les croyances ACTIVES de l'agent, la plus assurée d'abord."""
+    tenant = resolve_tenant(auth)
+    require_scope(auth, "read")
+    resolve_agent(auth, agent_id)
+    collections = {"user": ["user_model"], "humans": ["human_insights"]}.get(
+        about or "", ["user_model", "human_insights"])
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT id, subtype, content, confidence, provenance->'evidence' AS evidence,
+                   project, created_at
+            FROM memories
+            WHERE tenant_id = %s AND agent_id = %s AND type = %s AND status = 'active'
+              AND subtype = ANY(%s)
+            ORDER BY confidence DESC, created_at DESC
+        """, (tenant, agent_id, FAMILLE_REFLEXIVE, collections))
+        lignes = cur.fetchall()
+    return {"beliefs": [
+        {"id": str(r["id"]),
+         "about": "user" if r["subtype"] == "user_model" else "humans",
+         "content": r["content"], "confidence": r["confidence"],
+         "evidence": r["evidence"] or [], "project": r["project"],
+         "created_at": r["created_at"].isoformat()}
+        for r in lignes]}
+
+
+@v1_router.post("/beliefs/{belief_id}/contest")
+def contest_belief(belief_id: uuid.UUID, payload: ContestInput,
+                   auth: AuthContext | None = Depends(get_auth)):
+    """Conteste une croyance : elle sort du contexte et ne peut plus être réécrite telle quelle.
+
+    Statut `contested` (et non suppression) : la ligne sert de témoin pour refuser la
+    réécriture à l'identique (cf. `create_memory`), et la contestation reste traçable.
+    """
+    tenant = resolve_tenant(auth)
+    require_scope(auth, "write")
+    resolve_agent(auth, payload.agent_id)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE memories SET status = 'contested', updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND tenant_id = %s AND agent_id = %s AND type = %s
+                  AND status = 'active'
+                RETURNING id
+            """, (str(belief_id), tenant, payload.agent_id, FAMILLE_REFLEXIVE))
+            if cur.fetchone() is None:
+                conn.rollback()
+                raise HTTPException(status_code=404,
+                                    detail=f"Aucune croyance active {belief_id}.")
+            audit(cur, tenant, "belief_contested", auth, payload.agent_id,
+                  belief_id=str(belief_id), reason_length=len(payload.reason or ""))
+        conn.commit()
+    return {"status": "contested", "belief_id": str(belief_id)}
 
 
 @v1_router.get("/collections")

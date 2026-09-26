@@ -245,7 +245,8 @@ def test_les_nouveaux_outils_n_exposent_pas_agent_id(monkeypatch):
     """
     import inspect
     for nom in ("store_memory", "recall_memories", "build_context",
-                "list_collections", "create_collection", "merge_collections"):
+                "list_collections", "create_collection", "merge_collections",
+                "note_belief", "list_beliefs", "contest_belief"):
         params = inspect.signature(_outil(nom)).parameters
         assert "agent_id" not in params, f"{nom} expose agent_id"
         assert "tenant_id" not in params, f"{nom} expose tenant_id"
@@ -389,3 +390,46 @@ def test_un_422_dit_quel_champ_est_refuse(http):
     etat["charge"] = {"detail": [{"loc": ["body", "project"], "msg": "Nom de projet invalide"}]}
     message = _outil("store_memory")("x", "semantic", project="mon projet")
     assert message == "[REFUSE] project: Nom de projet invalide"
+
+
+
+# ─── 7. Croyances (famille `reflective`, lot C) ──────────────────────────────
+
+def test_note_belief_ecrit_une_croyance(http):
+    appels, etat = http
+    etat["charge"] = {"status": "created", "memory_id": "b1", "collection": "user_model"}
+    message = _outil("note_belief")("Jimmy decide vite", confidence=0.8, evidence_ids=["m1"])
+    payload = appels[0]["payload"]
+    assert payload["type"] == "reflective" and payload["subtype"] == "user_model"
+    assert payload["evidence"] == ["m1"]
+    assert "hypothese" in message
+
+
+def test_note_belief_sur_les_humains_va_dans_human_insights(http):
+    appels, etat = http
+    etat["charge"] = {"status": "created", "memory_id": "b1", "collection": "human_insights"}
+    _outil("note_belief")("Regis repond le matin", about="humans")
+    assert appels[0]["payload"]["subtype"] == "human_insights"
+
+
+def test_note_belief_transmet_le_refus_du_garde_fou(http):
+    _, etat = http
+    etat["status"] = 422
+    etat["charge"] = {"detail": [{"loc": ["body"], "msg": "Croyance refusée : catégorie sensible"}]}
+    assert _outil("note_belief")("x").startswith("[REFUSE]")
+
+
+def test_list_beliefs_affiche_confiance_et_indices(http):
+    appels, etat = http
+    etat["charge"] = {"beliefs": [{"id": "b1", "about": "user", "content": "Jimmy decide vite",
+                                   "confidence": 0.8, "evidence": ["m1", "m2"]}]}
+    sortie = _outil("list_beliefs")()
+    assert appels[0]["methode"] == "GET"
+    assert "confiance 0.8, 2 indice(s)" in sortie and "b1" in sortie
+
+
+def test_contest_belief_appelle_l_endpoint_dedie(http):
+    appels, etat = http
+    etat["charge"] = {"status": "contested"}
+    _outil("contest_belief")("b1", reason="faux")
+    assert appels[0]["url"].endswith("/v1/beliefs/b1/contest")

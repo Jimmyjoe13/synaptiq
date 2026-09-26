@@ -68,7 +68,8 @@ class SynaptiqClient:
         url = f"{self.base_url}/v1/context/build"
         contraintes: dict[str, Any] = {
             "max_tokens": max_tokens,
-            "memory_types": memory_types or ["semantic", "episodic", "procedural", "working"],
+            "memory_types": memory_types or ["semantic", "episodic", "procedural", "working",
+                                             "reflective"],
         }
         # Omis quand None : le serveur distingue « toutes les collections » (absent) de
         # « cette liste », et une liste vide y serait un filtre qui ne ramène rien.
@@ -147,6 +148,57 @@ class SynaptiqClient:
             return response.json()
         except Exception as e:
             raise RuntimeError(f"Échec de la récupération des souvenirs : {e}") from e
+
+    # ─── Croyances : ce que l'agent pense (famille `reflective`) ─────────────
+    # Hypothèses sur l'utilisateur (`about="user"`) ou les humains (`about="humans"`) :
+    # validées par le garde-fou côté serveur (422 sinon), servies comme « hypothèse,
+    # confiance x », consultables et contestables par l'utilisateur.
+
+    def note_belief(self, agent_id: str, content: str, about: str = "user",
+                    confidence: float = 0.5, evidence: list[str] | None = None,
+                    replaces: str | None = None, project: str | None = None) -> dict[str, Any]:
+        """Note une croyance. Confiance > 0.5 : `evidence` (ids de souvenirs) obligatoire."""
+        payload: dict[str, Any] = {
+            "agent_id": agent_id, "type": "reflective",
+            "subtype": "user_model" if about == "user" else "human_insights",
+            "content": content, "confidence": confidence,
+        }
+        if evidence:
+            payload["evidence"] = evidence
+        if replaces:
+            payload["replaces"] = replaces
+        if project is not None:
+            payload["project"] = project
+        try:
+            response = requests.post(f"{self.base_url}/v1/memories", json=payload,
+                                     headers=self.headers, timeout=5)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise RuntimeError(f"Échec de l'enregistrement de la croyance : {e}") from e
+
+    def list_beliefs(self, agent_id: str, about: str | None = None) -> dict[str, Any]:
+        """Croyances actives de l'agent, la plus assurée d'abord."""
+        params = {"agent_id": agent_id, **({"about": about} if about else {})}
+        try:
+            response = requests.get(f"{self.base_url}/v1/beliefs", params=params,
+                                    headers=self.headers, timeout=5)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise RuntimeError(f"Échec de la lecture des croyances : {e}") from e
+
+    def contest_belief(self, agent_id: str, belief_id: str,
+                       reason: str | None = None) -> dict[str, Any]:
+        """Conteste une croyance : retirée du contexte, non réinscriptible à l'identique."""
+        try:
+            response = requests.post(f"{self.base_url}/v1/beliefs/{belief_id}/contest",
+                                     json={"agent_id": agent_id, "reason": reason},
+                                     headers=self.headers, timeout=5)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise RuntimeError(f"Échec de la contestation : {e}") from e
 
     # ─── Collections : la taxonomie que l'agent se donne ────────────────────
     # La FAMILLE (`semantic`, `episodic`, `procedural`, `working`) appartient au moteur et

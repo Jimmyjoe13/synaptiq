@@ -26,6 +26,7 @@ classe d'erreur que la validation peut réellement attraper, donc la seule qu'el
 from __future__ import annotations
 
 from synaptiq_core.collections import (
+    FAMILLES_EXTRACTIBLES,
     FAMILY_FALLBACK_KEY,
     SYSTEM_COLLECTIONS,
     CollectionRegistry,
@@ -110,7 +111,9 @@ def normalize_extraction(memory_type: str | None, subtype: str | None,
     chaque hallucination la rendrait illisible en quelques jours. La création reste un acte
     délibéré (lot 3).
     """
-    mtype = memory_type if memory_type in VALID_SUBTYPES else "semantic"
+    # `FAMILLES_EXTRACTIBLES` et non `VALID_SUBTYPES` : un extracteur ne produit jamais de
+    # croyance (`reflective`), cf. `collections.FAMILLES_EXTRACTIBLES`.
+    mtype = memory_type if memory_type in FAMILLES_EXTRACTIBLES else "semantic"
     if subtype is not None and subtype in VALID_SUBTYPES[mtype]:
         return mtype, subtype
     if registry is not None and registry.get(mtype, subtype) is not None:

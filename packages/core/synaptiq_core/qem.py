@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 
 import numpy as np
 
+from synaptiq_core.collections import FAMILLE_REFLEXIVE
+
 logger = logging.getLogger("synaptiq-core.qem")
 
 
@@ -358,6 +360,16 @@ def format_entry(content: str, occurred_at) -> str:
     return f"[{day}] {content}"
 
 
+def format_croyance(content: str, confidence: float) -> str:
+    """Rendu d'une croyance (famille `reflective`) : JAMAIS comme un fait.
+
+    Le modèle qui lit le paquet doit savoir qu'il s'agit d'une hypothèse de l'agent, et à
+    quel point elle est assurée ; sans ce préfixe, « Jimmy préfère décider seul » serait lu
+    comme une vérité établie et appliqué sans nuance.
+    """
+    return f"(hypothèse, confiance {confidence:.1f}) {content}"
+
+
 def collapse_by_utility(
     candidates: dict[str, dict],
     max_tokens: int,
@@ -365,6 +377,7 @@ def collapse_by_utility(
     priorites: Sequence[str] = (),
     top_k: int = 0,
     density_exponent: float = 1.0,
+    reflective_max_share: float = 1.0,
 ) -> tuple[dict[str, list], list[str], int]:
     """Collapse glouton : maximise l'utilité/token sous contrainte `max_tokens`.
 
@@ -404,6 +417,13 @@ def collapse_by_utility(
       - `density_exponent` (β) : le reste est rempli par `score / tokens**β`. β=1 est la
         densité historique ; β<1 pénalise moins la longueur.
     Valeurs par défaut (0 et 1,0) = comportement historique exact.
+
+    ## `reflective_max_share` : les croyances ne prennent pas le paquet (lot C)
+
+    Part maximale du budget accordée aux souvenirs de la famille `reflective` (croyances
+    de l'agent). Au-delà, les croyances suivantes sont écartées même s'il reste de la
+    place : le paquet sert d'abord des FAITS, les hypothèses ne font que les nuancer.
+    1,0 (défaut) = pas de plafond.
     """
     from synaptiq_core.collections import REGISTRE_SYSTEME
     registre = registry or REGISTRE_SYSTEME
@@ -411,7 +431,10 @@ def collapse_by_utility(
     collapsed_candidates = []
     for mem_id, c in candidates.items():
         if c['score'] > 0.0:
-            entry = format_entry(c['content'], c.get('occurred_at'))
+            contenu = c['content']
+            if c['type'] == FAMILLE_REFLEXIVE:
+                contenu = format_croyance(contenu, float(c.get('confidence') or 0.0))
+            entry = format_entry(contenu, c.get('occurred_at'))
             tokens = estimate_tokens(entry)
             utility_density = c['score'] / (tokens ** density_exponent)
             collapsed_candidates.append({
@@ -441,11 +464,18 @@ def collapse_by_utility(
     packet: dict[str, list[str]] = {k: [] for k in registre.packet_keys()}
     selected_ids: list[str] = []
     token_count = 0
+    plafond_croyances = int(max_tokens * reflective_max_share)
+    tokens_croyances = 0
 
     for c in collapsed_candidates:
+        croyance = c['type'] == FAMILLE_REFLEXIVE
+        if croyance and tokens_croyances + c['tokens'] > plafond_croyances:
+            continue      # quota des croyances atteint : les faits d'abord
         if token_count + c['tokens'] <= max_tokens:
             selected_ids.append(c['id'])
             token_count += c['tokens']
+            if croyance:
+                tokens_croyances += c['tokens']
 
             # Routage complet type + sous-type vers la bonne collection logique.
             # `route_memory` ne renvoie plus jamais None : le `if key is not None` d'avant

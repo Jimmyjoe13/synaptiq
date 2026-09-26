@@ -1,4 +1,15 @@
-export type MemoryType = "semantic" | "episodic" | "procedural" | "working";
+// `reflective` : croyances de l'agent (ce qu'il pense de l'utilisateur et des humains).
+export type MemoryType = "semantic" | "episodic" | "procedural" | "working" | "reflective";
+
+export interface Belief {
+  id: string;
+  about: "user" | "humans";
+  content: string;
+  confidence: number;
+  evidence: string[];
+  project: string | null;
+  created_at: string;
+}
 
 export interface SynaptiqClientOptions {
   baseUrl?: string;
@@ -108,6 +119,32 @@ export class SynaptiqClient {
   // section de repli). La COLLECTION appartient a l'agent : il la nomme, la decrit, et
   // elle obtient sa propre section dans le context_packet.
 
+  // ─── Croyances (famille `reflective`) ─────────────────────────────────────
+  // Validees par le garde-fou serveur (422 sinon), servies comme « hypothese, confiance x »,
+  // consultables et contestables par l'utilisateur.
+
+  /** Confiance > 0.5 : `evidence` (ids de souvenirs) obligatoire. */
+  noteBelief(agent_id: string, content: string, options: { about?: "user" | "humans"; confidence?: number; evidence?: string[]; replaces?: string; project?: string } = {}) {
+    const body: Record<string, unknown> = {
+      agent_id, type: "reflective", content, confidence: options.confidence ?? 0.5,
+      subtype: (options.about ?? "user") === "user" ? "user_model" : "human_insights",
+    };
+    if (options.evidence?.length) body.evidence = options.evidence;
+    if (options.replaces) body.replaces = options.replaces;
+    if (options.project !== undefined) body.project = options.project;
+    return this.post<{ status: string; memory_id: string }>("/v1/memories", body);
+  }
+
+  listBeliefs(agent_id: string, about?: "user" | "humans") {
+    const params: Record<string, string> = { agent_id };
+    if (about) params.about = about;
+    return this.get<{ beliefs: Belief[] }>("/v1/beliefs", params);
+  }
+
+  contestBelief(agent_id: string, belief_id: string, reason?: string) {
+    return this.post<{ status: string; belief_id: string }>(`/v1/beliefs/${belief_id}/contest`, { agent_id, reason });
+  }
+
   listCollections(agent_id: string) {
     return this.get<CollectionsResult>("/v1/collections", { agent_id });
   }
@@ -142,7 +179,7 @@ export class SynaptiqClient {
   buildContext(agent_id: string, session_id: string, task: string, query: string, options: { maxTokens?: number; memoryTypes?: MemoryType[]; collections?: string[]; explain?: boolean; project?: string; includeGlobal?: boolean } = {}) {
     const constraints: Record<string, unknown> = {
       max_tokens: options.maxTokens ?? 1200,
-      memory_types: options.memoryTypes ?? ["semantic", "episodic", "procedural", "working"],
+      memory_types: options.memoryTypes ?? ["semantic", "episodic", "procedural", "working", "reflective"],
     };
     // Omis quand absent : le serveur distingue « toutes les collections » d'une liste
     // explicite, et une liste vide serait un filtre qui ne ramene rien.

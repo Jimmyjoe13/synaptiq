@@ -502,11 +502,12 @@ def test_collapse_routage_par_type():
     assert packet["examples"] == ["exemple"]
 
 
-def test_collapse_packet_toujours_7_cles():
-    """Le context_packet expose toujours ses 7 clés, même à vide."""
+def test_collapse_packet_toujours_ses_cles_canoniques():
+    """Le context_packet expose toujours ses 9 clés canoniques (7 + 2 croyances), même à vide."""
     packet, _, _ = collapse_by_utility({}, max_tokens=1000)
     assert set(packet.keys()) == {
-        "facts", "preferences", "episodes", "rules", "best_practices", "errors", "examples"
+        "facts", "preferences", "episodes", "rules", "best_practices", "errors", "examples",
+        "user_model", "human_insights",
     }
     assert all(v == [] for v in packet.values())
 

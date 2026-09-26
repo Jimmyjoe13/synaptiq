@@ -145,13 +145,15 @@ def test_la_taxonomie_derive_bien_des_collections_systeme():
         "semantic": {"preference", "fact"},
         "episodic": {"interaction"},
         "working": {"scratch"},
+        "reflective": {"user_model", "human_insights"},
     }
 
 
 def test_les_defauts_suivent_le_repli_de_famille():
     """Le sous-type par défaut est celui qui sert la section de repli de sa famille."""
     assert DEFAULT_SUBTYPE == {"procedural": "rule", "semantic": "fact",
-                               "episodic": "interaction", "working": "scratch"}
+                               "episodic": "interaction", "working": "scratch",
+                               "reflective": "user_model"}
     for famille, nom in DEFAULT_SUBTYPE.items():
         assert route_memory(famille, nom) == FAMILY_FALLBACK_KEY[famille]
 

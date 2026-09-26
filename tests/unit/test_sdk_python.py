@@ -79,7 +79,7 @@ def test_build_context_transmet_budget_et_explain(appels):
 def test_build_context_types_de_memoire_par_defaut(appels):
     SynaptiqClient().build_context(agent_id="a", session_id="s", task="t", query="q")
     assert appels[0]["payload"]["constraints"]["memory_types"] == [
-        "semantic", "episodic", "procedural", "working"]
+        "semantic", "episodic", "procedural", "working", "reflective"]
 
 
 def test_panne_reseau_leve_une_erreur_explicite(monkeypatch):

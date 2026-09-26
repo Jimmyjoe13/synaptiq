@@ -63,16 +63,19 @@ def _declarer_collection(db, agent_id, nom, famille, cle, entangle=True):
         db.commit()
 
 
-def test_les_sept_collections_systeme_sont_servies(client, db):
-    """Un agent tout neuf voit déjà les sept rayons livrés avec le moteur."""
+def test_les_collections_systeme_sont_servies(client, db):
+    """Un agent tout neuf voit déjà les rayons livrés avec le moteur : les sept historiques
+    et, depuis le 26/09, les deux rayons de croyances (famille `reflective`)."""
     resp = client.get("/collections", params={"agent_id": "agent_neuf"})
     assert resp.status_code == 200, resp.text
     corps = resp.json()
     systeme = {c["name"] for c in corps["collections"] if c["created_by"] == "system"}
     assert systeme == {"fact", "preference", "interaction", "rule",
-                       "coding_best_practices", "code_error_resolution", "scratch"}
-    assert corps["packet_keys"][:7] == ["facts", "preferences", "episodes", "rules",
-                                        "best_practices", "errors", "examples"]
+                       "coding_best_practices", "code_error_resolution", "scratch",
+                       "user_model", "human_insights"}
+    assert corps["packet_keys"][:9] == ["facts", "preferences", "episodes", "rules",
+                                        "best_practices", "errors", "examples",
+                                        "user_model", "human_insights"]
 
 
 def test_la_collection_d_un_agent_est_invisible_pour_un_autre(client, db):

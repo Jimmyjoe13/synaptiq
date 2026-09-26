@@ -12,7 +12,7 @@ from synaptiq_core.context_builder import (
     build_context_packet,
 )
 
-TOUS_TYPES = ["semantic", "episodic", "procedural", "working"]
+TOUS_TYPES = ["semantic", "episodic", "procedural", "working", "reflective"]
 CONFIG = RetrievalConfig(hybrid=False, recency_halflife_days=0.0)
 
 
@@ -49,11 +49,13 @@ def _construire(store, **kw):
 
 # ─── Contrat de réponse ──────────────────────────────────────────────────────
 
-def test_magasin_vide_renvoie_les_7_cles():
-    """Contrat stable côté consommateur : le paquet porte toujours ses 7 collections."""
+def test_magasin_vide_renvoie_les_cles_canoniques():
+    """Contrat stable côté consommateur : le paquet porte toujours ses 9 collections
+    canoniques (les 7 historiques + les 2 sections de croyances du 26/09)."""
     resultat = _construire(InMemoryStore())
     assert set(resultat["context_packet"]) == {
-        "facts", "preferences", "episodes", "rules", "best_practices", "errors", "examples"}
+        "facts", "preferences", "episodes", "rules", "best_practices", "errors", "examples",
+        "user_model", "human_insights"}
     assert all(v == [] for v in resultat["context_packet"].values())
     assert resultat["token_estimate"] == 0
     assert resultat["selected_memory_ids"] == []
@@ -296,3 +298,50 @@ def test_record_access_false_n_ecrit_rien():
     resultat = _construire(store, record_access=False)
     assert resultat["selected_memory_ids"]
     assert store.acces_marques == []
+
+
+
+# ─── Croyances (famille `reflective`, lot C) ─────────────────────────────────
+
+def _croyance(mem_id, contenu, confiance, **kw):
+    return _mem(mem_id, contenu=contenu, type_="reflective", subtype="user_model",
+                confidence=confiance, **kw)
+
+
+def test_une_croyance_est_rendue_comme_une_hypothese():
+    """Jamais comme un fait : le modèle doit savoir que c'est une hypothèse de l'agent."""
+    store = InMemoryStore([_croyance("B", "Jimmy prefere decider vite", 0.6)])
+    resultat = _construire(store, config=RetrievalConfig(hybrid=False))
+    assert resultat["context_packet"]["user_model"] == [
+        "(hypothèse, confiance 0.6) Jimmy prefere decider vite"]
+
+
+def test_une_croyance_ne_decroit_pas_avec_le_temps():
+    """Âge d'un an et demi-vie de 14 jours : un fait s'effondre, une croyance non."""
+    un_an = 365 * 86400.0
+    store = InMemoryStore([
+        _croyance("B", "hypothese ancienne", 1.0, age_seconds=un_an),
+        _mem("F", contenu="fait ancien", age_seconds=un_an, embedding=[0.0, 1.0, 0.0]),
+    ])
+    resultat = _construire(store, explain=True, explain_level="all",
+                           config=RetrievalConfig(hybrid=False, recency_halflife_days=14.0))
+    trace = {e["memory_id"]: e for e in resultat["retrieval_trace"]}
+    assert trace["B"]["recency_factor"] == 1.0
+    assert trace["F"]["recency_factor"] < 0.01
+
+
+def test_le_score_d_une_croyance_est_pondere_par_sa_confiance():
+    store = InMemoryStore([_croyance("B", "hypothese", 0.3, similarity=1.0)])
+    resultat = _construire(store, explain=True, config=RetrievalConfig(hybrid=False))
+    assert resultat["retrieval_trace"][0]["score"] == 0.3
+
+
+def test_les_croyances_respectent_leur_quota_de_budget():
+    """Plafond de 15 % : sur 100 tokens, au plus 15 tokens de croyances."""
+    store = InMemoryStore([
+        _croyance(f"B{i}", " ".join(["mot"] * 5), 0.9, embedding=[1.0, float(i), 0.0])
+        for i in range(5)])
+    resultat = _construire(store, max_tokens=100,
+                           config=RetrievalConfig(hybrid=False, redundancy_threshold=1.01))
+    # Chaque croyance rendue coûte ~11 tokens (préfixe compris) : une seule tient sous 15.
+    assert len(resultat["selected_memory_ids"]) == 1

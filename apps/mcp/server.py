@@ -520,7 +520,7 @@ def recall_memories(query: str, limit: int = 5, memory_type: str | None = None,
     Args:
         query: Le sujet ou mot-cle a rechercher (ex: 'preferences style ecriture').
         limit: Nombre maximum de souvenirs a ramener (default: 5).
-        memory_type: Filtrer par famille de memoire ('semantic', 'procedural', 'episodic', 'working').
+        memory_type: Filtrer par famille de memoire ('semantic', 'procedural', 'episodic', 'working', 'reflective').
         collections: Restreindre a ces collections (cf. list_collections). Cible un rayon precis plutot qu'une famille entiere : moins de candidats, donc moins de bruit.
         project: Restreindre a ce projet (ex: 'synaptiq') ; les souvenirs globaux restent inclus. Fortement recommande des que la question porte sur un projet precis : sans filtre, les autres projets noient le resultat.
     """
@@ -563,6 +563,10 @@ _LIBELLES_CANONIQUES = {
     "facts": "FAITS", "preferences": "PREFERENCES", "episodes": "EPISODES",
     "rules": "REGLES", "best_practices": "BONNES PRATIQUES",
     "errors": "ERREURS", "examples": "EXEMPLES",
+    # Croyances (famille `reflective`) : le libelle rappelle au modele que ce sont des
+    # hypotheses de l'agent, a verifier, et non des faits.
+    "user_model": "CE QUE JE PENSE DE L'UTILISATEUR (hypotheses)",
+    "human_insights": "REFLEXIONS SUR LES HUMAINS (hypotheses)",
 }
 
 
@@ -586,7 +590,7 @@ def build_context(task: str, query: str, max_tokens: int = 1200,
     try:
         contraintes: dict = {
             "max_tokens": max_tokens,
-            "memory_types": ["semantic", "episodic", "procedural", "working"],
+            "memory_types": ["semantic", "episodic", "procedural", "working", "reflective"],
         }
         if collections:
             contraintes["collections"] = collections
@@ -623,6 +627,125 @@ def build_context(task: str, query: str, max_tokens: int = 1200,
         return "\n".join(lines) if len(lines) > 1 else "Aucun contexte pertinent trouve."
     except Exception as e:
         return _echec("Echec de la construction du contexte", e)
+
+
+# ─── Croyances : ce que l'agent pense (famille `reflective`, lot C) ─────────
+
+@mcp.tool()
+def note_belief(content: str, about: str = "user", confidence: float = 0.5,
+                evidence_ids: list[str] | None = None, replaces: str | None = None,
+                project: str | None = None) -> str:
+    """
+    Note ce que tu PENSES de l'utilisateur (about='user') ou des humains et des personnes que
+    tu cotoies (about='humans') : une hypothese sur une facon de travailler, une attente, une
+    reaction. Ce n'est PAS un fait : elle sera servie comme « hypothese, confiance x ».
+
+    Regles (refus sinon) :
+      - decrire un comportement OBSERVABLE, jamais inferer sante, opinions politiques,
+        religion, orientation sexuelle, origine ou appartenance syndicale ;
+      - confiance > 0.5 : citer au moins un souvenir a l'appui (evidence_ids) ; plafond 0.9 ;
+      - pour CHANGER d'avis, passer l'id de l'ancienne croyance dans `replaces` plutot que
+        d'empiler deux croyances contradictoires.
+    L'utilisateur peut lire (list_beliefs) et contester ce que tu penses de lui : une
+    croyance contestee ne peut pas etre renotee a l'identique.
+
+    Args:
+        content: L'hypothese, formulee comme une observation (ex: 'Jimmy valide plus vite un plan illustre par un exemple').
+        about: 'user' (l'utilisateur) ou 'humans' (les humains en general, les tiers).
+        confidence: 0.1 (intuition) a 0.9 (tres etayee). Defaut 0.5.
+        evidence_ids: Ids de souvenirs qui appuient l'hypothese (obligatoire au-dela de 0.5).
+        replaces: Id d'une croyance precedente que celle-ci remplace (revision).
+        project: Projet concerne ; omettre si l'hypothese vaut en general.
+    """
+    url = f"{SYNAPTIQ_API_URL}/v1/memories"
+    try:
+        if about not in ("user", "humans"):
+            return "[REFUSE] about doit valoir 'user' ou 'humans'."
+        payload: dict = {
+            "agent_id": require_agent_id(),
+            "type": "reflective",
+            "subtype": "user_model" if about == "user" else "human_insights",
+            "content": content,
+            "confidence": confidence,
+        }
+        if evidence_ids:
+            payload["evidence"] = evidence_ids
+        if replaces:
+            payload["replaces"] = replaces
+        projet = _projet(project)
+        if projet:
+            payload["project"] = projet
+        response = _poster(url, payload)
+        refus = _refus(response)
+        if refus:
+            return refus
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") == "duplicate":
+            return f"[DEJA PRESENT] Cette croyance est deja notee (ID: {data.get('memory_id')})."
+        return (f"[SUCCESS] Croyance notee (ID: {data.get('memory_id')}), servie comme "
+                f"hypothese dans '{data.get('collection')}'.")
+    except Exception as e:
+        return _echec("Echec de l'enregistrement de la croyance", e)
+
+
+@mcp.tool()
+def list_beliefs(about: str | None = None) -> str:
+    """
+    Liste tout ce que tu penses de l'utilisateur et des humains (croyances actives), la plus
+    assuree d'abord. A utiliser quand l'utilisateur demande « que penses-tu de moi ? », ou
+    avant de noter une croyance pour verifier qu'elle n'existe pas deja (et la reviser via
+    `replaces` le cas echeant).
+
+    Args:
+        about: 'user', 'humans', ou omis pour tout lister.
+    """
+    url = f"{SYNAPTIQ_API_URL}/v1/beliefs"
+    try:
+        params = {"agent_id": require_agent_id()}
+        if about:
+            params["about"] = about
+        response = _lire(url, params)
+        refus = _refus(response)
+        if refus:
+            return refus
+        response.raise_for_status()
+        croyances = response.json().get("beliefs", [])
+        if not croyances:
+            return "Aucune croyance notee."
+        lignes = ["Ce que je pense (hypotheses, contestables) :"]
+        for c in croyances:
+            sujet = "utilisateur" if c["about"] == "user" else "humains"
+            indices = len(c.get("evidence") or [])
+            lignes.append(f"- [{sujet}, confiance {c['confidence']:.1f}, {indices} indice(s)] "
+                          f"{c['content']} (ID: {c['id']})")
+        return "\n".join(lignes)
+    except Exception as e:
+        return _echec("Echec de la lecture des croyances", e)
+
+
+@mcp.tool()
+def contest_belief(belief_id: str, reason: str | None = None) -> str:
+    """
+    Retire une croyance que l'utilisateur CONTESTE (« ce n'est pas vrai », « oublie ca »).
+    Elle sort du contexte et ne pourra pas etre renotee a l'identique. A n'utiliser qu'a la
+    demande de l'utilisateur, jamais pour « nettoyer » : pour changer d'avis toi-meme,
+    utiliser note_belief(..., replaces=id).
+
+    Args:
+        belief_id: Id de la croyance (cf. list_beliefs).
+        reason: Motif donne par l'utilisateur (facultatif).
+    """
+    url = f"{SYNAPTIQ_API_URL}/v1/beliefs/{belief_id}/contest"
+    try:
+        response = _poster(url, {"agent_id": require_agent_id(), "reason": reason})
+        refus = _refus(response)
+        if refus:
+            return refus
+        response.raise_for_status()
+        return f"[SUCCESS] Croyance {belief_id} contestee : elle ne sera plus utilisee."
+    except Exception as e:
+        return _echec("Echec de la contestation", e)
 
 
 if __name__ == "__main__":
