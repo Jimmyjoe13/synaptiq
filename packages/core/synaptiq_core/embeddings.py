@@ -222,6 +222,39 @@ def get_embedder() -> Embedder:
     raise EmbeddingError(f"EMBEDDING_PROVIDER inconnu : '{provider}'")
 
 
+# ─── Cache LRU pour les vecteurs d'embedding fréquents (Phase 4) ──────────────
+# Les requêtes d'un agent sont souvent répétées (même question, même contexte).
+# Le cache LRU évite les appels réseau répétés à LM Studio/OpenRouter pour des
+# textes identiques. Le cache est en mémoire (RAM), pas en Redis, car les
+# vecteurs sont volumineux (384 floats × 8 bytes = 3 Ko par vecteur).
+#
+# Taille du cache : EMBEDDING_CACHE_SIZE (défaut 128 vecteurs).
+# Chaque vecteur fait ~3 Ko, donc 128 vecteurs = ~384 Ko de RAM.
+#
+# Le cache est invalidé automatiquement par LRU (éviction du plus ancien).
+# Une invalidation proactive (purge à l'écriture) serait plus complexe et
+# le cache LRU suffit pour un usage d'agent où les questions changent peu.
+EMBEDDING_CACHE_SIZE = int(os.getenv("EMBEDDING_CACHE_SIZE", "128"))
+
+
+@lru_cache(maxsize=EMBEDDING_CACHE_SIZE)
+def _cached_embed(text: str) -> tuple[float, ...]:
+    """Embedding LRU mis en cache. Retourne un tuple (immuable, hashable).
+
+    Le cache est keyé sur le texte exact. Un texte différent = un cache miss.
+    """
+    return tuple(get_embedder().embed_one(text))
+
+
+def embed_cached(text: str) -> list[float]:
+    """Embedding avec cache LRU. Retourne une liste (compatible avec le reste du code).
+
+    Le cache est en mémoire (RAM), pas en Redis, car les vecteurs sont volumineux.
+    La taille du cache est configurable via EMBEDDING_CACHE_SIZE (défaut 128).
+    """
+    return list(_cached_embed(text))
+
+
 def generate_mock_embedding(text: str, dim: int = 384) -> list[float]:
     """Compat rétro : conservé pour l'ancien code et les tests. Utiliser get_embedder() ailleurs."""
     return MockEmbedder(dim=dim).embed_one(text)

@@ -934,6 +934,44 @@ def metrics() -> Response:
     _refresh_pipeline_gauges()
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
+
+@app.get("/v1/admin/slow-queries")
+def slow_queries(auth: AuthContext | None = Depends(get_auth), limit: int = Query(default=10, ge=1, le=100)):
+    """Endpoint admin : requêtes les plus lentes via pg_stat_statements.
+
+    Nécessite une clé API avec scope 'admin' (même si SYNAPTIQ_AUTH_REQUIRED=false).
+    Utile pour identifier les requêtes SQL qui ralentissent l'instance en production.
+    """
+    require_scope(auth, "admin")
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT query, calls,
+                           round(total_exec_time::numeric, 2) AS total_ms,
+                           round(mean_exec_time::numeric, 2) AS mean_ms,
+                           round(max_exec_time::numeric, 2) AS max_ms
+                    FROM pg_stat_statements
+                    WHERE query NOT LIKE '%%pg_stat_statements%%'
+                    ORDER BY total_exec_time DESC
+                    LIMIT %s;
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+                conn.rollback()
+            except Exception as e:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"pg_stat_statements indisponible (extension non activée ?) : {e}",
+                ) from None
+    return {"slow_queries": [dict(row) for row in rows]}
+
+
 @v1_router.post("/events", status_code=201)
 def capture_event(event: EventInput, auth: AuthContext | None = Depends(get_auth)):
     """

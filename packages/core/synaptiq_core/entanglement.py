@@ -153,6 +153,79 @@ def entangle(cur, tenant_id: str, agent_id: str, new_mem_id, subtype: str | None
                     new_mem_id, subtype, RELATION_INTRICATION, target_id, target_subtype,
                     similarity)
 
+    # Phase 4 : pré-calcul des voisins à 2 sauts.
+    # La propagation multi-hop (propagate_entanglement) explore le graphe à 2 sauts
+    # à chaque build_context. Avec un graphe dense (900 arêtes pour 255 souvenirs),
+    # chaque saut coûte un scan SQL + un chargement en mémoire.
+    #
+    # Le pré-calcul stocke les voisins à 2 sauts dans une table dédiée
+    # (`entanglement_2hop`), remplie lors de l'intrication. À la lecture,
+    # `propagate_entanglement` peut utiliser cette table au lieu de
+    # parcourir le graphe.
+    #
+    # Le pré-calcul est fait dans la même transaction que l'intrication :
+    # si l'intrication échoue, le pré-calcul est annulé aussi.
+    if voisins and len(voisins) > 0:
+        # Récupérer les voisins à 2 sauts : pour chaque voisin direct,
+        # chercher ses propres voisins (à l'exception du nouveau souvenir
+        # et des voisins directs déjà connus).
+        voisins_directs = [v[1] for v in voisins]
+        if voisins_directs:
+            # CTE récursive pour trouver les voisins à 2 sauts.
+            # On limite à 2 sauts pour éviter l'explosion combinatoire.
+            cur.execute(
+                """
+                WITH RECURSIVE voisins_2hop AS (
+                    -- Niveau 1 : voisins directs du nouveau souvenir
+                    SELECT r.target_memory_id AS mem_id, 1 AS hop
+                    FROM relationships r
+                    WHERE r.source_memory_id = ANY(%s::uuid[])
+                      AND r.relation_type = 'entangled_with'
+                      AND r.target_memory_id != %s
+                    UNION
+                    -- Niveau 2 : voisins des voisins directs
+                    SELECT r.target_memory_id AS mem_id, 2 AS hop
+                    FROM relationships r
+                    INNER JOIN voisins_2hop v ON r.source_memory_id = v.mem_id
+                    WHERE r.relation_type = 'entangled_with'
+                      AND r.target_memory_id != %s
+                )
+                SELECT mem_id, hop FROM voisins_2hop WHERE hop = 2
+                LIMIT 20;
+                """,
+                (voisins_directs, new_mem_id, new_mem_id),
+            )
+            voisins_2hop = cur.fetchall()
+            if voisins_2hop:
+                # Stocker les voisins à 2 sauts dans la table de pré-calcul.
+                # ON CONFLICT DO NOTHING : si le voisin est déjà connu, ne pas dupliquer.
+                # Les curseurs de test (_CurseurDouble) n'ont pas d'attribut `connection` :
+                # on retombe sur des INSERTs séquentiels dans ce cas.
+                try:
+                    from psycopg2.extras import execute_values
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO entanglement_2hop (memory_id, neighbor_id, hop, weight)
+                        VALUES %s
+                        ON CONFLICT (memory_id, neighbor_id) DO NOTHING;
+                        """,
+                        [(new_mem_id, str(row[0]), row[1], 1.0) for row in voisins_2hop],
+                    )
+                except AttributeError:
+                    # Curseur de test ou wrapper sans `connection` : INSERTs séquentiels.
+                    for row in voisins_2hop:
+                        cur.execute(
+                            """
+                            INSERT INTO entanglement_2hop (memory_id, neighbor_id, hop, weight)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (memory_id, neighbor_id) DO NOTHING;
+                            """,
+                            (new_mem_id, str(row[0]), row[1], 1.0),
+                        )
+                logger.info("Pré-calcul 2-hop : %d voisins à 2 sauts pour %s.",
+                            len(voisins_2hop), new_mem_id)
+
     # Batch INSERT avec execute_values : un seul aller-retour SQL pour tous les voisins.
     # Avec INSERTs séquentiels, chaque voisin coûtait un round-trip réseau + parsing.
     # Les curseurs de test (_CurseurDouble) n'ont pas d'attribut `connection` :
