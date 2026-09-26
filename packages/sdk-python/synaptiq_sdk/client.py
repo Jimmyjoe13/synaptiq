@@ -26,7 +26,7 @@ class SynaptiqClient:
             return {"status": "unhealthy", "error": str(e)}
 
     def capture(self, agent_id: str, session_id: str, content: str, metadata: dict[str, Any] | None = None,
-                idempotency_key: str | None = None) -> dict[str, Any]:
+                idempotency_key: str | None = None, project: str | None = None) -> dict[str, Any]:
         """
         Enregistre un événement ou une interaction brute dans SynaptiQ.
         Cet événement sera classifié et extrait en arrière-plan de manière asynchrone.
@@ -39,6 +39,9 @@ class SynaptiqClient:
             "metadata": metadata or {},
             "idempotency_key": idempotency_key,
         }
+        # Projet (lot B) : appliqué à tous les faits que le worker extraira de l'événement.
+        if project is not None:
+            payload["project"] = project
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=5)
             response.raise_for_status()
@@ -48,7 +51,8 @@ class SynaptiqClient:
 
     def build_context(self, agent_id: str, session_id: str, task: str, query: str, max_tokens: int = 1200,
                       memory_types: list[str] | None = None, explain: bool = False,
-                      collections: list[str] | None = None) -> dict[str, Any]:
+                      collections: list[str] | None = None, project: str | None = None,
+                      include_global: bool = True) -> dict[str, Any]:
         """
         Récupère un paquet de contexte structuré et minimaliste pour alimenter le prompt du LLM.
 
@@ -70,6 +74,10 @@ class SynaptiqClient:
         # « cette liste », et une liste vide y serait un filtre qui ne ramène rien.
         if collections is not None:
             contraintes["collections"] = collections
+        # Projet (lot B) : ce projet + les souvenirs globaux (sauf include_global=False).
+        if project is not None:
+            contraintes["project"] = project
+            contraintes["include_global"] = include_global
         payload = {
             "agent_id": agent_id,
             "session_id": session_id,
@@ -85,7 +93,9 @@ class SynaptiqClient:
         except Exception as e:
             raise RuntimeError(f"Échec de la récupération du contexte mémoire : {e}") from e
 
-    def store_memory(self, agent_id: str, memory_type: str, content: str, subtype: str | None = None, confidence: float = 1.0, importance: float = 0.5) -> dict[str, Any]:
+    def store_memory(self, agent_id: str, memory_type: str, content: str, subtype: str | None = None,
+                     confidence: float = 1.0, importance: float = 0.5,
+                     project: str | None = None) -> dict[str, Any]:
         """
         Permet à l'agent IA d'enregistrer de lui-même une information sémantique,
         procédurale ou épisodique dans sa mémoire à long terme.
@@ -99,6 +109,9 @@ class SynaptiqClient:
             "confidence": confidence,
             "importance": importance
         }
+        # None = souvenir GLOBAL (valable dans tous les projets).
+        if project is not None:
+            payload["project"] = project
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=5)
             response.raise_for_status()
@@ -107,7 +120,8 @@ class SynaptiqClient:
             raise RuntimeError(f"Échec de l'enregistrement de la mémoire par l'agent : {e}") from e
 
     def retrieve(self, agent_id: str, query: str, limit: int = 5, memory_type: str | None = None,
-                 collections: list[str] | None = None) -> dict[str, Any]:
+                 collections: list[str] | None = None, project: str | None = None,
+                 include_global: bool = True) -> dict[str, Any]:
         """
         Permet à l'agent IA de rechercher sémantiquement dans ses souvenirs.
 
@@ -124,6 +138,9 @@ class SynaptiqClient:
         # l'absence de filtre doit tout balayer.
         if collections is not None:
             payload["collections"] = collections
+        if project is not None:
+            payload["project"] = project
+            payload["include_global"] = include_global
         try:
             response = requests.post(url, json=payload, headers=self.headers, timeout=5)
             response.raise_for_status()

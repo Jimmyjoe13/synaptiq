@@ -74,19 +74,32 @@ export class SynaptiqClient {
     return response.json() as Promise<T>;
   }
 
-  capture(agent_id: string, session_id: string, content: string, metadata: Record<string, unknown> = {}, idempotency_key?: string) {
-    return this.post<{ status: string; event_id: string }>("/v1/events", { agent_id, session_id, content, metadata, idempotency_key });
+  /** `project` (lot B) : applique a tous les faits que le worker extraira de l'evenement. */
+  capture(agent_id: string, session_id: string, content: string, metadata: Record<string, unknown> = {}, idempotency_key?: string, project?: string) {
+    const body: Record<string, unknown> = { agent_id, session_id, content, metadata, idempotency_key };
+    if (project !== undefined) body.project = project;
+    return this.post<{ status: string; event_id: string }>("/v1/events", body);
   }
 
-  storeMemory(agent_id: string, type: MemoryType, content: string, subtype?: string, confidence = 1, importance = 0.5) {
-    return this.post<{ status: string; memory_id: string }>("/v1/memories", { agent_id, type, content, subtype, confidence, importance });
+  /** `project` absent = souvenir GLOBAL (valable dans tous les projets). */
+  storeMemory(agent_id: string, type: MemoryType, content: string, subtype?: string, confidence = 1, importance = 0.5, project?: string) {
+    const body: Record<string, unknown> = { agent_id, type, content, subtype, confidence, importance };
+    if (project !== undefined) body.project = project;
+    return this.post<{ status: string; memory_id: string; project: string | null }>("/v1/memories", body);
   }
 
-  /** `memory_type` filtre par famille cognitive, `collections` par rayon precis. */
-  retrieve(agent_id: string, query: string, limit = 5, memory_type?: MemoryType, collections?: string[]) {
+  /**
+   * `memory_type` filtre par famille cognitive, `collections` par rayon precis, `project`
+   * par projet (les souvenirs globaux restent inclus sauf `includeGlobal = false`).
+   */
+  retrieve(agent_id: string, query: string, limit = 5, memory_type?: MemoryType, collections?: string[], project?: string, includeGlobal = true) {
     const body: Record<string, unknown> = { agent_id, query, limit, memory_type };
     // Omis quand absent : une liste vide serait un filtre qui ne ramene rien.
     if (collections !== undefined) body.collections = collections;
+    if (project !== undefined) {
+      body.project = project;
+      body.include_global = includeGlobal;
+    }
     return this.post<{ memories: unknown[] }>("/v1/retrieve", body);
   }
 
@@ -126,7 +139,7 @@ export class SynaptiqClient {
    * sont toujours presentes, plus une section par collection declaree par l'agent, meme
    * vide. Iterer sur les entrees plutot que de lire sept cles en dur.
    */
-  buildContext(agent_id: string, session_id: string, task: string, query: string, options: { maxTokens?: number; memoryTypes?: MemoryType[]; collections?: string[]; explain?: boolean } = {}) {
+  buildContext(agent_id: string, session_id: string, task: string, query: string, options: { maxTokens?: number; memoryTypes?: MemoryType[]; collections?: string[]; explain?: boolean; project?: string; includeGlobal?: boolean } = {}) {
     const constraints: Record<string, unknown> = {
       max_tokens: options.maxTokens ?? 1200,
       memory_types: options.memoryTypes ?? ["semantic", "episodic", "procedural", "working"],
@@ -134,6 +147,11 @@ export class SynaptiqClient {
     // Omis quand absent : le serveur distingue « toutes les collections » d'une liste
     // explicite, et une liste vide serait un filtre qui ne ramene rien.
     if (options.collections !== undefined) constraints.collections = options.collections;
+    // Projet (lot B) : ce projet + les souvenirs globaux, sauf includeGlobal = false.
+    if (options.project !== undefined) {
+      constraints.project = options.project;
+      constraints.include_global = options.includeGlobal ?? true;
+    }
     return this.post<ContextResult>("/v1/context/build", {
       agent_id, session_id, task, query, explain: options.explain ?? false, constraints,
     });

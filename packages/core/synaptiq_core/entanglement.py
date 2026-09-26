@@ -48,6 +48,7 @@ import logging
 import os
 
 from synaptiq_core.embeddings import to_pgvector
+from synaptiq_core.project import activer_scan_iteratif, filtre_projet, mode_scan_iteratif
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +64,11 @@ RELATION_INTRICATION = "entangled_with"
 
 # `LIMIT %s` en paramètre lié plutôt qu'interpolé : la valeur est une constante de ce module,
 # mais une requête sans concaténation ne se relit pas pour vérifier qu'elle est sûre.
+# `{filtre_projet}` : fragment fixe de `project.filtre_projet` (vide pour un souvenir global).
 _SQL_VOISINS = """
     SELECT id, type, subtype, (1 - (embedding <=> %s::vector)) AS similarity
     FROM memories
-    WHERE tenant_id = %s AND agent_id = %s AND id != %s AND status = 'active'
+    WHERE tenant_id = %s AND agent_id = %s AND id != %s AND status = 'active' {filtre_projet}
     ORDER BY embedding <=> %s::vector
     LIMIT %s;
 """
@@ -94,7 +96,7 @@ def seuil_intrication() -> float:
 
 
 def entangle(cur, tenant_id: str, agent_id: str, new_mem_id, subtype: str | None,
-             embedding, threshold: float | None = None) -> int:
+             embedding, threshold: float | None = None, project: str | None = None) -> int:
     """Relie un souvenir à ses plus proches voisins sémantiques. Retourne le nombre d'arêtes.
 
     À appeler APRÈS l'insertion du souvenir (le `id != %s` l'exclut de ses propres voisins),
@@ -109,6 +111,11 @@ def entangle(cur, tenant_id: str, agent_id: str, new_mem_id, subtype: str | None
     `subtype` reste au contrat d'appel (les deux chemins d'écriture le passent) et n'est plus
     utilisé que pour la journalisation : le garder évite de toucher `apps/` et laisse la porte
     ouverte à un pré-filtre PAR TYPE — mais un pré-filtre ne serait toujours pas un verdict.
+
+    `project` (lot B, 26/09) : un souvenir de projet n'est relié qu'aux souvenirs du MÊME
+    projet et aux globaux. Sans cela, la propagation d'activation ferait passer le rappel
+    d'un projet à l'autre par le graphe, annulant le filtre posé à la recherche. Un
+    souvenir global (`project` None) peut, lui, être relié à tout projet.
     """
     if threshold is None:
         threshold = seuil_intrication()
@@ -118,8 +125,13 @@ def entangle(cur, tenant_id: str, agent_id: str, new_mem_id, subtype: str | None
     # l'index HNSW que sur l'opérateur de distance. Trier sur l'alias forçait un scan
     # complet des mémoires de l'agent À CHAQUE fait extrait — le coût de l'intrication
     # croissait donc linéairement avec la taille de la mémoire.
-    cur.execute(_SQL_VOISINS, (embedding_str, tenant_id, agent_id, new_mem_id, embedding_str,
-                               VOISINS_EXAMINES))
+    fragment, p_projet = filtre_projet(project, include_global=True)
+    if fragment:
+        activer_scan_iteratif(cur, mode_scan_iteratif())
+    # Fragment choisi parmi trois formes fixes par `filtre_projet` : aucune donnée d'appelant.
+    cur.execute(_SQL_VOISINS.format(filtre_projet=fragment),
+                (embedding_str, tenant_id, agent_id, new_mem_id, *p_projet, embedding_str,
+                 VOISINS_EXAMINES))
 
     aretes = 0
     for rel_row in cur.fetchall():

@@ -132,6 +132,21 @@ def restaurer_acces(conn, etat: dict) -> None:
     conn.commit()
 
 
+def appliquer_projets(conn, chemin_csv: str) -> None:
+    """Rattache les souvenirs du banc à leur projet d'après un CSV de backfill."""
+    import csv
+
+    with open(chemin_csv, encoding="utf-8", newline="") as f:
+        props = [(r["projet_propose"].strip(), r["id"]) for r in csv.DictReader(f)
+                 if r["projet_propose"].strip()]
+    with conn.cursor() as cur:
+        cur.executemany(
+            f"UPDATE memories SET project = %s WHERE id = %s AND tenant_id = '{TENANT_BANC}'",  # noqa: S608
+            props)
+    conn.commit()
+    log.info("%d souvenirs rattachés à un projet.", len(props))
+
+
 def rang(ids: list[str], gold: set[str]) -> int | None:
     """Rang (1-based) du premier gold dans la liste, None s'il est absent."""
     for i, mid in enumerate(ids, 1):
@@ -147,6 +162,11 @@ def main() -> int:
     ap.add_argument("--env", action="append", default=[], help="KEY=VAL (surcharge un réglage)")
     ap.add_argument("--out", default=None, help="JSON de résultats (défaut : à côté de la fixture)")
     ap.add_argument("--quiet", action="store_true")
+    # Lot B : rattacher les souvenirs à leur projet (CSV de scripts/backfill_project.py)
+    # puis filtrer chaque requête par son projet (JSON {qid: projet}). Mesure le gain du
+    # filtre projet à corpus identique.
+    ap.add_argument("--projects-csv", default=None)
+    ap.add_argument("--query-projects", default=None)
     args = ap.parse_args()
     logging.basicConfig(level=logging.WARNING if args.quiet else logging.INFO, format="%(message)s")
 
@@ -191,6 +211,12 @@ def main() -> int:
 
     conn = psycopg2.connect(dsn)
     etat = importer_fixture(conn, fixture)
+    if args.projects_csv:
+        appliquer_projets(conn, args.projects_csv)
+    projets_requetes: dict[str, str] = {}
+    if args.query_projects:
+        with open(args.query_projects, encoding="utf-8") as f:
+            projets_requetes = json.load(f)
     log.info("Fixture importée : %d souvenirs (%s) sous tenant %s. Réglages : %s",
              len(etat), agent, TENANT_BANC, reglages)
 
@@ -202,8 +228,11 @@ def main() -> int:
             ligne = {"qid": q["qid"], "query": q["query"], "gold": q["gold"]}
 
             t0 = time.perf_counter()
+            projet = projets_requetes.get(q["qid"])
+            filtre = {"project": projet} if projet else {}
+            ligne["project"] = projet
             r = client.post("/v1/retrieve", json={"agent_id": agent, "query": q["query"],
-                                                   "limit": TOP_RETRIEVE})
+                                                   "limit": TOP_RETRIEVE, **filtre})
             ligne["retrieve_ms"] = round((time.perf_counter() - t0) * 1000, 1)
             r.raise_for_status()
             ids = [str(m["id"]) for m in r.json()["memories"]]
@@ -214,7 +243,8 @@ def main() -> int:
                 t0 = time.perf_counter()
                 r = client.post("/v1/context/build", json={
                     "agent_id": agent, "session_id": "bench", "task": q["query"],
-                    "query": q["query"], "constraints": {"max_tokens": b}, "explain": True,
+                    "query": q["query"], "constraints": {"max_tokens": b, **filtre},
+                    "explain": True,
                 })
                 ms = round((time.perf_counter() - t0) * 1000, 1)
                 r.raise_for_status()

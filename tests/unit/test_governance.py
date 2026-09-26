@@ -129,7 +129,23 @@ def test_prefiltre_est_scope_tenant_agent_et_seuil():
     assert "embedding <=>" in query       # scoping sémantique par pgvector
     assert params[0] == "tenant1"
     assert params[1] == "agent1"
-    assert params[3] == 0.9               # seuil de pré-filtrage
+    assert params[2] is None              # projet : global par défaut
+    assert params[4] == 0.9               # seuil de pré-filtrage
+
+
+def test_prefiltre_confine_au_projet():
+    """Lot B : une préférence de projet ne confronte que les préférences du même projet.
+
+    `IS NOT DISTINCT FROM` et non `=` : une préférence GLOBALE (NULL) ne doit être comparée
+    qu'aux globales, et `project = NULL` ne serait jamais vrai.
+    """
+    cur = FakeCursor(proches=[])
+    handle_contradictions(cur, "tenant1", "agent1",
+                          {"type": "semantic", "subtype": "preference", "content": "x"},
+                          [0.1] * 384, threshold=0.9, judge=_non, project="emile")
+    query, params = cur.calls[0]
+    assert "project IS NOT DISTINCT FROM %s" in query
+    assert params[2] == "emile"
 
 
 # ─── Traçabilité de la supersession ──────────────────────────────────────────

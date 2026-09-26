@@ -31,6 +31,7 @@ from synaptiq_core import (
 from synaptiq_core.collections import charger_registre
 from synaptiq_core.embeddings import generate_mock_embedding  # noqa: F401 (compat rétro tests)
 from synaptiq_core.observability import configure_logging, set_trace_id
+from synaptiq_core.project import normaliser_projet
 from synaptiq_core.taxonomy import DEFAULT_SUBTYPE, VALID_SUBTYPES, normalize_extraction
 
 # Configuration du logging
@@ -446,14 +447,15 @@ def call_llm_extractor(event_content: str, occurred_at: str | None = None,
 _INSERT_MEMORY = """
     INSERT INTO memories (tenant_id, agent_id, type, subtype, content, summary, embedding,
                           confidence, importance, provenance, source_event_id,
-                          occurred_at, content_hash)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                          occurred_at, content_hash, project)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (source_event_id, content_hash) WHERE source_event_id IS NOT NULL DO NOTHING
     RETURNING id;
 """
 
 
-def _entangle(cur, tenant_id: str, agent_id: str, new_mem_id, fact: dict, embedding) -> None:
+def _entangle(cur, tenant_id: str, agent_id: str, new_mem_id, fact: dict, embedding,
+              project: str | None = None) -> None:
     """Relie un souvenir à ses plus proches voisins sémantiques (graphe Q-EM).
 
     Le corps vit dans `synaptiq_core.entanglement` : il était DÉFINI ici, donc seul le chemin
@@ -461,7 +463,8 @@ def _entangle(cur, tenant_id: str, agent_id: str, new_mem_id, fact: dict, embedd
     enveloppe ne fait qu'adapter la signature historique (`fact` complet) à celle du cœur,
     qui ne prend que le `subtype` dont la règle a besoin.
     """
-    entangle(cur, tenant_id, agent_id, new_mem_id, fact.get('subtype'), embedding)
+    entangle(cur, tenant_id, agent_id, new_mem_id, fact.get('subtype'), embedding,
+             project=project)
 
 
 def process_event(event: dict) -> bool:
@@ -478,6 +481,10 @@ def process_event(event: dict) -> bool:
     # Horodatage de l'événement : référence pour résoudre les dates relatives. Fourni par
     # l'API dans le payload outbox ; absent, le LLM ne pourra simplement pas dater.
     event_time = event.get('created_at')
+    # Projet de l'événement (lot B) : s'applique à TOUS les faits qu'il produit. Normalisé
+    # ici aussi (défense en profondeur : un payload peut venir d'une version antérieure).
+    # Redis Streams transporte des chaînes : une valeur vide vaut « global ».
+    project = normaliser_projet(event.get('project') or None)
 
     # Corrélation : tous les logs de la consolidation de cet événement porteront le même
     # identifiant, y compris ceux émis depuis synaptiq_core (extraction, gouvernance).
@@ -523,14 +530,15 @@ def process_event(event: dict) -> bool:
                 # Contradictions : archivage sur verdict EXPLICITE seulement (jamais sur la
                 # seule similarité). Les ids retournés serviront à tisser l'arête de
                 # supersession, une fois le nouvel id connu.
-                superseded = handle_contradictions(cur, tenant_id, agent_id, fact, embedding)
+                superseded = handle_contradictions(cur, tenant_id, agent_id, fact, embedding,
+                                                   project=project)
 
                 provenance = {"source": "event", "event_id": event_id}
                 cur.execute(_INSERT_MEMORY, (
                     tenant_id, agent_id, fact['type'], fact['subtype'], fact['content'],
                     fact['summary'], embedding, fact['confidence'], fact['importance'],
                     json.dumps(provenance), event_id,
-                    fact.get('occurred_at'), content_hash(fact['content']),
+                    fact.get('occurred_at'), content_hash(fact['content']), project,
                 ))
                 row = cur.fetchone()
                 if row is None:
@@ -549,7 +557,8 @@ def process_event(event: dict) -> bool:
 
                 # 4. Graphe d'intrication : la collection décide, plus la variable globale.
                 if _is_entanglement_candidate(fact, registre):
-                    _entangle(cur, tenant_id, agent_id, new_mem_id, fact, embedding)
+                    _entangle(cur, tenant_id, agent_id, new_mem_id, fact, embedding,
+                              project=project)
 
         conn.commit()
         if created == 0:

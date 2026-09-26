@@ -33,6 +33,7 @@ def handle_contradictions(
     new_embedding: list[float] | None = None,
     threshold: float | None = None,
     judge: ContradictionJudge | None = None,
+    project: str | None = None,
 ) -> list[str]:
     """Archive les préférences que la nouvelle **contredit explicitement**.
 
@@ -61,6 +62,11 @@ def handle_contradictions(
     À appeler AVANT d'insérer la nouvelle mémoire (sinon elle s'archiverait elle-même).
     Les ids retournés servent à tisser les arêtes `supersedes_by` une fois le nouvel id
     connu, ce qui rend la décision traçable et explicable.
+
+    `project` (lot B) : seules les préférences du MÊME périmètre sont candidates (même
+    projet, ou globales entre elles). Une préférence propre à un projet n'archive jamais la
+    préférence globale : les deux coexistent, et c'est le filtre de lecture qui sert la
+    plus spécifique dans le projet concerné.
     """
     if new_memory.get("type") != "semantic" or new_memory.get("subtype") != "preference":
         return []
@@ -84,9 +90,10 @@ def handle_contradictions(
           AND type = 'semantic'
           AND subtype = 'preference'
           AND status = 'active'
+          AND project IS NOT DISTINCT FROM %s
           AND (1 - (embedding <=> %s::vector)) >= %s
         """,
-        (tenant_id, agent_id, to_pgvector(new_embedding), seuil),
+        (tenant_id, agent_id, project, to_pgvector(new_embedding), seuil),
     )
     candidates = cur.fetchall()
     if not candidates:

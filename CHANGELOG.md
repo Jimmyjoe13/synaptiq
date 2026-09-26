@@ -13,6 +13,34 @@
 >   OpenRouter) et `a0b844b`. Le journal avait ces trous avant les tags ; les combler
 >   a posteriori aurait demande d'inventer des notes de version.
 
+## Unreleased — dimension PROJET (lot B du 26/09)
+
+Un agent generaliste melait tous ses projets dans une seule partition (`provenance` vide sur
+100 % des souvenirs reels). Migration `20260926_memory_project` : `memories.project` et
+`events.project` (NULL = souvenir GLOBAL), index partiel `(tenant_id, agent_id, project)`.
+
+- API : `project` sur `POST /v1/memories` et `/v1/events` ; `project` + `include_global`
+  (defaut vrai) sur `/v1/retrieve` et `context/build` (`constraints`). Nom normalise et valide
+  (`synaptiq_core.project`), 422 sinon. Sans `project`, comportement inchange.
+- Le filtre vaut dans CHAQUE chemin (vectoriel, plein texte, completion du graphe) ; scan
+  iteratif HNSW active sous filtre (`RETRIEVAL_HNSW_ITERATIVE`).
+- Graphe : un souvenir de projet n'est relie qu'a son projet et aux globaux. Contradictions :
+  confinees au meme projet (`IS NOT DISTINCT FROM`), une preference de projet n'archive
+  jamais la globale.
+- Worker : le projet de l'evenement s'applique a tous les faits extraits.
+- MCP : parametre `project` sur `store_memory`, `recall_memories`, `build_context`, defaut
+  `SYNAPTIQ_PROJECT` ; les 422 disent quel champ est refuse (`[REFUSE] project: ...`).
+- SDK Python et TypeScript : parametres `project` / `include_global`.
+- `scripts/backfill_project.py` : classement des souvenirs existants par mots-cles, en
+  simulation (CSV a relire) puis `--apply` en une transaction avec `audit_log`.
+- `migrations/env.py` force psycopg2 : SQLAlchemy 2.1 (tire par Alembic) prend psycopg 3 par
+  defaut pour `postgresql://`, et le service `migrate` aurait casse a la reconstruction.
+
+Mesure (banc, 16 requetes de projet, 1200 tokens) : souvenirs d'AUTRES projets dans le paquet
+15 % -> 0 %, souvenirs du bon projet 54 % -> 62 %. Pas de gain de rappel mesurable ; le seul
+recul (1 requete) vient d'un souvenir mal classe par le backfill a mots-cles — d'ou la
+relecture obligatoire du CSV.
+
 ## Unreleased — build_context ne perd plus la reponse (banc de rappel du 26/09)
 
 ### Constat

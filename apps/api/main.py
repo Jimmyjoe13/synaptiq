@@ -19,7 +19,7 @@ from typing import Any, Literal
 
 import numpy as np
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Response
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 v1_router = APIRouter()
 import redis
@@ -51,6 +51,12 @@ from synaptiq_core.context_builder import RetrievalConfig, build_context_packet
 from synaptiq_core.observability import configure_logging, set_trace_id
 
 # Taxonomie partagée avec le worker : les DEUX chemins d'écriture appliquent la même règle
+from synaptiq_core.project import (
+    activer_scan_iteratif,
+    filtre_projet,
+    mode_scan_iteratif,
+    normaliser_projet,
+)
 from synaptiq_core.qem import route_memory
 
 # Fusion de classements pour la recherche hybride (fonctions pures, cf. retrieval.py)
@@ -456,7 +462,9 @@ def audit(cur, tenant_id: str, action: str, auth: AuthContext | None,
 
 def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
                       agent_id: str, memory_types: list[str],
-                      collections: list[str] | None = None) -> list[dict]:
+                      collections: list[str] | None = None,
+                      project: str | None = None,
+                      include_global: bool = True) -> list[dict]:
     """Ramène les candidats par similarité vectorielle ET, si activé, par plein texte.
 
     Une seule requête à deux CTE plutôt que deux allers-retours : chaque ligne porte son
@@ -502,6 +510,16 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
     filtre_col = "AND subtype = ANY(%s)" if collections else ""
     filtre_col_m = "AND m.subtype = ANY(%s)" if collections else ""
     p_col: list = [collections] if collections else []
+    # Filtre PROJET (lot B), concaténé au filtre de collection : même position dans chaque
+    # WHERE, paramètres dans le même ordre (collections puis projet).
+    frag_projet, p_projet = filtre_projet(project, include_global)
+    frag_projet_m, _ = filtre_projet(project, include_global, alias="m.")
+    filtre_col = f"{filtre_col} {frag_projet}"
+    filtre_col_m = f"{filtre_col_m} {frag_projet_m}"
+    p_col = [*p_col, *p_projet]
+    if frag_projet:
+        # Filtre sélectif : sans scan itératif, HNSW rendrait moins que le LIMIT.
+        activer_scan_iteratif(cur, mode_scan_iteratif())
 
     # Interpolation limitee a `colonnes`/`colonnes_m` (listes de colonnes CONSTANTES,
     # definies juste au-dessus) : aucune valeur d'appelant n'entre dans le SQL, toutes
@@ -603,13 +621,18 @@ class PostgresMemoryStore:
     """
 
     def __init__(self, cur, tenant_id: str, agent_id: str,
-                 collections: list[str] | None = None) -> None:
+                 collections: list[str] | None = None,
+                 project: str | None = None, include_global: bool = True) -> None:
         self._cur = cur
         self._tenant = tenant_id
         self._agent = agent_id
         # Restriction optionnelle à certaines collections. Fixée à la construction, comme le
         # périmètre : le cœur n'a pas à savoir qu'un filtre de rangement existe.
         self._collections = collections
+        # Idem pour le projet (lot B) : il borne AUSSI la complétion du graphe
+        # (`fetch_by_ids`), sans quoi une arête ramènerait un souvenir d'un autre projet.
+        self._project = project
+        self._include_global = include_global
 
     @staticmethod
     def _normaliser(ligne) -> dict:
@@ -621,7 +644,7 @@ class PostgresMemoryStore:
     def fetch_candidates(self, query_vector, query_text: str, memory_types: list[str]) -> list[dict]:
         lignes = _fetch_candidates(self._cur, to_pgvector(query_vector), query_text,
                                    self._tenant, self._agent, memory_types,
-                                   self._collections)
+                                   self._collections, self._project, self._include_global)
         return [self._normaliser(ligne) for ligne in lignes]
 
     def fetch_relationships(self, memory_ids: list[str]) -> list[dict]:
@@ -637,16 +660,19 @@ class PostgresMemoryStore:
         return self._cur.fetchall()
 
     def fetch_by_ids(self, memory_ids: list[str]) -> list[dict]:
+        frag_projet, p_projet = filtre_projet(self._project, self._include_global)
+        # Fragment choisi par `filtre_projet` parmi trois formes fixes (aucune donnée
+        # d'appelant dans le SQL, le nom du projet passe en paramètre lié).
         self._cur.execute(
-            """
+            f"""
             SELECT id, type, subtype, content, confidence, importance,
                    last_accessed_at, created_at, occurred_at, embedding::text
             FROM memories
             WHERE id = ANY(%s::uuid[])
               AND tenant_id = %s AND agent_id = %s
-              AND status = 'active';
+              AND status = 'active' {frag_projet};
             """,
-            (memory_ids, self._tenant, self._agent),
+            (memory_ids, self._tenant, self._agent, *p_projet),
         )
         return [self._normaliser(ligne) for ligne in self._cur.fetchall()]
 
@@ -695,6 +721,15 @@ class EventInput(BaseModel):
     # Clé de déduplication optionnelle : deux appels avec la même clé (même tenant)
     # ne créent qu'un seul événement.
     idempotency_key: str | None = Field(default=None, max_length=128, json_schema_extra={"example": "evt-2026-07-15-001"})
+    # Projet du souvenir (lot B). None = global. Normalisé (minuscules) et validé par
+    # `synaptiq_core.project.normaliser_projet` : un nom invalide est refusé en 422.
+    project: str | None = Field(default=None, max_length=64,
+                                json_schema_extra={"example": "synaptiq"})
+
+    @field_validator("project")
+    @classmethod
+    def _normaliser_projet(cls, valeur):
+        return normaliser_projet(valeur)
 
 class ContextConstraints(BaseModel):
     max_tokens: int = Field(default=1200, ge=1, le=8000)
@@ -707,6 +742,16 @@ class ContextConstraints(BaseModel):
     # None = toutes les collections des familles retenues (comportement historique).
     collections: list[str] | None = Field(default=None, max_length=32,
                                           json_schema_extra={"example": ["clients_paca"]})
+    # Filtre projet (lot B). None = tous projets confondus (historique). Avec un projet,
+    # `include_global` ajoute les souvenirs globaux (préférences, conventions générales).
+    project: str | None = Field(default=None, max_length=64,
+                                json_schema_extra={"example": "synaptiq"})
+    include_global: bool = True
+
+    @field_validator("project")
+    @classmethod
+    def _normaliser_projet(cls, valeur):
+        return normaliser_projet(valeur)
 
 class ContextRequest(BaseModel):
     agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$", json_schema_extra={"example": "agent_sales_01"})
@@ -874,13 +919,15 @@ def capture_event(event: EventInput, auth: AuthContext | None = Depends(get_auth
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute(
                         """
-                        INSERT INTO events (tenant_id, agent_id, session_id, content, metadata, idempotency_key)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        INSERT INTO events (tenant_id, agent_id, session_id, content, metadata,
+                                            idempotency_key, project)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
                         RETURNING id, created_at;
                         """,
                         (tenant, event.agent_id, event.session_id,
-                         event.content, json.dumps(event.metadata), event.idempotency_key),
+                         event.content, json.dumps(event.metadata), event.idempotency_key,
+                         event.project),
                     )
                     result = cur.fetchone()
                     if result is None:
@@ -899,6 +946,8 @@ def capture_event(event: EventInput, auth: AuthContext | None = Depends(get_auth
                         "id": event_id, "tenant_id": tenant, "agent_id": event.agent_id,
                         "session_id": event.session_id, "content": event.content,
                         "metadata": json.dumps(event.metadata), "created_at": created_at,
+                        # Absent (None) pour un événement global : le worker le relit tel quel.
+                        "project": event.project,
                     }
                     cur.execute(
                         "INSERT INTO event_outbox (event_id, payload) VALUES (%s, %s) "
@@ -960,7 +1009,9 @@ def build_context(request: ContextRequest, auth: AuthContext | None = Depends(ge
             registre = charger_registre(cur, tenant, request.agent_id)
             resultat = build_context_packet(
                 store=PostgresMemoryStore(cur, tenant, request.agent_id,
-                                          request.constraints.collections),
+                                          request.constraints.collections,
+                                          request.constraints.project,
+                                          request.constraints.include_global),
                 query_vector=query_vector,
                 query_text=request.query,
                 memory_types=request.constraints.memory_types,
@@ -1006,6 +1057,15 @@ class MemoryInput(BaseModel):
     # régénérée à chaque tentative ne protégeant de rien.
     idempotency_key: str | None = Field(default=None, max_length=128,
                                         json_schema_extra={"example": "crm-row-4711"})
+    # Projet du souvenir (lot B). None = global. Normalisé (minuscules) et validé par
+    # `synaptiq_core.project.normaliser_projet` : un nom invalide est refusé en 422.
+    project: str | None = Field(default=None, max_length=64,
+                                json_schema_extra={"example": "synaptiq"})
+
+    @field_validator("project")
+    @classmethod
+    def _normaliser_projet(cls, valeur):
+        return normaliser_projet(valeur)
 
     @model_validator(mode="after")
     def _verifier_la_taxonomie(self):
@@ -1130,6 +1190,8 @@ def _reponse_memoire(memory: "MemoryInput", memory_id: str, statut: str, registr
         # de `if` : une collection qu'il a déclarée lui-même est donc honorée ici.
         "collection": route_memory(memory.type, memory.subtype, registre),
         "canonical_subtype": is_canonical(memory.type, memory.subtype),
+        # Projet effectivement enregistré (normalisé) : None = souvenir global.
+        "project": memory.project,
     }
 
 
@@ -1190,7 +1252,8 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                 "content": memory.content
             }
             # Archivage sur verdict EXPLICITE de contradiction seulement (cf. governance).
-            superseded = handle_contradictions(cur, tenant, memory.agent_id, new_mem_dict, embedding)
+            superseded = handle_contradictions(cur, tenant, memory.agent_id, new_mem_dict,
+                                               embedding, project=memory.project)
 
             # Insertion. `ON CONFLICT DO NOTHING` SANS cible : deux index uniques partiels
             # couvrent cette table (contenu et clé d'idempotence) et une clause `ON CONFLICT`
@@ -1201,8 +1264,9 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             # SELECT seul laisse ouverte.
             query = """
                 INSERT INTO memories (tenant_id, agent_id, type, subtype, content, embedding,
-                                      confidence, importance, status, content_hash, idempotency_key)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s)
+                                      confidence, importance, status, content_hash, idempotency_key,
+                                      project)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s)
                 ON CONFLICT DO NOTHING
                 RETURNING id;
             """
@@ -1217,6 +1281,7 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                 memory.importance,
                 empreinte,
                 memory.idempotency_key,
+                memory.project,
             ))
             ligne = cur.fetchone()
             if ligne is None:
@@ -1260,7 +1325,8 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             # transaction qui porte l'INSERT (cf. `collections.charger_registre`).
             registre = charger_registre(cur, tenant, memory.agent_id)
             if registre.entangle_pour(memory.type, memory.subtype):
-                entangle(cur, tenant, memory.agent_id, new_id, memory.subtype, embedding)
+                entangle(cur, tenant, memory.agent_id, new_id, memory.subtype, embedding,
+                         project=memory.project)
 
             # Réponse assemblée dans la MÊME transaction que l'insertion : `charger_registre`
             # lit en base, et le faire après le commit ouvrirait une transaction de plus.
@@ -1288,6 +1354,16 @@ class RetrieveRequest(BaseModel):
     memory_type: MemoryType | None = None
     # Symétrique de `ContextConstraints.collections` : viser un rayon plutôt qu'une famille.
     collections: list[str] | None = Field(default=None, max_length=32)
+    # Filtre projet (lot B). None = tous projets confondus (historique). Avec un projet,
+    # `include_global` ajoute les souvenirs globaux (préférences, conventions générales).
+    project: str | None = Field(default=None, max_length=64,
+                                json_schema_extra={"example": "synaptiq"})
+    include_global: bool = True
+
+    @field_validator("project")
+    @classmethod
+    def _normaliser_projet(cls, valeur):
+        return normaliser_projet(valeur)
 
 @v1_router.post("/retrieve")
 def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depends(get_auth)):
@@ -1321,6 +1397,13 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
             if request.collections:
                 type_filter += " AND m.subtype = ANY(%s)"
                 filtre_params.append(request.collections)
+            # Projet (lot B) : même fragment que `_fetch_candidates`, ajouté en dernier.
+            frag_projet, p_projet = filtre_projet(request.project, request.include_global,
+                                                  alias="m.")
+            if frag_projet:
+                type_filter += f" {frag_projet}"
+                filtre_params.extend(p_projet)
+                activer_scan_iteratif(cur, mode_scan_iteratif())
 
             if not RETRIEVAL_HYBRID:
                 cur.execute(f"""

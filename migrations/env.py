@@ -33,12 +33,27 @@ if not DATABASE_URL:
     raise SystemExit(2)
 
 
+def _url_psycopg2(url: str) -> str:
+    """Force le pilote psycopg2 sur une URL `postgresql://` sans pilote explicite.
+
+    SQLAlchemy 2.1 a changé le pilote par DÉFAUT de `postgresql://` : psycopg (v3) au lieu
+    de psycopg2. Alembic ne fixant pas la version de SQLAlchemy, une image reconstruite
+    tirait 2.1 et la migration échouait sur `No module named 'psycopg'` — le projet
+    n'embarque que `psycopg2-binary` (constaté le 26/09). Une URL qui nomme déjà son pilote
+    (`postgresql+xxx://`) est laissée telle quelle.
+    """
+    for prefixe in ("postgresql://", "postgres://"):
+        if url.startswith(prefixe):
+            return "postgresql+psycopg2://" + url[len(prefixe):]
+    return url
+
+
 def run_migrations_online() -> None:
     # L'URL est injectée dans la section lue par `engine_from_config`, et non via
     # `config.set_main_option` : ce dernier passe par l'interpolation de configparser, où un
     # `%` dans un mot de passe casserait la configuration.
     section = dict(config.get_section(config.config_ini_section) or {})
-    section["sqlalchemy.url"] = DATABASE_URL
+    section["sqlalchemy.url"] = _url_psycopg2(DATABASE_URL)
     connectable = engine_from_config(section, prefix="sqlalchemy.", poolclass=pool.NullPool)
     with connectable.connect() as connection:
         context.configure(connection=connection)

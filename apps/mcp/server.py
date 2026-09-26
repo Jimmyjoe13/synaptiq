@@ -41,6 +41,42 @@ SYNAPTIQ_API_KEY = os.getenv("SYNAPTIQ_API_KEY", "")
 # Un serveur qui refuse de demarrer vaut mieux qu'un serveur qui repond a cote en silence.
 SYNAPTIQ_AGENT_ID = os.getenv("SYNAPTIQ_AGENT_ID", "").strip()
 
+# Projet par DEFAUT de ce serveur (lot B, 26/09). Optionnel : un serveur declare par depot
+# (`.mcp.json`) peut fixer `SYNAPTIQ_PROJECT` pour que les outils visent ce projet sans que
+# l'agent ait a le repeter. Un parametre `project` explicite l'emporte toujours ; la valeur
+# speciale "global" force un souvenir global / une lecture sans filtre.
+SYNAPTIQ_PROJECT = os.getenv("SYNAPTIQ_PROJECT", "").strip() or None
+
+
+def _projet(explicite: str | None) -> str | None:
+    """Projet effectif d'un appel d'outil : l'argument, sinon le defaut du serveur."""
+    valeur = explicite if explicite is not None else SYNAPTIQ_PROJECT
+    if valeur is None or valeur.strip().lower() in ("", "global"):
+        return None
+    return valeur
+
+
+def _refus(response) -> str | None:
+    """Message `[REFUSE] ...` lisible pour un 4xx de validation, None sinon.
+
+    `raise_for_status()` seul transformait un 422 en « 422 Client Error » : l'agent ne
+    savait pas QUEL champ etait refuse (incident du 22/09 : `memory_type` au lieu de `type`,
+    invisible pendant des jours). Le detail FastAPI (liste de `{loc, msg}`) est aplati en
+    une ligne par champ.
+    """
+    if response.status_code not in (400, 404, 409, 422):
+        return None
+    try:
+        detail = response.json().get("detail", response.text)
+    except ValueError:
+        detail = response.text
+    if isinstance(detail, list):
+        detail = " ; ".join(
+            f"{'.'.join(str(x) for x in d.get('loc', []) if x != 'body')}: {d.get('msg')}"
+            for d in detail if isinstance(d, dict))
+    return f"[REFUSE] {detail}"
+
+
 # En-tête d'auth propagé à l'API si une clé est configurée (Phase 3, multi-tenant)
 HEADERS = {"Authorization": f"Bearer {SYNAPTIQ_API_KEY}"} if SYNAPTIQ_API_KEY else {}
 
@@ -267,7 +303,8 @@ def _echec(operation: str, err: Exception) -> str:
 
 
 @mcp.tool()
-def store_memory(content: str, memory_type: str, subtype: str | None = None) -> str:
+def store_memory(content: str, memory_type: str, subtype: str | None = None,
+                 project: str | None = None) -> str:
     """
     Enregistre de maniere autonome un fait, une preference, une regle ou un episode dans la memoire SynaptiQ.
 
@@ -280,6 +317,7 @@ def store_memory(content: str, memory_type: str, subtype: str | None = None) -> 
         content: Le souvenir ou fait a retenir (ex: 'L'utilisateur prefere les rapports courts').
         memory_type: La famille de memoire ('semantic' pour les faits/preferences, 'procedural' pour les regles/playbooks, 'episodic' pour les actions/resultats, 'working' pour le volatil).
         subtype: Nom de la collection (ex: 'preference', 'rule', 'clients_paca').
+        project: Projet auquel le souvenir appartient (ex: 'synaptiq', 'emile'). Omettre pour un souvenir GLOBAL, valable dans tous les projets (preferences de l'utilisateur, conventions generales). Un fait propre a un projet doit porter son projet : sinon il pollue le rappel des autres.
     """
     url = f"{SYNAPTIQ_API_URL}/v1/memories"
     try:
@@ -293,7 +331,13 @@ def store_memory(content: str, memory_type: str, subtype: str | None = None) -> 
             "confidence": 1.0,
             "importance": 0.5,
         }
+        projet = _projet(project)
+        if projet:
+            payload["project"] = projet
         response = _poster(url, payload)
+        refus = _refus(response)
+        if refus:
+            return refus
         response.raise_for_status()
         res_data = response.json()
 
@@ -315,8 +359,10 @@ def store_memory(content: str, memory_type: str, subtype: str | None = None) -> 
                        f"corriger un souvenir, en ecrire un NOUVEAU qui enonce la version a "
                        f"jour -- une reformulation a l'identique ne cree rien.")
             return message
+        portee = (f"projet '{res_data['project']}'" if res_data.get("project")
+                  else "global")
         message = (f"[SUCCESS] Memoire enregistree. ID: {res_data.get('memory_id')} | "
-                   f"servie dans la section '{collection}'")
+                   f"servie dans la section '{collection}' | {portee}")
         if subtype and not res_data.get("canonical_subtype") and collection != subtype:
             message += (f".\n[INFO] '{subtype}' n'est pas une collection declaree : le "
                         f"souvenir est range dans '{collection}', la section par defaut de "
@@ -466,7 +512,8 @@ def create_collection(name: str, family: str, description: str,
 
 @mcp.tool()
 def recall_memories(query: str, limit: int = 5, memory_type: str | None = None,
-                    collections: list[str] | None = None) -> str:
+                    collections: list[str] | None = None,
+                    project: str | None = None) -> str:
     """
     Recherche sementiquement des souvenirs ou regles dans la memoire SynaptiQ pour adapter les reponses ou actions de l'agent.
 
@@ -475,6 +522,7 @@ def recall_memories(query: str, limit: int = 5, memory_type: str | None = None,
         limit: Nombre maximum de souvenirs a ramener (default: 5).
         memory_type: Filtrer par famille de memoire ('semantic', 'procedural', 'episodic', 'working').
         collections: Restreindre a ces collections (cf. list_collections). Cible un rayon precis plutot qu'une famille entiere : moins de candidats, donc moins de bruit.
+        project: Restreindre a ce projet (ex: 'synaptiq') ; les souvenirs globaux restent inclus. Fortement recommande des que la question porte sur un projet precis : sans filtre, les autres projets noient le resultat.
     """
     url = f"{SYNAPTIQ_API_URL}/v1/retrieve"
     try:
@@ -488,7 +536,13 @@ def recall_memories(query: str, limit: int = 5, memory_type: str | None = None,
         # l'absence de filtre doit tout balayer.
         if collections:
             payload["collections"] = collections
+        projet = _projet(project)
+        if projet:
+            payload["project"] = projet
         response = _poster(url, payload)
+        refus = _refus(response)
+        if refus:
+            return refus
         response.raise_for_status()
         memories = response.json().get("memories", [])
 
@@ -514,7 +568,8 @@ _LIBELLES_CANONIQUES = {
 
 @mcp.tool()
 def build_context(task: str, query: str, max_tokens: int = 1200,
-                  collections: list[str] | None = None) -> str:
+                  collections: list[str] | None = None,
+                  project: str | None = None) -> str:
     """
     Assemble un paquet de contexte compact (Q-EM) pret a injecter dans le prompt systeme
     de l'agent : faits, preferences, episodes, regles, bonnes pratiques, erreurs, plus une
@@ -525,6 +580,7 @@ def build_context(task: str, query: str, max_tokens: int = 1200,
         query: La requete de rappel semantique (ex: 'style d'ecriture, preferences client').
         max_tokens: Budget de tokens du contexte (default: 1200).
         collections: Restreindre le rappel a ces collections (cf. list_collections). Cible un rayon precis au lieu de ratisser toute la memoire : moins de bruit a budget de tokens egal. Omettre pour tout balayer.
+        project: Projet de la tache en cours (ex: 'synaptiq'). Le paquet ne contient alors que ce projet et les souvenirs globaux.
     """
     url = f"{SYNAPTIQ_API_URL}/v1/context/build"
     try:
@@ -534,6 +590,9 @@ def build_context(task: str, query: str, max_tokens: int = 1200,
         }
         if collections:
             contraintes["collections"] = collections
+        projet = _projet(project)
+        if projet:
+            contraintes["project"] = projet
         payload = {
             "agent_id": require_agent_id(),
             "session_id": "mcp-session",
@@ -542,6 +601,9 @@ def build_context(task: str, query: str, max_tokens: int = 1200,
             "constraints": contraintes,
         }
         response = _poster(url, payload)
+        refus = _refus(response)
+        if refus:
+            return refus
         response.raise_for_status()
         data = response.json()
         packet = data.get("context_packet", {})

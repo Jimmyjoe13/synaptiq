@@ -342,3 +342,50 @@ def test_recall_memories_omet_le_filtre_quand_il_est_absent(http):
     etat["charge"] = {"memories": []}
     _outil("recall_memories")("une requete")
     assert "collections" not in appels[0]["payload"]
+
+
+# ─── 6. Projet (lot B) et refus lisibles ─────────────────────────────────────
+
+def test_store_memory_transmet_le_projet(http):
+    appels, etat = http
+    etat["charge"] = {"status": "created", "memory_id": "m1", "collection": "facts",
+                      "canonical_subtype": True, "project": "emile"}
+    message = _outil("store_memory")("x", "semantic", "fact", project="emile")
+    assert appels[0]["payload"]["project"] == "emile"
+    assert "projet 'emile'" in message
+
+
+def test_sans_projet_le_souvenir_est_global(http, monkeypatch):
+    monkeypatch.setattr(mcp_server, "SYNAPTIQ_PROJECT", None)
+    appels, etat = http
+    etat["charge"] = {"status": "created", "memory_id": "m1", "collection": "facts",
+                      "canonical_subtype": True, "project": None}
+    message = _outil("store_memory")("x", "semantic", "fact")
+    assert "project" not in appels[0]["payload"]
+    assert "global" in message
+
+
+def test_le_projet_par_defaut_du_serveur_s_applique(http, monkeypatch):
+    """`SYNAPTIQ_PROJECT` (déclaré par dépôt) évite à l'agent de répéter le projet."""
+    monkeypatch.setattr(mcp_server, "SYNAPTIQ_PROJECT", "synaptiq")
+    appels, etat = http
+    etat["charge"] = {"memories": []}
+    _outil("recall_memories")("q")
+    assert appels[0]["payload"]["project"] == "synaptiq"
+
+
+def test_global_explicite_neutralise_le_projet_par_defaut(http, monkeypatch):
+    monkeypatch.setattr(mcp_server, "SYNAPTIQ_PROJECT", "synaptiq")
+    appels, etat = http
+    etat["charge"] = {"token_estimate": 0, "context_packet": {}}
+    _outil("build_context")("t", "q", project="global")
+    assert "project" not in appels[0]["payload"]["constraints"]
+
+
+def test_un_422_dit_quel_champ_est_refuse(http):
+    """Incident du 22/09 : un 422 opaque cachait `memory_type` envoyé au lieu de `type`."""
+    _, etat = http
+    etat["status"] = 422
+    etat["charge"] = {"detail": [{"loc": ["body", "project"], "msg": "Nom de projet invalide"}]}
+    message = _outil("store_memory")("x", "semantic", project="mon projet")
+    assert message == "[REFUSE] project: Nom de projet invalide"
