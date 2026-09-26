@@ -113,14 +113,21 @@ def test_le_routage_retourne_par_l_ecriture_vient_du_registre(client, db):
     # Le nom n'est pas canonique : l'agent doit pouvoir le savoir.
     assert resp.json()["canonical_subtype"] is False
 
-    # Le MÊME sous-type, écrit par un agent qui ne l'a pas déclaré, retombe sur la section
-    # de repli de sa famille — comportement historique, préservé.
+    # Le MÊME sous-type, écrit par un agent qui ne l'a pas déclaré : depuis `e444408`, il
+    # est AUTO-DÉCLARÉ pour cet agent (plus de rayon fantôme servi dans `facts`). Ce qui
+    # doit tenir, c'est l'isolation : agentB obtient SA propre collection, il n'hérite pas
+    # de celle d'agentA.
     autre = client.post("/memories", json={
         "agent_id": "agentB", "type": "semantic", "subtype": "clients_paca",
         "content": "Contenu ecrit par un autre agent.",
     })
     assert autre.status_code == 201, autre.text
-    assert autre.json()["collection"] == "facts"
+    assert autre.json()["collection"] == "clients_paca"
+    with db.cursor() as cur:
+        cur.execute("SELECT agent_id FROM memory_collections WHERE tenant_id = %s "
+                    "AND name = 'clients_paca' AND created_by = 'agent' ORDER BY agent_id",
+                    (TENANT,))
+        assert [r[0] for r in cur.fetchall()] == ["agentA", "agentB"]
 
 
 def test_memory_count_reflete_les_souvenirs_reels(client, db):

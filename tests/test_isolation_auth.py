@@ -265,7 +265,9 @@ def test_sous_type_libre_accepte_et_routage_annonce(client):
     })
     assert resp.status_code == 201
     corps = resp.json()
-    assert corps["collection"] == "facts"          # retombe sur la collection du type
+    # Depuis `e444408`, un libellé libre est auto-déclaré : il obtient sa propre section
+    # au lieu de retomber, invisible, dans `facts`.
+    assert corps["collection"] == "nana_intelligence_lead_webhook"
     assert corps["canonical_subtype"] is False     # dit explicitement que c'est un libellé libre
 
 
