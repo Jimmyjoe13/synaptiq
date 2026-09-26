@@ -83,8 +83,17 @@ QEM_ENTANGLE_DAMPING = float(os.getenv("QEM_ENTANGLE_DAMPING", "0.5"))
 # Nombre maximal de sauts de propagation d'activation (spreading activation multi-hop).
 # 1 = comportement mono-saut historique ; 2 (défaut) ramène les souvenirs à 2 liens.
 QEM_ENTANGLE_MAX_HOPS = int(os.getenv("QEM_ENTANGLE_MAX_HOPS", "2"))
-# Au-delà de ce cosinus entre deux candidats, le moins prioritaire est filtré (redondance).
-QEM_REDUNDANCY_THRESHOLD = float(os.getenv("QEM_REDUNDANCY_THRESHOLD", "0.75"))
+# Agrégation des apports reçus de plusieurs parents : "max" (défaut, borne l'activation
+# d'un nœud très connecté) ou "sum" (historique : les hubs dépassaient les seeds).
+QEM_ENTANGLE_AGGREGATION = os.getenv("QEM_ENTANGLE_AGGREGATION", "max")
+# Au-delà de ce cosinus entre deux candidats, le moins bien classé est filtré (redondance).
+# 0.75 -> 0.90 le 26/09 : avec le modèle multilingue, deux souvenirs DISTINCTS du même
+# auteur montent couramment à 0,76-0,86 ; les vrais quasi-doublons sont au-dessus de 0,95.
+QEM_REDUNDANCY_THRESHOLD = float(os.getenv("QEM_REDUNDANCY_THRESHOLD", "0.90"))
+# Collapse : nombre de meilleurs candidats (par score) admis avant la densité d'utilité,
+# et exposant β de la densité score/tokens**β (1 = historique, <1 pénalise moins la longueur).
+QEM_COLLAPSE_TOP_K = int(os.getenv("QEM_COLLAPSE_TOP_K", "3"))
+QEM_DENSITY_EXPONENT = float(os.getenv("QEM_DENSITY_EXPONENT", "0.5"))
 # Décroissance temporelle : demi-vie (en jours) du score de récence. Une mémoire non
 # ré-accédée voit sa pertinence divisée par 2 tous les N jours. 0 (ou négatif) = désactivé.
 QEM_RECENCY_HALFLIFE_DAYS = float(os.getenv("QEM_RECENCY_HALFLIFE_DAYS", "14"))
@@ -666,8 +675,11 @@ def retrieval_config() -> RetrievalConfig:
         weight_fts=RRF_WEIGHT_FTS,
         entangle_damping=QEM_ENTANGLE_DAMPING,
         entangle_max_hops=QEM_ENTANGLE_MAX_HOPS,
+        entangle_aggregation=QEM_ENTANGLE_AGGREGATION,
         redundancy_threshold=QEM_REDUNDANCY_THRESHOLD,
         recency_halflife_days=QEM_RECENCY_HALFLIFE_DAYS,
+        collapse_top_k=QEM_COLLAPSE_TOP_K,
+        density_exponent=QEM_DENSITY_EXPONENT,
     )
 
 
@@ -703,6 +715,12 @@ class ContextRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=8000, json_schema_extra={"example": "Style d'écriture concis de Jimmy"})
     constraints: ContextConstraints = Field(default_factory=ContextConstraints)
     explain: bool = False
+    # "selected" : trace des retenus (historique) ; "all" : tous les candidats, avec le
+    # motif d'exclusion (redondance et par qui, contradiction, hors budget).
+    explain_level: Literal["selected", "all"] = "selected"
+    # Rafraîchir last_accessed_at / access_count des retenus. Toujours désactivé quand
+    # `explain` est vrai : un diagnostic ne doit pas modifier la récence qu'il observe.
+    record_access: bool = True
 
 # Âge maximal toléré du plus vieil événement non publié avant de déclarer l'ingestion en
 # panne. 300 s : très au-delà du cycle du relais (OUTBOX_POLL_SECONDS=0.5), donc aucun faux
@@ -951,6 +969,8 @@ def build_context(request: ContextRequest, auth: AuthContext | None = Depends(ge
                 trace_id=trace_id,
                 explain=request.explain,
                 registry=registre,
+                explain_level=request.explain_level,
+                record_access=request.record_access and not request.explain,
             )
             # `mark_accessed` a ecrit dans la transaction : la valider.
             conn.commit()

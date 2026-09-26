@@ -298,15 +298,52 @@ def test_la_paire_pratique_erreur_se_renforce_au_lieu_de_s_annuler():
     assert candidates["PRATIQUE"]["score"] > 0.0
 
 
-def test_redondance_annule_le_moins_important():
-    """Deux embeddings identiques (cosinus 1.0 > seuil) -> seul le plus important survit."""
+def test_redondance_annule_le_moins_bien_classe():
+    """Deux embeddings identiques (cosinus 1.0 > seuil) -> seul le meilleur SCORE survit."""
     candidates = {
-        "HI": _cand("HI", importance=0.8, embedding=[1.0, 0.0, 0.0], score=1.0),
-        "LO": _cand("LO", importance=0.5, embedding=[1.0, 0.0, 0.0], score=1.0),
+        "HI": _cand("HI", embedding=[1.0, 0.0, 0.0], score=0.9),
+        "LO": _cand("LO", embedding=[1.0, 0.0, 0.0], score=0.4),
     }
     filter_redundancy(candidates, threshold=0.75)
-    assert candidates["HI"]["score"] == 1.0
+    assert candidates["HI"]["score"] == 0.9
     assert candidates["LO"]["score"] == 0.0
+
+
+def test_redondance_le_score_prime_sur_la_recence():
+    """Régression du banc du 26/09 : un souvenir récent mais hors sujet (0,083) annulait
+    le souvenir attendu (0,877) parce que le tri se faisait sur (importance, date) et que
+    l'importance vaut 0,5 partout. Le mieux classé doit gagner, quelle que soit sa date."""
+    candidates = {
+        "ANCIEN_PERTINENT": _cand("ANCIEN_PERTINENT", score=0.877,
+                                  created_at=datetime(2026, 8, 5)),
+        "RECENT_HORS_SUJET": _cand("RECENT_HORS_SUJET", score=0.083,
+                                   created_at=datetime(2026, 9, 22)),
+    }
+    filter_redundancy(candidates, threshold=0.75)
+    assert candidates["ANCIEN_PERTINENT"]["score"] == 0.877
+    assert candidates["RECENT_HORS_SUJET"]["score"] == 0.0
+
+
+def test_redondance_a_score_egal_le_plus_recent_gagne():
+    candidates = {
+        "VIEUX": _cand("VIEUX", score=0.5, created_at=datetime(2026, 1, 1)),
+        "NEUF": _cand("NEUF", score=0.5, created_at=datetime(2026, 6, 1)),
+    }
+    filter_redundancy(candidates, threshold=0.75)
+    assert candidates["NEUF"]["score"] == 0.5
+    assert candidates["VIEUX"]["score"] == 0.0
+
+
+def test_redondance_ne_touche_jamais_un_protege():
+    """La priorité de build_context (1er du rang fusionné) n'est jamais annulée, même face
+    à un candidat mieux scoré après propagation : elle peut annuler, pas être annulée."""
+    candidates = {
+        "PRIO": _cand("PRIO", score=0.6),
+        "AUTRE": _cand("AUTRE", score=0.9),
+    }
+    filter_redundancy(candidates, threshold=0.75, proteges=["PRIO"])
+    assert candidates["PRIO"]["score"] == 0.6
+    assert candidates["AUTRE"]["score"] == 0.0
 
 
 def test_redondance_embeddings_distincts_conserves():
@@ -402,7 +439,8 @@ def test_redondance_equivalente_a_la_reference_naive():
 
     def _reference(cands, seuil):
         actifs = [c for c, v in cands.items() if v["score"] > 0.0]
-        actifs.sort(key=lambda c: (cands[c]["importance"], cands[c]["created_at"]), reverse=True)
+        # Même ordre que l'implémentation : score décroissant, puis le plus récent.
+        actifs.sort(key=lambda c: (cands[c]["score"], cands[c]["created_at"]), reverse=True)
         for i in range(len(actifs)):
             if cands[actifs[i]]["score"] == 0.0:
                 continue
@@ -419,10 +457,11 @@ def test_redondance_equivalente_a_la_reference_naive():
         for k in range(8):
             vec = [rng.gauss(0, 1) for _ in range(6)]
             norme = sum(x * x for x in vec) ** 0.5
-            base[f"m{k}"] = {"importance": round(rng.uniform(0, 1), 3),
+            base[f"m{k}"] = {"score": round(rng.uniform(0.01, 1), 3),
+                             "created_at": datetime(2026, 1, 1 + rng.randrange(28)),
                              "embedding": [x / norme for x in vec]}
-        vectorise = {k: _cand(k, score=1.0, **v) for k, v in base.items()}
-        naif = {k: _cand(k, score=1.0, **v) for k, v in base.items()}
+        vectorise = {k: _cand(k, **v) for k, v in base.items()}
+        naif = {k: _cand(k, **v) for k, v in base.items()}
 
         filter_redundancy(vectorise, threshold=0.3)
         _reference(naif, 0.3)
@@ -620,3 +659,72 @@ def test_le_prefixe_est_compte_dans_le_budget():
     candidates = {"m1": _cand("m1", content=contenu, score=1.0, occurred_at=date)}
     _, _, tokens = collapse_by_utility(candidates, max_tokens=10_000)
     assert tokens == estimate_tokens(format_entry(contenu, date))
+
+
+# ─── Collapse : top_k et exposant de densité (banc de rappel du 26/09) ───────
+
+def _long_et_courts():
+    """Un souvenir long et très pertinent face à des souvenirs brefs et moyens."""
+    cands = {"LONG": _cand("LONG", score=0.96, content=" ".join(["mot"] * 100))}
+    for i in range(10):
+        cands[f"C{i}"] = _cand(f"C{i}", score=0.5, content="bref souvenir générique")
+    return cands
+
+
+def test_collapse_historique_ecarte_le_long_pertinent():
+    """Comportement par défaut (top_k=0, β=1) inchangé : la densité favorise le court."""
+    _, sel, _ = collapse_by_utility(_long_et_courts(), max_tokens=60)
+    assert "LONG" not in sel
+
+
+def test_collapse_top_k_admet_le_meilleur_avant_la_densite():
+    _, sel, _ = collapse_by_utility(_long_et_courts(), max_tokens=160, top_k=1)
+    assert sel[0] == "LONG"
+
+
+def test_collapse_top_k_respecte_le_plafond_de_budget():
+    """top_k n'est pas une dérogation au budget : trop cher, le meilleur n'entre pas."""
+    _, sel, tokens = collapse_by_utility(_long_et_courts(), max_tokens=60, top_k=1)
+    assert "LONG" not in sel and tokens <= 60
+
+
+def test_collapse_exposant_attenue_la_penalite_de_longueur():
+    """β décide du classement entre un souvenir moyen pertinent et un bref peu pertinent.
+
+    MOYEN : 10 mots -> 13 tokens, score 0,9 ; BREF : 2 mots -> 2 tokens, score 0,3.
+      β=1   : 0,9/13 = 0,069  <  0,3/2 = 0,150       -> BREF d'abord (historique)
+      β=0,5 : 0,9/3,61 = 0,250 > 0,3/1,41 = 0,212     -> MOYEN d'abord
+    """
+    cands = {
+        "MOYEN": _cand("MOYEN", score=0.9, content=" ".join(["mot"] * 10)),
+        "BREF": _cand("BREF", score=0.3, content="deux mots"),
+    }
+    _, sel_b1, _ = collapse_by_utility(dict(cands), max_tokens=15, density_exponent=1.0)
+    _, sel_b05, _ = collapse_by_utility(dict(cands), max_tokens=15, density_exponent=0.5)
+    assert sel_b1[0] == "BREF"
+    assert sel_b05[0] == "MOYEN"
+
+
+# ─── Intrication : agrégation des apports de plusieurs parents (26/09) ───────
+
+def _hub_relie_a(n_seeds, sim=0.5):
+    cands = {f"S{i}": _cand(f"S{i}", similarity=sim, score=sim) for i in range(n_seeds)}
+    cands["HUB"] = _cand("HUB", similarity=0.0, score=0.0)
+    rels = [{"source_memory_id": f"S{i}", "target_memory_id": "HUB",
+             "relation_type": "entangled_with", "weight": 1.0} for i in range(n_seeds)]
+    return cands, rels
+
+
+def test_propagation_max_borne_un_noeud_tres_connecte():
+    """Un hub relié à dix seeds ne dépasse plus les seeds qui l'activent."""
+    cands, rels = _hub_relie_a(10)
+    propagate_entanglement(cands, rels, damping=0.5, max_hops=1)
+    assert cands["HUB"]["score"] == 0.25          # meilleur chemin : 0,5 x 1 x 0,5
+    assert cands["HUB"]["score"] < cands["S0"]["score"]
+
+
+def test_propagation_sum_reste_disponible():
+    """Mode historique : les apports s'additionnent (2,5 > tout seed) — c'était le bug."""
+    cands, rels = _hub_relie_a(10)
+    propagate_entanglement(cands, rels, damping=0.5, max_hops=1, aggregation="sum")
+    assert cands["HUB"]["score"] == 2.5

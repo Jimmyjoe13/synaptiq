@@ -13,6 +13,48 @@
 >   OpenRouter) et `a0b844b`. Le journal avait ces trous avant les tags ; les combler
 >   a posteriori aurait demande d'inventer des notes de version.
 
+## Unreleased — build_context ne perd plus la reponse (banc de rappel du 26/09)
+
+### Constat
+Un banc reproductible (`scripts/bench_export.py` + `benchmarks/recall_bench.py`, 20 requetes
+avec souvenir attendu identifie a la main, corpus reel d'un agent rejoue sur la base de dev)
+a montre que `/context/build` servait MOINS bien la reponse que la simple recherche : le
+souvenir attendu n'etait dans le paquet (1200 tokens) que dans 55 % des cas, contre 80 % dans
+le top 10 de `/retrieve`. Diagnostic phase par phase : 10 des 14 pertes venaient du filtre de
+redondance, 3 de la densite d'utilite, 1 du vivier.
+
+### Corrige
+- **Redondance** (`qem.filter_redundancy`) : le mieux CLASSE gagne (tri par score, la date
+  ne departage qu'a egalite). Le tri `(importance, created_at)` faisait gagner le plus recent,
+  `importance` valant 0,5 partout. La priorite de `build_context` n'est plus annulable.
+  Seuil `QEM_REDUNDANCY_THRESHOLD` 0,75 -> **0,90** (souvenirs distincts a 0,76-0,86 avec le
+  modele multilingue).
+- **Intrication** (`qem.propagate_entanglement`) : un voisin garde le MEILLEUR apport de ses
+  parents au lieu de leur somme (`QEM_ENTANGLE_AGGREGATION=max`, `sum` = historique). Un hub
+  relie a dix seeds depassait tous les souvenirs ayant reellement matche la requete.
+- **Collapse** (`qem.collapse_by_utility`) : les `QEM_COLLAPSE_TOP_K=3` meilleurs par score
+  entrent avant la densite, puis densite `score / tokens**QEM_DENSITY_EXPONENT` (0,5).
+- **Worker** : `zip(..., strict=True)` et l'embedder exige un vecteur par texte (index 0..n-1).
+  Un lot court faisait disparaitre des faits en silence, evenement acquitte.
+- **Worker** : un echec de `XAUTOCLAIM` est journalise en WARNING (+ compteur
+  `synaptiq_worker_reclaim_errors_total`) au lieu de DEBUG.
+- **Registre** : le SAVEPOINT vit dans `collections.charger_registre` (commun API, rappel,
+  worker) ; `_charger_registre_isole` disparait.
+
+### Ajoute
+- `ContextRequest.explain_level` (`selected` | `all`) : `all` trace tous les candidats avec le
+  motif d'exclusion (`cancelled_redondance` + `cancelled_by` + `cosine`, `over_token_budget`...).
+  Champ `priority` sur les retenus ; libelle historique conserve.
+- `ContextRequest.record_access` (defaut vrai), **force a faux quand `explain` est vrai** : un
+  diagnostic ne rafraichit plus `last_accessed_at` (le premier banc avait ecrit en production).
+
+### Resultat (banc, 1200 tokens)
+Souvenir attendu dans le paquet : 55 % -> **80 %** (`/retrieve` top 10 : 80 %). MRR 0,41 -> 0,55.
+Le souvenir le plus frequent n'apparait plus que dans 60 % des paquets (75 % avant).
+
+### Non mesure
+LOCOMO n'a pas ete rejoue (exige un endpoint LLM et plusieurs heures).
+
 ## 0.3.1 - Unreleased — les conteneurs se pointaient sur eux-memes
 
 ### Regression de `a0b844b` : `EMBEDDING_BASE_URL` en conteneur

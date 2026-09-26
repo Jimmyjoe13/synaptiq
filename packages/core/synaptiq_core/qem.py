@@ -66,6 +66,7 @@ def propagate_entanglement(
     relationships: list[dict],
     damping: float,
     max_hops: int = 2,
+    aggregation: str = "max",
 ) -> None:
     """Propage l'activation le long des liens 'entangled_with' — spreading activation.
 
@@ -84,6 +85,16 @@ def propagate_entanglement(
       - N'agit que si les deux extrémités du lien sont présentes dans `candidates`.
 
     `max_hops <= 0` désactive la propagation.
+
+    ## `aggregation` : un nœud relié à beaucoup de seeds ne doit pas tout écraser (26/09)
+
+    Les apports de plusieurs parents d'un même niveau étaient SOMMÉS. Un souvenir très
+    connecté (le graphe de claude_code_orchestrator compte 900 arêtes pour 255 souvenirs)
+    relié à dix seeds de similarité 0,5 recevait 10 × 0,5 × 0,5 = 2,5 : plus que n'importe
+    quel souvenir ayant réellement matché la requête (scores ≤ 1). Les mêmes « hubs »
+    génériques entraient ainsi dans presque tous les paquets. `max` (défaut) retient le
+    meilleur chemin : l'activation reçue reste bornée par `damping × meilleur parent`, donc
+    toujours inférieure au seed qui l'a produite. `sum` conserve l'ancien comportement.
     """
     if max_hops <= 0:
         return
@@ -109,16 +120,19 @@ def propagate_entanglement(
     visited = set(frontier)
 
     for _hop in range(max_hops):
-        # Contributions du niveau courant, sommées AVANT de marquer `visited` :
-        # un nœud atteint par plusieurs parents au même niveau cumule leurs apports.
+        # Contributions du niveau courant, agrégées AVANT de marquer `visited` : un nœud
+        # atteint par plusieurs parents au même niveau garde le meilleur apport (ou leur
+        # somme en mode `sum`, historique).
         level_contrib: dict[str, float] = {}
         for node in frontier:
             for neighbor, weight in adjacency.get(node, []):
                 if neighbor in visited:
                     continue
-                level_contrib[neighbor] = (
-                    level_contrib.get(neighbor, 0.0) + activation[node] * weight * damping
-                )
+                apport = activation[node] * weight * damping
+                if aggregation == "sum":
+                    level_contrib[neighbor] = level_contrib.get(neighbor, 0.0) + apport
+                else:
+                    level_contrib[neighbor] = max(level_contrib.get(neighbor, 0.0), apport)
         if not level_contrib:
             break
         for neighbor, contrib in level_contrib.items():
@@ -136,6 +150,7 @@ def propagate_entanglement(
 def apply_contradictions(
     candidates: dict[str, dict],
     relationships: list[dict],
+    journal: dict[str, dict] | None = None,
 ) -> None:
     """Annule (score=0) le souvenir périmé d'un couple en conflit.
 
@@ -183,6 +198,8 @@ def apply_contradictions(
             perdant, gagnant = tgt, src
 
         candidates[perdant]['score'] = 0.0
+        if journal is not None:
+            journal[perdant] = {"motif": type_relation, "par": gagnant}
         logger.info("Q-EM: Interférence destructive (%s) : %s annulé par %s",
                     type_relation, perdant, gagnant)
 
@@ -190,13 +207,28 @@ def apply_contradictions(
 def filter_redundancy(
     candidates: dict[str, dict],
     threshold: float,
+    proteges: Sequence[str] = (),
+    journal: dict[str, dict] | None = None,
 ) -> None:
     """Filtre les redondances sémantiques par similarité cosinus des embeddings.
 
-    Parmi les candidats encore actifs (score > 0), triés par (importance, created_at)
-    décroissants, une mémoire dont le cosinus avec une mémoire CONSERVÉE dépasse
+    Parmi les candidats encore actifs (score > 0), les `proteges` d'abord puis par SCORE
+    décroissant, une mémoire dont le cosinus avec une mémoire CONSERVÉE dépasse
     `threshold` est jugée redondante et annulée. Les embeddings sont supposés
     L2-normalisés (cosinus = produit scalaire), garanti par la couche embeddings.
+
+    ## Pourquoi le tri se fait sur le score (banc de rappel du 26/09)
+
+    Le tri était `(importance, created_at)`. Or `importance` vaut 0,5 sur tout le corpus
+    réel : c'était donc le souvenir le plus RÉCENT qui gagnait, quelle que soit sa
+    pertinence. Mesuré : 10 des 14 souvenirs attendus absents du paquet étaient annulés
+    ici, dont un de score 0,877 « au profit » d'un souvenir de score 0,083, et le premier
+    du rang fusionné lui-même (score 0,998). Garder le mieux classé est la seule règle qui
+    ne détruit pas la réponse : entre deux quasi-doublons, on sert celui qui répond le
+    mieux à la question. La date ne départage plus qu'à score égal.
+
+    Les `proteges` (la priorité de `build_context`) ne sont jamais annulés : ils peuvent
+    en annuler d'autres, pas l'inverse.
 
     ## Pourquoi cette version est vectorisée
 
@@ -215,8 +247,14 @@ def filter_redundancy(
     annulatrice : sans vecteur, aucune redondance n'est démontrable.
     """
     active_ids = [cid for cid, c in candidates.items() if c['score'] > 0.0]
-    # Conserver en priorité les plus importants / récents (annulera les suivants).
-    active_ids.sort(key=lambda cid: (candidates[cid]['importance'], candidates[cid]['created_at']), reverse=True)
+    # Protégés d'abord, puis score décroissant, puis le plus récent à score égal. Ceux qui
+    # passent en premier sont conservés et annulent les suivants trop proches d'eux.
+    ordre_protege = {cid: i for i, cid in enumerate(proteges)}
+    # Deux tris stables (une date ne se négative pas) : la date d'abord, clé secondaire,
+    # puis (protection, score), clé principale.
+    active_ids.sort(key=lambda cid: candidates[cid]['created_at'], reverse=True)
+    active_ids.sort(key=lambda cid: (ordre_protege.get(cid, len(ordre_protege)),
+                                     -candidates[cid]['score']))
     if len(active_ids) < 2:
         return
 
@@ -252,9 +290,12 @@ def filter_redundancy(
             # Comparaison vectorisée contre TOUS les candidats déjà conservés.
             contre_conserves = cosinus[position, positions_conservees]
             plus_proche = int(np.argmax(contre_conserves))
-            if contre_conserves[plus_proche] > threshold:
+            if contre_conserves[plus_proche] > threshold and cid not in ordre_protege:
                 candidates[cid]['score'] = 0.0
                 gagnant = ids_comparables[positions_conservees[plus_proche]]
+                if journal is not None:
+                    journal[cid] = {"motif": "redondance", "par": gagnant,
+                                    "cosinus": round(float(contre_conserves[plus_proche]), 3)}
                 logger.info("Q-EM: Interférence destructive (redondance sim=%.2f) : "
                             "%s annulé au profit de %s",
                             float(contre_conserves[plus_proche]), cid, gagnant)
@@ -322,6 +363,8 @@ def collapse_by_utility(
     max_tokens: int,
     registry: CollectionRegistry | None = None,
     priorites: Sequence[str] = (),
+    top_k: int = 0,
+    density_exponent: float = 1.0,
 ) -> tuple[dict[str, list], list[str], int]:
     """Collapse glouton : maximise l'utilité/token sous contrainte `max_tokens`.
 
@@ -349,6 +392,18 @@ def collapse_by_utility(
     décroissant. Ils ne dérogent à RIEN d'autre : une priorité dont le score a été annulé
     par l'interférence (contradiction, redondance) reste exclue, et le budget de tokens
     reste un plafond dur — une priorité plus coûteuse que le budget total n'entre pas.
+
+    ## `top_k` et `density_exponent` : ne plus sélectionner à la longueur (banc du 26/09)
+
+    Avec une densité `score / tokens`, un souvenir de 140 tokens au score 0,96 passait
+    derrière une douzaine de souvenirs brefs et génériques de score ~0,5 : trois souvenirs
+    attendus sortaient du paquet à 1200 tokens pour cette seule raison, et cinq « hubs »
+    courts apparaissaient dans 95 % des paquets, quelle que soit la question.
+      - `top_k` : après les priorités, les `top_k` meilleurs candidats par SCORE entrent
+        avant toute considération de coût (toujours sous le plafond du budget) ;
+      - `density_exponent` (β) : le reste est rempli par `score / tokens**β`. β=1 est la
+        densité historique ; β<1 pénalise moins la longueur.
+    Valeurs par défaut (0 et 1,0) = comportement historique exact.
     """
     from synaptiq_core.collections import REGISTRE_SYSTEME
     registre = registry or REGISTRE_SYSTEME
@@ -358,7 +413,7 @@ def collapse_by_utility(
         if c['score'] > 0.0:
             entry = format_entry(c['content'], c.get('occurred_at'))
             tokens = estimate_tokens(entry)
-            utility_density = c['score'] / tokens
+            utility_density = c['score'] / (tokens ** density_exponent)
             collapsed_candidates.append({
                 "id": mem_id,
                 "type": c['type'],
@@ -371,7 +426,11 @@ def collapse_by_utility(
     # Les priorités d'abord (dans leur ordre), puis densité d'utilité décroissante (stable
     # sur l'ordre d'insertion). Toute priorité avec score annulé n'est pas dans la liste :
     # elle a été filtrée juste au-dessus par `score > 0.0`.
-    ordre_priorites = {m_id: i for i, m_id in enumerate(priorites)}
+    # Les `top_k` meilleurs par score rejoignent les priorités, dans l'ordre du score.
+    meilleurs = sorted(
+        (x["id"] for x in collapsed_candidates if x["id"] not in priorites),
+        key=lambda m_id: -candidates[m_id]['score'])[:max(0, top_k)]
+    ordre_priorites = {m_id: i for i, m_id in enumerate([*priorites, *meilleurs])}
     collapsed_candidates.sort(
         key=lambda x: (ordre_priorites.get(x["id"], len(ordre_priorites)),
                        -x["utility_density"]))

@@ -257,3 +257,42 @@ def test_le_meilleur_candidat_annule_reste_exclu():
     resultat = _construire(store, config=RetrievalConfig(hybrid=True, recency_halflife_days=0.0))
     assert "TOP" not in resultat["selected_memory_ids"]
     assert "REMPLACANT" in resultat["selected_memory_ids"]
+
+
+# ─── Explain « all » et record_access (banc de rappel du 26/09) ──────────────
+
+def _store_avec_doublon():
+    """TOP (priorité) et DOUBLON (cosinus 1.0) + DISTINCT : un annulé, deux retenus."""
+    return InMemoryStore(memoires=[
+        _mem("TOP", similarity=0.95, rank_vec=1),
+        _mem("DOUBLON", similarity=0.9, rank_vec=2),
+        _mem("DISTINCT", similarity=0.5, rank_vec=3, embedding=[0.0, 1.0, 0.0]),
+    ])
+
+
+def test_explain_all_donne_le_motif_des_exclus():
+    """Un souvenir exclu doit dire POURQUOI : 10 disparitions sur 14 étaient muettes."""
+    resultat = _construire(_store_avec_doublon(), explain=True, explain_level="all",
+                           config=RetrievalConfig(recency_halflife_days=0.0))
+    trace = {e["memory_id"]: e for e in resultat["retrieval_trace"]}
+    assert set(trace) == {"TOP", "DOUBLON", "DISTINCT"}
+    assert trace["TOP"]["priority"] is True
+    assert trace["DOUBLON"]["selection_reason"] == "cancelled_redondance"
+    assert trace["DOUBLON"]["cancelled_by"] == "TOP"
+    assert trace["DOUBLON"]["cosine"] == 1.0
+
+
+def test_explain_selected_garde_le_contrat_historique():
+    """Sans explain_level, la trace ne liste que les retenus."""
+    resultat = _construire(_store_avec_doublon(), explain=True,
+                           config=RetrievalConfig(recency_halflife_days=0.0))
+    ids = {e["memory_id"] for e in resultat["retrieval_trace"]}
+    assert ids == set(resultat["selected_memory_ids"])
+
+
+def test_record_access_false_n_ecrit_rien():
+    """Un diagnostic ne modifie pas la récence qu'il observe."""
+    store = _store_avec_doublon()
+    resultat = _construire(store, record_access=False)
+    assert resultat["selected_memory_ids"]
+    assert store.acces_marques == []

@@ -77,7 +77,12 @@ class RetrievalConfig:
     weight_fts: float = 1.0
     entangle_damping: float = 0.5
     entangle_max_hops: int = 2
-    redundancy_threshold: float = 0.75
+    # Agrégation des apports de plusieurs parents : "max" (défaut) ou "sum" (historique).
+    entangle_aggregation: str = "max"
+    redundancy_threshold: float = 0.90
+    # Collapse (cf. `qem.collapse_by_utility`) : meilleurs admis d'office, exposant β.
+    collapse_top_k: int = 3
+    density_exponent: float = 0.5
     # Demi-vie de la décroissance temporelle, en jours. Recalibrée de 90 → 14 le 11/08 :
     # à 90 jours sur un corpus de 13 jours, la décroissance était inerte (amplitude
     # 0,89–1,00 mesurée par l'audit) — elle ne triait rien. 14 jours la rend perceptible
@@ -153,6 +158,8 @@ def build_context_packet(
     trace_id: str,
     explain: bool = False,
     registry: CollectionRegistry | None = None,
+    explain_level: str = "selected",
+    record_access: bool = True,
 ) -> dict[str, Any]:
     """Assemble un paquet de contexte compact selon les 4 phases de Q-EM.
 
@@ -160,6 +167,12 @@ def build_context_packet(
     2. Intrication    — propagation d'activation amortie le long de `entangled_with`.
     3. Interférence   — annulation des contradictions puis des redondances sémantiques.
     4. Mesure         — collapse glouton par densité d'utilité sous budget de tokens.
+
+    `explain_level="all"` trace TOUS les candidats avec la décision qui les concerne
+    (retenu, annulé par redondance/contradiction et par qui, hors budget) : sans cela, un
+    souvenir attendu disparaissait sans laisser de trace — 10 cas sur 14 au banc du 26/09.
+    `record_access=False` n'écrit rien : un diagnostic ne doit pas modifier la récence
+    qu'il mesure (le premier banc a réécrit `last_accessed_at` en production).
     """
     lignes = store.fetch_candidates(query_vector, query_text, memory_types)
 
@@ -231,13 +244,17 @@ def build_context_packet(
 
     # ── Phases 2 à 4, déléguées au cœur pur (qem.py) ──
     propagate_entanglement(candidates, relationships,
-                           config.entangle_damping, config.entangle_max_hops)
-    apply_contradictions(candidates, relationships)
-    filter_redundancy(candidates, config.redundancy_threshold)
+                           config.entangle_damping, config.entangle_max_hops,
+                           aggregation=config.entangle_aggregation)
+    annulations: dict[str, dict] = {}
+    apply_contradictions(candidates, relationships, journal=annulations)
+    filter_redundancy(candidates, config.redundancy_threshold, proteges=priorites,
+                      journal=annulations)
     context_packet, selected_ids, token_count = collapse_by_utility(
-        candidates, max_tokens, registry, priorites)
+        candidates, max_tokens, registry, priorites,
+        top_k=config.collapse_top_k, density_exponent=config.density_exponent)
 
-    if selected_ids:
+    if selected_ids and record_access:
         store.mark_accessed(selected_ids)
 
     logger.info("Q-EM: mesure achevée (%d mémoires retenues, %d/%d tokens, trace=%s).",
@@ -248,17 +265,44 @@ def build_context_packet(
         "token_estimate": token_count,
         "selected_memory_ids": selected_ids,
         "trace_id": trace_id,
-        "retrieval_trace": [
-            {
-                "memory_id": memory_id,
-                "similarity": candidates[memory_id]["similarity"],
-                "recency_factor": candidates[memory_id].get("recency_factor", 0.0),
-                "score": candidates[memory_id]["score"],
-                "selection_reason": "selected_by_utility_under_token_budget",
-            }
-            for memory_id in selected_ids
-        ] if explain else None,
+        "retrieval_trace": _trace(candidates, selected_ids, annulations, priorites,
+                                  explain_level) if explain else None,
     }
+
+
+def _trace(candidates: dict[str, dict], selected_ids: list[str],
+           annulations: dict[str, dict], priorites: list[str], niveau: str) -> list[dict]:
+    """Trace d'explication. `selected` : les retenus (contrat historique) ; `all` : tous
+    les candidats, retenus d'abord, avec le motif d'exclusion des autres."""
+    retenus = set(selected_ids)
+    ids = list(selected_ids)
+    if niveau == "all":
+        ids += sorted((i for i in candidates if i not in retenus),
+                      key=lambda i: -candidates[i]["score"])
+    trace = []
+    for memory_id in ids:
+        c = candidates[memory_id]
+        entree: dict[str, Any] = {
+            "memory_id": memory_id,
+            "similarity": c["similarity"],
+            "recency_factor": c.get("recency_factor", 0.0),
+            "score": c["score"],
+        }
+        if memory_id in retenus:
+            # Libellé historique conservé (contrat) ; la priorité est un champ à part.
+            entree["selection_reason"] = "selected_by_utility_under_token_budget"
+            entree["priority"] = memory_id in priorites
+        elif memory_id in annulations:
+            entree["selection_reason"] = f"cancelled_{annulations[memory_id]['motif']}"
+            entree["cancelled_by"] = annulations[memory_id]["par"]
+            if "cosinus" in annulations[memory_id]:
+                entree["cosine"] = annulations[memory_id]["cosinus"]
+        elif c["score"] <= 0.0:
+            entree["selection_reason"] = "zero_score"
+        else:
+            entree["selection_reason"] = "over_token_budget"
+        trace.append(entree)
+    return trace
 
 
 class InMemoryStore:
