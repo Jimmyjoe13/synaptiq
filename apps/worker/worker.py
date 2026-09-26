@@ -637,6 +637,50 @@ def _handle(r, msg_id: str, fields: dict) -> None:
         # Pas d'ACK : le message reste pending et sera repris par _reclaim()
 
 
+# ─── Traitement parallèle des événements (Phase 3) ────────────────────────────
+# Le worker traitait les événements un par un, en séquence. Avec un LLM lent
+# (2-5s par extraction), le débit était limité à ~0.2-0.5 événements/seconde.
+#
+# Phase 3 : ThreadPoolExecutor pour traiter plusieurs événements en parallèle.
+# Chaque événement est indépendant (pas de dépendance entre eux), donc le
+# parallélisme est sûr. Le nombre de workers est configurable via
+# WORKER_MAX_PARALLEL (défaut 4).
+#
+# Attention : le parallélisme ne doit pas dépasser le nombre de connexions
+# PostgreSQL disponibles (WORKER_DB_POOL_MAX). Avec 4 workers parallèles et
+# 4 connexions DB, chaque worker a sa propre connexion.
+WORKER_MAX_PARALLEL = int(os.getenv("WORKER_MAX_PARALLEL", "4"))
+
+
+def _handle_batch(r, messages: list[tuple[str, dict]]) -> None:
+    """Traite un lot de messages en parallèle avec ThreadPoolExecutor.
+
+    Chaque message est traité dans un thread séparé. Les ACK/DLQ sont faits
+    dans le thread principal après la fin de tous les traitements.
+    """
+    if not messages:
+        return
+
+    if len(messages) == 1:
+        # Un seul message : traitement direct (pas de ThreadPoolExecutor)
+        msg_id, fields = messages[0]
+        _handle(r, msg_id, fields)
+        return
+
+    # Plusieurs messages : traitement parallèle
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _traiter_un(msg_id_fields):
+        msg_id, fields = msg_id_fields
+        try:
+            _handle(r, msg_id, fields)
+        except Exception as e:
+            logger.error("Erreur dans le traitement parallèle de %s: %s", msg_id, e, exc_info=True)
+
+    with ThreadPoolExecutor(max_workers=WORKER_MAX_PARALLEL) as executor:
+        list(executor.map(_traiter_un, messages))
+
+
 def _reclaim(r) -> None:
     """Reprend les messages pending trop longtemps (worker mort, échec précédent)."""
     try:
@@ -772,8 +816,12 @@ def main():
             if not resp:
                 continue
             for _stream, messages in resp:
-                for msg_id, fields in messages:
-                    _handle(r, msg_id, fields)
+                # Phase 3 : traitement parallèle des messages avec ThreadPoolExecutor.
+                # Avant, chaque message était traité séquentiellement, limitant le débit
+                # à ~0.2-0.5 événements/seconde avec un LLM lent (2-5s par extraction).
+                # Avec WORKER_MAX_PARALLEL=4, le débit passe à ~1-2 événements/seconde.
+                msg_list = [(msg_id, fields) for msg_id, fields in messages]
+                _handle_batch(r, msg_list)
         except KeyboardInterrupt:
             logger.info("Arrêt du worker par l'utilisateur.")
             break

@@ -103,10 +103,18 @@ def handle_contradictions(
                 len(candidates), nouveau_contenu[:60])
 
     # 2. Verdict explicite, préférence par préférence.
-    a_archiver = [
-        str(mem_id) for mem_id, contenu in candidates
-        if verdict(contenu, nouveau_contenu)
-    ]
+    # Phase 3 : parallélisation des appels au juge avec ThreadPoolExecutor.
+    # Avec des appels séquentiels, N préférences proches coûtent N × latence LLM.
+    # Avec la parallélisation, le temps est max(latence LLM) au lieu de somme.
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _juge_para(mem_id_contenu):
+        mem_id, contenu = mem_id_contenu
+        return (str(mem_id), verdict(contenu, nouveau_contenu))
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        resultats = list(executor.map(_juge_para, candidates))
+    a_archiver = [mem_id for mem_id, est_contradiction in resultats if est_contradiction]
 
     if not a_archiver:
         logger.info("Aucune contradiction constatée : les %d préférence(s) proche(s) sont conservées.",
