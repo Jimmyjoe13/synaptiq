@@ -114,3 +114,41 @@ def test_factory_mode_openrouter(monkeypatch):
     assert e.model == "openai/text-embedding-3-small"
     assert e.api_key == "sk-or-v1-test"
 
+
+
+def _fake_post(data):
+    """Fabrique un `requests.post` factice qui renvoie `data` comme corps d'embeddings."""
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": data}
+    return lambda *a, **k: FakeResp()
+
+
+def test_openai_compat_lot_incomplet_leve(monkeypatch):
+    """Moins de vecteurs que de textes : lever, JAMAIS tronquer en silence.
+
+    Le worker associe faits et vecteurs par position : un lot court y faisait disparaître
+    les derniers faits sans la moindre erreur (événement acquitté, mémoire absente).
+    """
+    import synaptiq_core.embeddings as emb
+
+    monkeypatch.setattr(emb.requests, "post", _fake_post([{"index": 0, "embedding": [1.0, 0.0]}]))
+    e = OpenAICompatEmbedder(base_url="http://fake/v1", model="m", dim=2)
+    with pytest.raises(EmbeddingError, match="incomplet"):
+        e.embed(["un", "deux", "trois"])
+
+
+def test_openai_compat_index_en_double_leve(monkeypatch):
+    """Bon nombre de vecteurs mais un index dupliqué : l'association serait fausse."""
+    import synaptiq_core.embeddings as emb
+
+    monkeypatch.setattr(emb.requests, "post", _fake_post([
+        {"index": 0, "embedding": [1.0, 0.0]},
+        {"index": 0, "embedding": [0.0, 1.0]},
+    ]))
+    e = OpenAICompatEmbedder(base_url="http://fake/v1", model="m", dim=2)
+    with pytest.raises(EmbeddingError):
+        e.embed(["un", "deux"])

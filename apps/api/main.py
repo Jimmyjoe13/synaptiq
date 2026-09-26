@@ -1004,38 +1004,6 @@ class MemoryInput(BaseModel):
             raise ValueError(str(e)) from e
         return self
 
-def _charger_registre_isole(cur, tenant: str, agent_id: str):
-    """`charger_registre` encadré par un SAVEPOINT, pour le chemin d'ÉCRITURE.
-
-    `charger_registre` avale volontairement toute erreur SQL et se replie sur les
-    collections système (cf. `synaptiq_core.collections`) : la taxonomie ne doit pas être
-    une dépendance dure de l'écriture. Mais ce repli laisse la transaction psycopg2 en état
-    *aborted*, et PostgreSQL exécute alors le `conn.commit()` suivant comme un ROLLBACK
-    **sans lever la moindre exception**. `POST /v1/memories` répondait donc
-    `201 {"status": "created", "memory_id": …}` pour une ligne qui n'existait pas. Sur une
-    collection sans intrication (`working/scratch`, `episodic/interaction`) aucune requête
-    ne suit, donc rien ne révélait la perte.
-
-    Précondition réaliste : `memory_collections` illisible — typiquement une instance mise
-    à jour par `git pull` sans `alembic upgrade head`.
-
-    Le SAVEPOINT est préféré à un chargement anticipé dans une transaction séparée : il
-    conserve la propriété que le registre lu est celui de la MÊME transaction que
-    l'insertion (donc cohérent avec une collection créée juste avant), et il ferme la
-    classe de panne entière plutôt qu'un seul de ses points d'appel.
-
-    `ROLLBACK TO SAVEPOINT` est inconditionnel : `charger_registre` ne fait que LIRE, donc
-    rien d'utile n'est perdu, et c'est l'une des rares instructions que PostgreSQL accepte
-    encore sur une transaction avortée.
-    """
-    cur.execute("SAVEPOINT synaptiq_registre")
-    try:
-        return charger_registre(cur, tenant, agent_id)
-    finally:
-        cur.execute("ROLLBACK TO SAVEPOINT synaptiq_registre")
-        cur.execute("RELEASE SAVEPOINT synaptiq_registre")
-
-
 def _declarer_collection_manquante(cur, tenant: str, agent_id: str,
                                    famille: str, nom: str) -> None:
     """Déclare une collection à l'écriture quand l'agent range hors registre.
@@ -1053,7 +1021,7 @@ def _declarer_collection_manquante(cur, tenant: str, agent_id: str,
     """
     if not nom:
         return
-    registre = _charger_registre_isole(cur, tenant, agent_id)
+    registre = charger_registre(cur, tenant, agent_id)
     # Déjà couvert par une collection système ou une collection de l'agent.
     if registre.get(famille, nom) is not None:
         return
@@ -1062,7 +1030,7 @@ def _declarer_collection_manquante(cur, tenant: str, agent_id: str,
                        "atteint pour %s.", famille, nom, agent_id)
         return
     # SAVEPOINT : une défaillance ici ne doit pas avorter la transaction qui porte
-    # l'INSERT de la mémoire (même classe de panne que `_charger_registre_isole`).
+    # l'INSERT de la mémoire (même classe de panne que le SAVEPOINT de `charger_registre`).
     cur.execute("SAVEPOINT synaptiq_declare")
     try:
         cur.execute(
@@ -1186,7 +1154,7 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                 # de collections, donc il lui faut la transaction encore ouverte.
                 reponse = _reponse_memoire(
                     memory, str(existant), "duplicate",
-                    _charger_registre_isole(cur, tenant, memory.agent_id))
+                    charger_registre(cur, tenant, memory.agent_id))
                 conn.rollback()      # lecture seule : ne rien laisser en transaction
                 MEMORY_WRITES.labels("duplicate").inc()
                 logger.info("Écriture directe déjà présente : relance traitée en no-op.",
@@ -1241,7 +1209,7 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                                               memory.idempotency_key)
                 reponse = _reponse_memoire(
                     memory, str(gagnante) if gagnante else "", "duplicate",
-                    _charger_registre_isole(cur, tenant, memory.agent_id))
+                    charger_registre(cur, tenant, memory.agent_id))
                 conn.commit()
                 MEMORY_WRITES.labels("duplicate").inc()
                 logger.info("Course d'insertion perdue sur un contenu identique : no-op.",
@@ -1269,8 +1237,8 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             # Dans la même transaction que l'insertion : une arête sans son souvenir n'a pas
             # de sens, et l'inverse non plus.
             # Isolé sur un SAVEPOINT : un registre illisible ne doit pas avorter la
-            # transaction qui porte l'INSERT (cf. `_charger_registre_isole`).
-            registre = _charger_registre_isole(cur, tenant, memory.agent_id)
+            # transaction qui porte l'INSERT (cf. `collections.charger_registre`).
+            registre = charger_registre(cur, tenant, memory.agent_id)
             if registre.entangle_pour(memory.type, memory.subtype):
                 entangle(cur, tenant, memory.agent_id, new_id, memory.subtype, embedding)
 

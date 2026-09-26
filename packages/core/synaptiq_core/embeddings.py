@@ -115,6 +115,16 @@ class OpenAICompatEmbedder(Embedder):
         # Respecter l'ordre d'entrée via le champ 'index' quand il est présent
         data_sorted = sorted(data, key=lambda d: d.get("index", 0))
         vectors = [d["embedding"] for d in data_sorted]
+        # UN vecteur par texte, exactement. Un lot partiel (endpoint qui tronque, quota,
+        # entrée rejetée) décalerait ou amputerait silencieusement l'association
+        # fait <-> vecteur en aval : le worker perdait les derniers faits sans erreur.
+        # Les index doivent aussi couvrir 0..n-1 sans trou ni doublon.
+        index = [d.get("index", i) for i, d in enumerate(data_sorted)]
+        if len(vectors) != len(texts) or index != list(range(len(texts))):
+            raise EmbeddingError(
+                f"Lot d'embeddings incomplet : {len(vectors)} vecteur(s) reçu(s) pour "
+                f"{len(texts)} texte(s) (index {index[:10]}) depuis {self.base_url}."
+            )
 
         got = len(vectors[0])
         if got != self.dim:

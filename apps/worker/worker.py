@@ -42,6 +42,11 @@ EXTRACTION_DEGRADED_COUNTER = Counter(
     "Nombre d'extractions de mémoire ayant replié sur les heuristiques regex suite à un échec LLM",
 )
 
+RECLAIM_ERRORS_COUNTER = Counter(
+    "synaptiq_worker_reclaim_errors_total",
+    "Nombre d'échecs de la reprise des messages pending (XAUTOCLAIM)",
+)
+
 # Chargement des variables d'environnement depuis le .env RACINE (source unique)
 load_dotenv(os.path.join(_root, ".env"))
 
@@ -512,7 +517,9 @@ def process_event(event: dict) -> bool:
     try:
         created = 0
         with conn.cursor() as cur:
-            for fact, embedding in zip(facts, embeddings, strict=False):
+            # strict=True : un lot d'embeddings court lève au lieu de perdre des faits en
+            # silence (l'événement n'est alors PAS acquitté et part en reprise / DLQ).
+            for fact, embedding in zip(facts, embeddings, strict=True):
                 # Contradictions : archivage sur verdict EXPLICITE seulement (jamais sur la
                 # seule similarité). Les ids retournés serviront à tisser l'arête de
                 # supersession, une fois le nouvel id connu.
@@ -631,8 +638,11 @@ def _reclaim(r) -> None:
         for msg_id, fields in messages:
             if fields:
                 _handle(r, msg_id, fields)
-    except Exception as e:
-        logger.debug("reclaim ignoré : %s", e)
+    except Exception:
+        # Était un logger.debug : une panne XAUTOCLAIM récurrente (Redis, groupe supprimé)
+        # rendait la reprise des messages pending invisible en production.
+        RECLAIM_ERRORS_COUNTER.inc()
+        logger.warning("Reprise des messages pending (XAUTOCLAIM) en échec", exc_info=True)
 
 
 # Cosinus minimal entre un vecteur stocké et le même contenu ré-embarqué par le modèle

@@ -255,6 +255,29 @@ _SQL_COLLECTIONS = """
 
 
 def charger_registre(cur, tenant_id: str, agent_id: str) -> CollectionRegistry:
+    """Registre des collections, lu sous SAVEPOINT (voir `_lire_registre`).
+
+    `_lire_registre` avale volontairement toute erreur SQL pour se replier sur les
+    collections système. Mais ce repli laisse la transaction psycopg2 en état *aborted* :
+    PostgreSQL exécute alors le `commit()` suivant comme un ROLLBACK **sans lever
+    d'exception** (écriture perdue en silence), et toute requête suivante sur le même
+    curseur échoue (500 en cascade sur le rappel). Le SAVEPOINT vivait jusqu'ici dans
+    l'API, côté écriture seulement : le rappel, `list_collections` et le worker restaient
+    exposés. Il est désormais ici, donc commun aux quatre points d'appel.
+
+    `ROLLBACK TO SAVEPOINT` est inconditionnel : la lecture ne modifie rien, et c'est l'une
+    des rares instructions que PostgreSQL accepte encore sur une transaction avortée.
+    Précondition : une transaction ouverte (psycopg2 hors autocommit, le cas partout ici).
+    """
+    cur.execute("SAVEPOINT synaptiq_registre")
+    try:
+        return _lire_registre(cur, tenant_id, agent_id)
+    finally:
+        cur.execute("ROLLBACK TO SAVEPOINT synaptiq_registre")
+        cur.execute("RELEASE SAVEPOINT synaptiq_registre")
+
+
+def _lire_registre(cur, tenant_id: str, agent_id: str) -> CollectionRegistry:
     """Registre des collections d'un (tenant, agent), complété par les collections système.
 
     Le repli sur le registre système est délibéré et vaut pour toute erreur : la taxonomie

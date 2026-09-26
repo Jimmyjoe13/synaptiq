@@ -23,12 +23,11 @@ from apps.api.main import (
     CLES_PAQUET_CANONIQUES,
     AuthContext,
     CollectionInput,
-    _charger_registre_isole,
     _declarer_collection_manquante,
     create_collection,
     purge_memories,
 )
-from synaptiq_core.collections import SYSTEM_COLLECTIONS
+from synaptiq_core.collections import SYSTEM_COLLECTIONS, charger_registre
 
 # ─── 1. La purge ne doit pas déborder du périmètre de la clé ─────────────────
 
@@ -194,7 +193,7 @@ def test_registre_illisible_ne_laisse_pas_la_transaction_avortee():
     """
     cur = CurseurTransactionnel(echouer_sur="memory_collections")
 
-    registre = _charger_registre_isole(cur, "t", "agentA")
+    registre = charger_registre(cur, "t", "agentA")
 
     # Repli sur les collections système, comme le veut `charger_registre`…
     assert len(registre.collections) == len(SYSTEM_COLLECTIONS)
@@ -209,7 +208,7 @@ def test_savepoint_libere_sur_le_chemin_nominal():
     """Un registre lisible ne doit laisser aucun savepoint ouvert derrière lui."""
     cur = CurseurTransactionnel(echouer_sur="__jamais__")
 
-    _charger_registre_isole(cur, "t", "agentA")
+    charger_registre(cur, "t", "agentA")
 
     assert cur.executees[0] == "SAVEPOINT synaptiq_registre"
     assert cur.executees[-1] == "RELEASE SAVEPOINT synaptiq_registre"

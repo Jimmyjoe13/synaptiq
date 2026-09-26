@@ -192,6 +192,9 @@ class _CurseurFactice:
         self.requete = None
 
     def execute(self, sql, params=None):
+        # Les SAVEPOINT de `charger_registre` passent ; seule la LECTURE échoue.
+        if "SAVEPOINT" in sql:
+            return
         if self._lever is not None:
             raise self._lever
         self.requete = (sql, params)
