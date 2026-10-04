@@ -68,8 +68,22 @@ def publish_pending(db_pool, redis_client) -> int:
 
 def main() -> None:
     configure_logging("synaptiq-relay")
-    db_pool = pg_pool.ThreadedConnectionPool(1, 4, dsn=DATABASE_URL)
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    db_pool = None
+    redis_client = None
+    while db_pool is None or redis_client is None:
+        try:
+            if db_pool is None:
+                db_pool = pg_pool.ThreadedConnectionPool(1, 4, dsn=DATABASE_URL)
+            if redis_client is None:
+                redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+                redis_client.ping()
+            logger.info("Relay connecté à Postgres et Redis avec succès.")
+        except KeyboardInterrupt:
+            return
+        except Exception as exc:
+            logger.warning("Attente de disponibilité de Postgres / Redis (%s)...", exc)
+            time.sleep(2)
+
     while True:
         try:
             published = publish_pending(db_pool, redis_client)

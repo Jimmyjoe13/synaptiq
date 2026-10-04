@@ -6,16 +6,13 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     container_name: synaptiq-postgres
+    restart: unless-stopped
     ports:
       - "127.0.0.1:5435:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-synaptiq}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-synaptiq_password}
       POSTGRES_DB: ${POSTGRES_DB:-synaptiq_db}
-      # Paramètres HNSW : ef_search=150 (défaut 40, recall ~50% → 95%+)
-      # iterative_scan=relaxed_order (latence requêtes filtrées -5 à -9x)
-      HNSW_EF_SEARCH: ${HNSW_EF_SEARCH:-150}
-      HNSW_ITERATIVE_SCAN: ${HNSW_ITERATIVE_SCAN:-relaxed_order}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -30,6 +27,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: synaptiq-redis
+    restart: unless-stopped
     ports:
       - "127.0.0.1:6399:6379"
     volumes:
@@ -48,6 +46,7 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile
     container_name: synaptiq-api
+    restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
     env_file: .env
@@ -87,6 +86,7 @@ services:
       context: .
       dockerfile: apps/worker/Dockerfile
     container_name: synaptiq-worker
+    restart: unless-stopped
     env_file: .env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-synaptiq}:${POSTGRES_PASSWORD:-synaptiq_password}@postgres:5432/${POSTGRES_DB:-synaptiq_db}
@@ -127,6 +127,7 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile
     container_name: synaptiq-relay
+    restart: unless-stopped
     env_file: .env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-synaptiq}:${POSTGRES_PASSWORD:-synaptiq_password}@postgres:5432/${POSTGRES_DB:-synaptiq_db}

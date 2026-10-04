@@ -7,6 +7,7 @@ for _p in (root_path, os.path.join(root_path, "packages", "core")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -151,6 +152,32 @@ GRAPH_EDGES_PER_MEMORY = Gauge("synaptiq_graph_edges_per_memory",
                                ["agent_id"])
 
 
+_pool_lock = threading.Lock()
+_redis_lock = threading.Lock()
+
+
+def get_db_pool() -> pg_pool.ThreadedConnectionPool:
+    """Retourne le pool PostgreSQL en le réinitialisant si nécessaire.
+
+    Auto-cicatrisant : si le pool n'a pas pu être créé au démarrage (ex:
+    PostgreSQL en cours de boot), il est créé à la volée au premier appel
+    qui en a besoin sans exiger de redémarrage manuel du conteneur.
+    """
+    global db_pool
+    if db_pool is not None and not getattr(db_pool, "closed", False):
+        return db_pool
+    with _pool_lock:
+        if db_pool is None or getattr(db_pool, "closed", False):
+            try:
+                db_pool = pg_pool.ThreadedConnectionPool(DB_POOL_MIN, DB_POOL_MAX, dsn=DATABASE_URL)
+                logger.info("Pool PostgreSQL auto-initialisé (%d–%d connexions).", DB_POOL_MIN, DB_POOL_MAX)
+            except Exception as e:
+                logger.warning("Tentative d'initialisation du pool PostgreSQL échouée : %s", e)
+                db_pool = None
+                raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé") from None
+    return db_pool
+
+
 @contextmanager
 def get_conn():
     """Emprunte une connexion au pool et la restitue systématiquement.
@@ -159,47 +186,72 @@ def get_conn():
     requête obtient sa propre connexion, évitant les conditions de course sous
     charge (FastAPI sert les routes sync dans un threadpool).
 
+    Auto-cicatrisant : si le pool n'a pas pu être initialisé au boot, il est
+    créé à la volée dès que la base répond. Si une coupure survient, la connexion
+    morte est fermée au putconn au lieu d'être remise en circulation.
+
     Paramètres HNSW appliqués à chaque session :
     - `ef_search = 150` : le défaut (40) ne donne qu'un recall@10 d'environ 50%.
       100-200 est la plage recommandée pour 95%+ de recall (benchmarks pgvector).
     - `iterative_scan = relaxed_order` : permet à pgvector de continuer le scan
       après filtrage, améliorant la latence des requêtes filtrées de 5-9x.
     """
-    if db_pool is None:
-        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
-    conn = db_pool.getconn()
+    pool = get_db_pool()
+    conn = pool.getconn()
+    casse = False
     try:
         with conn.cursor() as cur:
             cur.execute("SET hnsw.ef_search = %s", (os.getenv("HNSW_EF_SEARCH", "150"),))
             cur.execute("SET hnsw.iterative_scan = %s", (os.getenv("HNSW_ITERATIVE_SCAN", "relaxed_order"),))
         yield conn
+    except Exception:
+        casse = True
+        try:
+            conn.rollback()
+            casse = False
+        except Exception:
+            logger.warning("Rollback impossible : la connexion sera fermée.", exc_info=True)
+        raise
     finally:
-        db_pool.putconn(conn)
+        pool.putconn(conn, close=casse)
 
 
 def get_redis_client():
-    if redis_client is None:
-        raise HTTPException(status_code=503, detail="Redis non initialisé")
-    return redis_client
+    global redis_client
+    if redis_client is not None:
+        return redis_client
+    with _redis_lock:
+        if redis_client is None:
+            try:
+                client = redis.from_url(REDIS_URL, decode_responses=True)
+                client.ping()
+                redis_client = client
+                logger.info("Client Redis auto-initialisé.")
+            except Exception as e:
+                logger.warning("Échec d'initialisation de Redis : %s", e)
+                raise HTTPException(status_code=503, detail="Redis non initialisé") from None
+        return redis_client
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Cycle de vie applicatif (remplace @app.on_event('startup') déprécié)."""
     global db_pool, redis_client
+    retries = int(os.getenv("DB_STARTUP_RETRIES", "5"))
+    for attempt in range(1, retries + 1):
+        try:
+            get_db_pool()
+            break
+        except Exception as e:
+            if attempt < retries:
+                logger.info("PostgreSQL en attente de démarrage (tentative %d/%d)...", attempt, retries)
+                await asyncio.sleep(1)
+            else:
+                logger.warning("PostgreSQL non prêt au démarrage après %d tentatives (%s) — le pool sera auto-initialisé à la première requête.", retries, e)
     try:
-        db_pool = pg_pool.ThreadedConnectionPool(DB_POOL_MIN, DB_POOL_MAX, dsn=DATABASE_URL)
-        logger.info("Pool PostgreSQL initialisé (%d–%d connexions).", DB_POOL_MIN, DB_POOL_MAX)
+        get_redis_client()
     except Exception as e:
-        logger.error("Échec d'initialisation du pool PostgreSQL : %s", e, exc_info=True)
-        db_pool = None
-    try:
-        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-        redis_client.ping()
-        logger.info("Client Redis initialisé.")
-    except Exception as e:
-        logger.error("Échec d'initialisation de Redis : %s", e, exc_info=True)
-        redis_client = None
+        logger.warning("Redis non prêt au démarrage (%s) — le client sera initialisé à la première requête.", e)
     yield
     if db_pool is not None:
         db_pool.closeall()
@@ -352,8 +404,7 @@ def get_auth(authorization: str | None = Header(default=None)) -> AuthContext | 
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Format attendu : Authorization: Bearer <clé>")
     raw = authorization.split(" ", 1)[1].strip()
-    if db_pool is None:
-        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
+    pool = get_db_pool()
     key_hash = _hash_key(raw)
 
     cachee = _auth_cache_get(key_hash)
@@ -365,7 +416,7 @@ def get_auth(authorization: str | None = Header(default=None)) -> AuthContext | 
     # Initialisé AVANT le try : une exception SQL laissait auparavant `row` non liée,
     # transformant une panne base en NameError opaque au lieu d'un 401/503 propre.
     row = None
-    conn = db_pool.getconn()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -383,7 +434,7 @@ def get_auth(authorization: str | None = Header(default=None)) -> AuthContext | 
                 )
                 conn.commit()
     finally:
-        db_pool.putconn(conn)
+        pool.putconn(conn)
     if not row:
         # Une clé invalide n'est JAMAIS mise en cache : sinon un attaquant pourrait remplir
         # le cache de hachages arbitraires, et une clé réactivée resterait rejetée.
@@ -943,8 +994,6 @@ def slow_queries(auth: AuthContext | None = Depends(get_auth), limit: int = Quer
     Utile pour identifier les requêtes SQL qui ralentissent l'instance en production.
     """
     require_scope(auth, "admin")
-    if db_pool is None:
-        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
     with get_conn() as conn:
         with conn.cursor() as cur:
             try:
@@ -1096,8 +1145,7 @@ def build_context(request: ContextRequest, auth: AuthContext | None = Depends(ge
     # ceux de synaptiq_core. Il est aussi retourne au client, qui peut donc citer un
     # identifiant retrouvable dans les journaux du serveur.
     set_trace_id(trace_id)
-    if db_pool is None:
-        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialise")
+    pool = get_db_pool()
 
     # ── Cache Redis ──
     cache_key = _context_cache_key(tenant, request.agent_id, request)
@@ -1115,7 +1163,7 @@ def build_context(request: ContextRequest, auth: AuthContext | None = Depends(ge
         except Exception:
             logger.warning("Cache Redis indisponible pour la lecture.", exc_info=True)
 
-    conn = db_pool.getconn()
+    conn = pool.getconn()
     try:
         query_vector = get_embedder().embed_one(request.query)
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -1163,7 +1211,7 @@ def build_context(request: ContextRequest, auth: AuthContext | None = Depends(ge
         raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
     finally:
         CONTEXT_BUILD_SECONDS.observe(time.perf_counter() - start_time)
-        db_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 class MemoryInput(BaseModel):
@@ -1395,9 +1443,8 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
     tenant = resolve_tenant(auth)
     require_scope(auth, "write")
     resolve_agent(auth, memory.agent_id)
-    if db_pool is None:
-        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
-    conn = db_pool.getconn()
+    pool = get_db_pool()
+    conn = pool.getconn()
     empreinte = content_hash(memory.content)
     try:
         with conn.cursor() as cur:
@@ -1542,7 +1589,7 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
         logger.error("Erreur lors de la création de la mémoire.", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
     finally:
-        db_pool.putconn(conn)
+        pool.putconn(conn)
 
 class RetrieveRequest(BaseModel):
     agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$")
@@ -1573,9 +1620,8 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
     tenant = resolve_tenant(auth)
     require_scope(auth, "read")
     resolve_agent(auth, request.agent_id)
-    if db_pool is None:
-        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
-    conn = db_pool.getconn()
+    pool = get_db_pool()
+    conn = pool.getconn()
     try:
         query_vector = get_embedder().embed_one(request.query)
         vector_str = to_pgvector(query_vector)
@@ -1695,7 +1741,7 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
         logger.error("Erreur de recherche de souvenirs.", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
     finally:
-        db_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 # Plafond du nombre de collections qu'un agent peut se créer. Ce n'est pas une limite
@@ -1976,10 +2022,9 @@ def merge_collections(payload: MergeInput, auth: AuthContext | None = Depends(ge
 
     if payload.source == payload.target:
         raise HTTPException(status_code=422, detail="Source et cible identiques.")
-    if db_pool is None:
-        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
 
-    conn = db_pool.getconn()
+    pool = get_db_pool()
+    conn = pool.getconn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -2037,7 +2082,7 @@ def merge_collections(payload: MergeInput, auth: AuthContext | None = Depends(ge
         logger.error("Erreur lors de la fusion de collections.", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
     finally:
-        db_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 # ─── Croyances : ce que l'agent pense (famille `reflective`, lot C) ─────────
@@ -2123,9 +2168,8 @@ def list_collections(agent_id: str, auth: AuthContext | None = Depends(get_auth)
     tenant = resolve_tenant(auth)
     require_scope(auth, "read")
     resolve_agent(auth, agent_id)
-    if db_pool is None:
-        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
-    conn = db_pool.getconn()
+    pool = get_db_pool()
+    conn = pool.getconn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             registre = charger_registre(cur, tenant, agent_id)
@@ -2184,7 +2228,7 @@ def list_collections(agent_id: str, auth: AuthContext | None = Depends(get_auth)
         logger.error("Erreur de lecture du registre de collections.", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
     finally:
-        db_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 @v1_router.delete("/memories")
