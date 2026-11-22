@@ -279,7 +279,7 @@ def build_context_packet(
     context_packet, selected_ids, token_count = collapse_by_utility(
         candidates, max_tokens, priorites,
         top_k=config.collapse_top_k, density_exponent=config.density_exponent,
-        parts_max=config.parts(), ancres=ancres)
+        parts_max=_parts_effectives(config, compartments), ancres=ancres)
 
     if selected_ids and record_access:
         store.mark_accessed(selected_ids)
@@ -295,6 +295,19 @@ def build_context_packet(
         "retrieval_trace": _trace(candidates, selected_ids, annulations, priorites,
                                   explain_level, ancres) if explain else None,
     }
+
+
+def _parts_effectives(config: RetrievalConfig, compartments: list[str]) -> dict[str, float]:
+    """Quotas réellement appliqués à CETTE requête.
+
+    Un quota sert à laisser de la place aux AUTRES compartiments (la réponse à la question ne
+    doit pas être évincée par les réflexes ou les croyances). Quand l'appelant ne demande que
+    ce compartiment-là, il n'y a rien à protéger : le plafond tronquerait sans raison. Cas
+    réel : le hook de démarrage de Claude Code ne demande que `reflexes` sur 900 tokens, et
+    n'en aurait reçu que 180.
+    """
+    return {nom: part for nom, part in config.parts().items()
+            if any(c != nom for c in compartments)}
 
 
 def _ancres_actives(compartments: list[str], config: RetrievalConfig) -> bool:

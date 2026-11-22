@@ -115,6 +115,19 @@ def test_pas_d_injection_si_les_reflexes_ne_sont_pas_demandes():
     assert resultat["context_packet"]["reflexes"] == []
 
 
+def test_pas_de_quota_quand_seuls_les_reflexes_sont_demandes():
+    """Le quota protège les AUTRES compartiments ; sans eux, il tronquerait pour rien."""
+    # Vecteurs unitaires orthogonaux : aucun n'est redondant avec un autre.
+    reflexes = [_mem(f"R{i}", contenu=" ".join(["regle"] * 10), compartment="reflexes",
+                     embedding=[1.0 if j == i else 0.0 for j in range(5)]) for i in range(5)]
+    config = RetrievalConfig(hybrid=False)
+    seul = _construire(InMemoryStore(reflexes), compartments=["reflexes"], max_tokens=100,
+                       config=config)
+    avec_autres = _construire(InMemoryStore(reflexes), max_tokens=100, config=config)
+    assert len(seul["context_packet"]["reflexes"]) == 5          # 65 tokens, aucun plafond
+    assert len(avec_autres["context_packet"]["reflexes"]) == 1   # plafond 20 tokens
+
+
 def test_injection_desactivable():
     store = InMemoryStore([_mem("R", contenu="toujours tutoyer", compartment="reflexes")])
     store.fetch_candidates = lambda v, t, c: []
