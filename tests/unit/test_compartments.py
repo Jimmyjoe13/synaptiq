@@ -58,6 +58,16 @@ def test_seules_les_croyances_sont_fermees_a_l_ecriture_directe():
     assert "croyances" not in cp.CLASSABLES
 
 
+def test_le_moteur_ne_classe_jamais_en_reflexes_ni_en_croyances():
+    """Un réflexe est injecté partout : une erreur de classement y coûterait à chaque
+    session. Seuls un choix explicite ou un ancien nom (`preference`…) y mènent."""
+    assert "reflexes" not in cp.CLASSABLES and "croyances" not in cp.CLASSABLES
+    assert "reflexes" not in cp.textes_prototypes()
+    assert cp.classer([1.0, 0.0], {"reflexes": [1.0, 0.0], "savoirs": [0.0, 1.0]})[0] == "savoirs"
+    assert cp.resoudre("reflexes", None, {}).compartiment == "reflexes"
+    assert cp.resoudre("preference", None, {}).compartiment == "reflexes"
+
+
 def test_seuls_les_reflexes_sont_injectes_d_office():
     assert [c.nom for c in cp.COMPARTIMENTS if c.toujours_injecte] == ["reflexes"]
 

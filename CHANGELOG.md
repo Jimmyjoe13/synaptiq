@@ -23,7 +23,7 @@ des régions du cerveau. L'agent ne crée plus rien : il juge seulement où rang
 
 | Compartiment | Région | Comportement |
 |---|---|---|
-| `reflexes` | Tronc cérébral | injecté dans CHAQUE contexte, aucun oubli, ≤ 20 % du budget, hors graphe |
+| `reflexes` | Tronc cérébral | injecté dans CHAQUE contexte, aucun oubli, ≤ 20 % du budget, hors graphe, jamais choisi par le moteur |
 | `decisions` | Lobe frontal | oubli lent (×3), intriqué |
 | `savoir_faire` | Cervelet | oubli très lent (×4), intriqué |
 | `alertes` | Amygdale | poids ×1,15 au rappel, oubli lent (×4), intriqué |

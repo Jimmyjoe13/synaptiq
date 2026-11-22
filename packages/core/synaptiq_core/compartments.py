@@ -107,7 +107,11 @@ COMPARTIMENTS: tuple[Compartiment, ...] = (
             "Ne jamais pousser sur git sans confirmation explicite.",
             "L'utilisateur préfère les réponses courtes, sans titres inutiles.",
         ),
-        facteur_demi_vie=0.0, intrique=False, part_max=0.20, toujours_injecte=True),
+        facteur_demi_vie=0.0, intrique=False, part_max=0.20, toujours_injecte=True,
+        # Jamais choisi par le moteur (décision du 22/11, relecture du reclassement de la
+        # prod) : un réflexe est injecté dans TOUS les contextes, une erreur de classement
+        # y pollue donc chaque session. Il faut un choix explicite (ou un ancien nom).
+        classable=False),
     Compartiment(
         "decisions", "Lobe frontal", "Décisions", "semantic",
         "Décisions prises et leur raison, objectifs, plans, priorités, arbitrages "

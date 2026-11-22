@@ -317,7 +317,8 @@ _DESCRIPTION_STORE = f"""
 {_FICHE_COMPARTIMENTS}
 
     Si tu hesites, omets `compartment` : le moteur classe le souvenir par similarite et te
-    dit ou il l'a range. Pour une hypothese sur l'utilisateur ou les humains, utiliser
+    dit ou il l'a range. Il ne choisit JAMAIS 'reflexes' a ta place (injecte dans chaque
+    contexte) : pour une regle ou une preference ferme, indique-le explicitement. Pour une hypothese sur l'utilisateur ou les humains, utiliser
     note_belief (compartiment 'croyances'), jamais store_memory.
 
     Args:
