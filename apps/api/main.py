@@ -38,16 +38,19 @@ from synaptiq_core import (
     link_supersedes,
     to_pgvector,
 )
-
-# Registre des collections : le rangement est un objet que l'agent possède. Le chargement
-# vit dans le cœur (comme `handle_contradictions`), afin que l'API et le worker voient
-# forcément le MÊME registre — la taxonomie avait déjà divergé une fois entre les deux
-# chemins d'écriture, elle ne doit pas recommencer.
 from synaptiq_core.belief_guard import CroyanceRefusee, valider_croyance
-from synaptiq_core.collections import (
-    FAMILLE_REFLEXIVE,
-    SYSTEM_COLLECTIONS,
-    charger_registre,
+
+# Compartiments (v0.4) : 9 régions fixes, propriété du moteur. Définis dans le cœur, comme
+# le reste de la taxonomie, pour que l'API et le worker rangent selon les MÊMES règles.
+from synaptiq_core.compartments import (
+    ALIAS,
+    COMPARTIMENT_CROYANCES,
+    NOMS,
+    PAR_NOM,
+    Rangement,
+    catalogue,
+    prototypes,
+    resoudre,
 )
 
 # Orchestration des 4 phases Q-EM (sans SQL ni HTTP : testable en isolation)
@@ -63,11 +66,9 @@ from synaptiq_core.project import (
     mode_scan_iteratif,
     normaliser_projet,
 )
-from synaptiq_core.qem import route_memory
 
 # Fusion de classements pour la recherche hybride (fonctions pures, cf. retrieval.py)
 from synaptiq_core.retrieval import DEFAULT_RRF_K, fuse_and_rank
-from synaptiq_core.taxonomy import SubtypeMismatch, is_canonical, validate_subtype
 
 # Configuration du logging
 configure_logging("synaptiq-api")
@@ -107,7 +108,13 @@ QEM_REDUNDANCY_THRESHOLD = float(os.getenv("QEM_REDUNDANCY_THRESHOLD", "0.90"))
 QEM_COLLAPSE_TOP_K = int(os.getenv("QEM_COLLAPSE_TOP_K", "3"))
 QEM_DENSITY_EXPONENT = float(os.getenv("QEM_DENSITY_EXPONENT", "0.5"))
 # Part maximale du budget de tokens accordée aux croyances (famille `reflective`, lot C).
-QEM_REFLECTIVE_MAX_SHARE = float(os.getenv("QEM_REFLECTIVE_MAX_SHARE", "0.15"))
+# Parts max du budget par compartiment plafonné. `QEM_REFLECTIVE_MAX_SHARE` reste lu en
+# repli : c'était le nom du réglage des croyances avant la v0.4.
+QEM_CROYANCES_MAX_SHARE = float(os.getenv(
+    "QEM_CROYANCES_MAX_SHARE", os.getenv("QEM_REFLECTIVE_MAX_SHARE", "0.15")))
+QEM_REFLEXES_MAX_SHARE = float(os.getenv("QEM_REFLEXES_MAX_SHARE", "0.20"))
+# Nombre max de réflexes injectés à chaque contexte (tronc cérébral). 0 = désactivé.
+QEM_REFLEXES_INJECTES = int(os.getenv("QEM_REFLEXES_INJECTES", "8"))
 # Décroissance temporelle : demi-vie (en jours) du score de récence. Une mémoire non
 # ré-accédée voit sa pertinence divisée par 2 tous les N jours. 0 (ou négatif) = désactivé.
 QEM_RECENCY_HALFLIFE_DAYS = float(os.getenv("QEM_RECENCY_HALFLIFE_DAYS", "14"))
@@ -259,7 +266,7 @@ async def lifespan(app: FastAPI):
         redis_client.close()
 
 
-app = FastAPI(title="SynaptiQ API", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="SynaptiQ API", version="0.4.0", lifespan=lifespan)
 
 # ─── Sécurité : CORS + rate limiting ───
 from fastapi.middleware.cors import CORSMiddleware
@@ -528,8 +535,7 @@ def audit(cur, tenant_id: str, action: str, auth: AuthContext | None,
     )
 
 def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
-                      agent_id: str, memory_types: list[str],
-                      collections: list[str] | None = None,
+                      agent_id: str, compartments: list[str],
                       project: str | None = None,
                       include_global: bool = True) -> list[dict]:
     """Ramène les candidats par similarité vectorielle ET, si activé, par plein texte.
@@ -560,30 +566,22 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
     linéaire en volume : l'écart croît avec le corpus. Ne pas « simplifier » en refactorisant
     le filtre commun dans une CTE.
     """
-    champs = ("id", "type", "subtype", "content", "confidence", "importance",
+    champs = ("id", "type", "compartment", "content", "confidence", "importance",
               "last_accessed_at", "created_at", "occurred_at", "embedding::text")
     colonnes = ", ".join(champs)
     # Le SELECT final joint `memories` (alias m) et les rangs : sans préfixe, PostgreSQL
     # refuse la requête ("column reference id is ambiguous").
     colonnes_m = ", ".join(f"m.{c}" for c in champs)
 
-    # Filtrage FIN par collection. Le fragment est CHOISI par le serveur (deux formes
-    # possibles, sans aucune donnee d'appelant) ; les noms de collection passent par un
-    # parametre lie, comme le reste. Meme motif que `type_filter` dans `retrieve_memories`.
-    #
-    # ⚠️ Le fragment est place APRES `type = ANY(...)` dans chaque WHERE, et les parametres
-    # suivent le meme ordre : ces requetes sont positionnelles, un decalage y serait muet
-    # (les types concordent tous) et fausserait le filtre au lieu de lever.
-    filtre_col = "AND subtype = ANY(%s)" if collections else ""
-    filtre_col_m = "AND m.subtype = ANY(%s)" if collections else ""
-    p_col: list = [collections] if collections else []
-    # Filtre PROJET (lot B), concaténé au filtre de collection : même position dans chaque
-    # WHERE, paramètres dans le même ordre (collections puis projet).
+    # Filtre PROJET (lot B) : fragment CHOISI par le serveur parmi trois formes fixes, le
+    # nom du projet passe en paramètre lié. Placé APRÈS `compartment = ANY(...)` dans chaque
+    # WHERE, paramètres dans le même ordre : ces requêtes sont positionnelles, un décalage
+    # y serait muet (les types concordent) et fausserait le filtre au lieu de lever.
     frag_projet, p_projet = filtre_projet(project, include_global)
     frag_projet_m, _ = filtre_projet(project, include_global, alias="m.")
-    filtre_col = f"{filtre_col} {frag_projet}"
-    filtre_col_m = f"{filtre_col_m} {frag_projet_m}"
-    p_col = [*p_col, *p_projet]
+    filtre_col = frag_projet
+    filtre_col_m = frag_projet_m
+    p_col: list = list(p_projet)
     if frag_projet:
         # Filtre sélectif : sans scan itératif, HNSW rendrait moins que le LIMIT.
         activer_scan_iteratif(cur, mode_scan_iteratif())
@@ -601,11 +599,11 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
                    row_number() OVER (ORDER BY embedding <=> %s::vector) AS rank_vec,
                    NULL::bigint AS rank_fts
             FROM memories
-            WHERE tenant_id = %s AND agent_id = %s AND type = ANY(%s) {filtre_col}
+            WHERE tenant_id = %s AND agent_id = %s AND compartment = ANY(%s) {filtre_col}
               AND status = 'active'
             ORDER BY embedding <=> %s::vector
             LIMIT %s;
-        """, (vector_str, vector_str, tenant, agent_id, memory_types, *p_col, vector_str,
+        """, (vector_str, vector_str, tenant, agent_id, compartments, *p_col, vector_str,
               RETRIEVAL_CANDIDATES))
         return cur.fetchall()
 
@@ -615,7 +613,7 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
             FROM (
                 SELECT id, embedding <=> %s::vector AS distance
                 FROM memories
-                WHERE tenant_id = %s AND agent_id = %s AND type = ANY(%s) {filtre_col}
+                WHERE tenant_id = %s AND agent_id = %s AND compartment = ANY(%s) {filtre_col}
                   AND status = 'active'
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
@@ -632,7 +630,7 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
                     SELECT to_tsquery('french', string_agg(lexeme, ' | ')) AS query
                     FROM unnest(to_tsvector('french', %s))
                 ) AS q
-                WHERE m.tenant_id = %s AND m.agent_id = %s AND m.type = ANY(%s) {filtre_col_m}
+                WHERE m.tenant_id = %s AND m.agent_id = %s AND m.compartment = ANY(%s) {filtre_col_m}
                   AND m.status = 'active' AND m.content_tsv @@ q.query
                 ORDER BY ts_rank(m.content_tsv, q.query) DESC
                 LIMIT %s
@@ -653,8 +651,8 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
                EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - m.last_accessed_at)) AS age_seconds,
                r.rank_vec, r.rank_fts
         FROM retenus r JOIN memories m ON m.id = r.id;
-    """, (vector_str, tenant, agent_id, memory_types, *p_col, vector_str, RETRIEVAL_CANDIDATES,
-          query_text, tenant, agent_id, memory_types, *p_col, RETRIEVAL_CANDIDATES,
+    """, (vector_str, tenant, agent_id, compartments, *p_col, vector_str, RETRIEVAL_CANDIDATES,
+          query_text, tenant, agent_id, compartments, *p_col, RETRIEVAL_CANDIDATES,
           vector_str))
     return cur.fetchall()
 
@@ -688,14 +686,10 @@ class PostgresMemoryStore:
     """
 
     def __init__(self, cur, tenant_id: str, agent_id: str,
-                 collections: list[str] | None = None,
                  project: str | None = None, include_global: bool = True) -> None:
         self._cur = cur
         self._tenant = tenant_id
         self._agent = agent_id
-        # Restriction optionnelle à certaines collections. Fixée à la construction, comme le
-        # périmètre : le cœur n'a pas à savoir qu'un filtre de rangement existe.
-        self._collections = collections
         # Idem pour le projet (lot B) : il borne AUSSI la complétion du graphe
         # (`fetch_by_ids`), sans quoi une arête ramènerait un souvenir d'un autre projet.
         self._project = project
@@ -708,11 +702,33 @@ class PostgresMemoryStore:
         valeur["embedding"] = parse_embedding(valeur.get("embedding"))
         return valeur
 
-    def fetch_candidates(self, query_vector, query_text: str, memory_types: list[str]) -> list[dict]:
+    def fetch_candidates(self, query_vector, query_text: str, compartments: list[str]) -> list[dict]:
         lignes = _fetch_candidates(self._cur, to_pgvector(query_vector), query_text,
-                                   self._tenant, self._agent, memory_types,
-                                   self._collections, self._project, self._include_global)
+                                   self._tenant, self._agent, compartments,
+                                   self._project, self._include_global)
         return [self._normaliser(ligne) for ligne in lignes]
+
+    def fetch_ancres(self, compartment: str, limit: int) -> list[dict]:
+        """Réflexes injectés d'office : les plus importants, puis les plus récents.
+
+        Même périmètre que la recherche, projet compris (filtre répété ici comme dans
+        chaque chemin SQL, jamais factorisé en CTE — cf. CLAUDE.md §3).
+        """
+        frag_projet, p_projet = filtre_projet(self._project, self._include_global)
+        self._cur.execute(
+            f"""
+            SELECT id, type, compartment, content, confidence, importance,
+                   last_accessed_at, created_at, occurred_at, embedding::text,
+                   EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_accessed_at)) AS age_seconds
+            FROM memories
+            WHERE tenant_id = %s AND agent_id = %s AND compartment = %s
+              AND status = 'active' {frag_projet}
+            ORDER BY importance DESC, created_at DESC
+            LIMIT %s;
+            """,
+            (self._tenant, self._agent, compartment, *p_projet, limit),
+        )
+        return [self._normaliser(ligne) for ligne in self._cur.fetchall()]
 
     def fetch_relationships(self, memory_ids: list[str]) -> list[dict]:
         # UNION ALL au lieu d'OR : PostgreSQL utilise les index efficacement.
@@ -741,7 +757,7 @@ class PostgresMemoryStore:
         # d'appelant dans le SQL, le nom du projet passe en paramètre lié).
         self._cur.execute(
             f"""
-            SELECT id, type, subtype, content, confidence, importance,
+            SELECT id, type, compartment, content, confidence, importance,
                    last_accessed_at, created_at, occurred_at, embedding::text
             FROM memories
             WHERE id = ANY(%s::uuid[])
@@ -782,14 +798,22 @@ def retrieval_config() -> RetrievalConfig:
         recency_halflife_days=QEM_RECENCY_HALFLIFE_DAYS,
         collapse_top_k=QEM_COLLAPSE_TOP_K,
         density_exponent=QEM_DENSITY_EXPONENT,
-        reflective_max_share=QEM_REFLECTIVE_MAX_SHARE,
+        croyances_max_share=QEM_CROYANCES_MAX_SHARE,
+        reflexes_max_share=QEM_REFLEXES_MAX_SHARE,
+        reflexes_injectes=QEM_REFLEXES_INJECTES,
     )
 
 
+def prototypes_compartiments() -> dict[str, list[float]]:
+    """Prototypes des compartiments pour l'embedder de l'instance (cache du cœur)."""
+    return prototypes(get_embedder())
+
+
 # Modèles Pydantic
-# `reflective` (26/09) : croyances de l'agent sur l'utilisateur et les humains. Écrites
-# délibérément, validées par `belief_guard`, jamais extraites par le worker.
-MemoryType = Literal["semantic", "episodic", "procedural", "working", "reflective"]
+# Nom de compartiment STRICT, pour les FILTRES de lecture : viser un compartiment qui
+# n'existe pas est une erreur de l'appelant (422), pas une recherche vide silencieuse.
+# À l'écriture, au contraire, un nom inconnu est classé par le moteur (cf. MemoryInput).
+CompartmentName = Literal[NOMS]  # type: ignore[valid-type]
 
 
 class EventInput(BaseModel):
@@ -812,17 +836,12 @@ class EventInput(BaseModel):
 
 class ContextConstraints(BaseModel):
     max_tokens: int = Field(default=1200, ge=1, le=8000)
-    # Familles cognitives. Le plafond de 4 n'est pas arbitraire : c'est le nombre TOTAL de
-    # familles, et elles restent fermées (chacune porte un comportement du moteur).
-    # `reflective` inclus par défaut (lot C) : les croyances nuancent le paquet, sous le
-    # quota `QEM_REFLECTIVE_MAX_SHARE`. Plafond = nombre total de familles (5).
-    memory_types: list[MemoryType] = Field(default=["semantic", "episodic", "procedural", "working", "reflective"], min_length=1, max_length=5)
-    # Filtrage FIN par collection (`memories.subtype`). C'est ici que la granularité s'ouvre :
-    # un agent qui a déclaré `clients_paca` peut viser ce seul rayon au lieu de ratisser tout
-    # `semantic`. Moins de candidats en entrée de Q-EM, donc moins de bruit à budget égal.
-    # None = toutes les collections des familles retenues (comportement historique).
-    collections: list[str] | None = Field(default=None, max_length=32,
-                                          json_schema_extra={"example": ["clients_paca"]})
+    # Compartiments interrogés. Par défaut les 9 : `croyances` nuance le paquet sous son
+    # quota, `reflexes` y est injecté d'office. Viser un sous-ensemble réduit le bruit à
+    # budget égal (ex. ["alertes", "savoir_faire"] pour un débogage).
+    compartments: list[CompartmentName] = Field(  # type: ignore[valid-type]
+        default_factory=lambda: list(NOMS), min_length=1, max_length=len(NOMS),
+        json_schema_extra={"example": ["savoir_faire", "alertes"]})
     # Filtre projet (lot B). None = tous projets confondus (historique). Avec un projet,
     # `include_global` ajoute les souvenirs globaux (préférences, conventions générales).
     project: str | None = Field(default=None, max_length=64,
@@ -1094,7 +1113,7 @@ def capture_event(event: EventInput, auth: AuthContext | None = Depends(get_auth
 # Le cache évite de refaire tout le calcul Q-EM (recherche hybride + intrication +
 # interférence + collapse) pour une requête identique dans la fenêtre TTL.
 #
-# Clé : `ctx_cache:{tenant}:{agent}:{hash(query + memory_types + max_tokens + project)}`
+# Clé : `ctx_cache:{tenant}:{agent}:{hash(query + compartments + max_tokens + project)}`
 # TTL : 60s (défaut, configurable via CONTEXT_CACHE_TTL)
 # Sérialisation : JSON (le résultat est déjà un dict sérialisable)
 #
@@ -1109,10 +1128,11 @@ CONTEXT_CACHE_HITS = Counter("synaptiq_context_cache_total", "Context build cach
 def _context_cache_key(tenant: str, agent_id: str, request: ContextRequest) -> str:
     """Clé de cache unique pour une requête de contexte.
 
-    Inclut tous les paramètres qui influencent le résultat : query, memory_types,
-    max_tokens, project, collections, include_global.
+    Inclut tous les paramètres qui influencent le résultat : query, compartments,
+    max_tokens, project, include_global.
     """
-    key_data = f"{request.query}|{','.join(request.constraints.memory_types)}|{request.constraints.max_tokens}|{request.constraints.project}|{','.join(request.constraints.collections or [])}|{request.constraints.include_global}"
+    c = request.constraints
+    key_data = f"{request.query}|{','.join(c.compartments)}|{c.max_tokens}|{c.project}|{c.include_global}"
     key_hash = hashlib.sha256(key_data.encode("utf-8")).hexdigest()[:16]
     return f"ctx_cache:{tenant}:{agent_id}:{key_hash}"
 
@@ -1167,23 +1187,19 @@ def build_context(request: ContextRequest, auth: AuthContext | None = Depends(ge
     try:
         query_vector = get_embedder().embed_one(request.query)
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Le registre décide des SECTIONS du paquet : une collection déclarée par cet
-            # agent y apparaît, même vide. Chargé ici, avant l'assemblage, pour que la
-            # réponse ait la même forme qu'il y ait des souvenirs ou non.
-            registre = charger_registre(cur, tenant, request.agent_id)
+            # Les sections du paquet sont les 9 compartiments, toujours présents : la forme
+            # de la réponse ne dépend ni de l'agent ni de ce qu'il a déjà rangé.
             resultat = build_context_packet(
                 store=PostgresMemoryStore(cur, tenant, request.agent_id,
-                                          request.constraints.collections,
                                           request.constraints.project,
                                           request.constraints.include_global),
                 query_vector=query_vector,
                 query_text=request.query,
-                memory_types=request.constraints.memory_types,
+                compartments=list(request.constraints.compartments),
                 max_tokens=request.constraints.max_tokens,
                 config=retrieval_config(),
                 trace_id=trace_id,
                 explain=request.explain,
-                registry=registre,
                 explain_level=request.explain_level,
                 record_access=request.record_access and not request.explain,
             )
@@ -1216,8 +1232,19 @@ def build_context(request: ContextRequest, auth: AuthContext | None = Depends(ge
 
 class MemoryInput(BaseModel):
     agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$", json_schema_extra={"example": "agent_sales_01"})
-    type: MemoryType = Field(..., json_schema_extra={"example": "semantic"})
-    subtype: str | None = Field(None, max_length=50, json_schema_extra={"example": "preference"})
+    # Compartiment où ranger le souvenir. C'est le SEUL rangement que l'agent fournit, et il
+    # est facultatif : absent ou inconnu, le moteur classe par similarité avec les
+    # prototypes des compartiments, et la réponse le dit (`compartment_origin`).
+    compartment: str | None = Field(None, max_length=64,
+                                    json_schema_extra={"example": "savoir_faire"})
+    # ⚠️ DÉPRÉCIÉS (v0.3). Encore lus pour ne pas casser les clients existants le jour de
+    # la bascule : un ancien nom de collection est converti par `compartments.ALIAS`
+    # (origine `alias`, journalisée). Seront retirés en v0.5.
+    type: str | None = Field(None, max_length=20, description="Déprécié : utiliser compartment.")
+    subtype: str | None = Field(None, max_length=64, description="Déprécié : utiliser compartment.")
+    # Sujet d'une croyance (compartiment `croyances` seulement) : l'utilisateur, ou les
+    # humains / tiers en général.
+    about: Literal["user", "humans"] | None = None
     content: str = Field(..., min_length=1, max_length=12000, json_schema_extra={"example": "Jimmy préfère les e-mails courts."})
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     importance: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -1238,28 +1265,36 @@ class MemoryInput(BaseModel):
     def _normaliser_projet(cls, valeur):
         return normaliser_projet(valeur)
 
-    # Croyances (famille `reflective`, lot C) : souvenirs à l'appui, et croyance remplacée
-    # (révision par supersession plutôt que par accumulation). Refusés hors de la famille.
+    # Croyances (lot C) : souvenirs à l'appui, et croyance remplacée (révision par
+    # supersession plutôt que par accumulation). Refusés hors du compartiment `croyances`.
     evidence: list[str] | None = Field(default=None, max_length=20)
     replaces: uuid.UUID | None = None
 
     @model_validator(mode="after")
     def _verifier_la_croyance(self):
-        """Applique `belief_guard` à toute croyance, et borne ses collections.
+        """Ramène les anciennes formes de croyance au compartiment, puis applique
+        `belief_guard`.
 
         Dans le validateur (et non dans le handler) pour que le refus sorte en 422 avec le
         motif, comme toute autre erreur de saisie : l'agent peut reformuler.
         """
-        if self.type != FAMILLE_REFLEXIVE:
-            if self.evidence or self.replaces:
-                raise ValueError("`evidence` et `replaces` ne s'appliquent qu'aux croyances "
-                                 "(type='reflective').")
+        # Formes v0.3 d'une croyance : type='reflective', ou sous-type user_model /
+        # human_insights. Le sujet se déduit du sous-type.
+        ancien = self.subtype if self.compartment is None else self.compartment
+        if self.compartment is None and (self.type == "reflective"
+                                         or ancien in ("user_model", "human_insights")):
+            self.compartment = COMPARTIMENT_CROYANCES
+        if ancien in ("user_model", "human_insights") and self.about is None:
+            self.about = "humans" if ancien == "human_insights" else "user"
+        if self.compartment in ("user_model", "human_insights"):
+            self.compartment = COMPARTIMENT_CROYANCES
+
+        if self.compartment != COMPARTIMENT_CROYANCES:
+            if self.evidence or self.replaces or self.about:
+                raise ValueError("`evidence`, `replaces` et `about` ne s'appliquent qu'aux "
+                                 "croyances (compartment='croyances').")
             return self
-        if self.subtype is None:
-            self.subtype = "user_model"
-        if self.subtype not in ("user_model", "human_insights"):
-            raise ValueError("Une croyance se range dans 'user_model' (ce que l'agent pense "
-                             "de l'utilisateur) ou 'human_insights' (les humains, les tiers).")
+        self.about = self.about or "user"
         try:
             validee = valider_croyance(self.content, self.confidence, self.evidence)
         except CroyanceRefusee as e:
@@ -1268,71 +1303,16 @@ class MemoryInput(BaseModel):
         self.evidence = list(validee.evidence)
         return self
 
-    @model_validator(mode="after")
-    def _verifier_la_taxonomie(self):
-        """Refuse un sous-type canonique rattaché au mauvais type.
+    @property
+    def est_croyance(self) -> bool:
+        return self.compartment == COMPARTIMENT_CROYANCES
 
-        Jusqu'au 29/07, la taxonomie n'était appliquée que sur le chemin d'extraction du
-        worker : cet endpoint acceptait n'importe quel sous-type. Un sous-type LIBRE reste
-        accepté (le routage retombe sur la collection du type, et un libellé métier précis
-        est légitime), mais `type='semantic'` avec `subtype='coding_best_practices'` est une
-        erreur démontrable de l'appelant : la mémoire irait dans `facts` alors qu'elle visait
-        `best_practices`. Voir `synaptiq_core.taxonomy`.
-        """
-        try:
-            validate_subtype(self.type, self.subtype)
-        except SubtypeMismatch as e:
-            raise ValueError(str(e)) from e
-        return self
-
-def _declarer_collection_manquante(cur, tenant: str, agent_id: str,
-                                   famille: str, nom: str) -> None:
-    """Déclare une collection à l'écriture quand l'agent range hors registre.
-
-    Contexte (audit 11/08) : 189 souvenirs étaient rangés dans des collections
-    jamais déclarées. La cause n'est pas le sous-type libre (voulu) mais la FAMILLE —
-    l'unicité porte sur (tenant, agent, name, family), donc `project_state` en
-    `procedural` et en `semantic` sont deux collections distinctes, et la seconde
-    n'avait aucune ligne. Le registre a été rattrapé une fois en base ; sans ce
-    mécanisme, il re-dériverait à la première écriture d'un nouveau sous-type.
-
-    Réglé pour rester silencieux : déclarer est un service rendu à l'agent, jamais une
-    condition d'écriture. L'écriture n'échoue pas ici — au pire la collection manque
-    (comportement d'avant) — et le plafond `MAX_COLLECTIONS_PER_AGENT` est respecté.
-    """
-    if not nom:
-        return
-    registre = charger_registre(cur, tenant, agent_id)
-    # Déjà couvert par une collection système ou une collection de l'agent.
-    if registre.get(famille, nom) is not None:
-        return
-    if len([c for c in registre.collections if c.created_by == "agent"]) >= MAX_COLLECTIONS_PER_AGENT:
-        logger.warning("Collection non déclarée %s/%s : plafond MAX_COLLECTIONS_PER_AGENT "
-                       "atteint pour %s.", famille, nom, agent_id)
-        return
-    # SAVEPOINT : une défaillance ici ne doit pas avorter la transaction qui porte
-    # l'INSERT de la mémoire (même classe de panne que le SAVEPOINT de `charger_registre`).
-    cur.execute("SAVEPOINT synaptiq_declare")
-    try:
-        cur.execute(
-            """INSERT INTO memory_collections
-               (tenant_id, agent_id, name, family, description, entangle, packet_key, created_by)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, 'agent')
-               ON CONFLICT (tenant_id, agent_id, name, family)
-               WHERE created_by = 'agent' DO NOTHING""",
-            (tenant, agent_id, nom, famille,
-             f"Rayon {nom} (famille {famille}) — déclaré automatiquement à l'écriture.",
-             famille in ("semantic", "procedural"), nom),
-        )
-        if cur.rowcount:
-            logger.info("Collection auto-déclarée à l'écriture : %s/%s (agent %s).",
-                        famille, nom, agent_id)
-    except Exception:
-        cur.execute("ROLLBACK TO SAVEPOINT synaptiq_declare")
-        logger.warning("Auto-déclaration impossible (%s/%s) : l'écriture continue sans "
-                       "collection déclarée.", famille, nom, exc_info=True)
-    finally:
-        cur.execute("RELEASE SAVEPOINT synaptiq_declare")
+    def rangement(self, vecteur) -> Rangement:
+        """Compartiment retenu : demandé, converti depuis un ancien nom, ou classé."""
+        if self.est_croyance:
+            return Rangement(COMPARTIMENT_CROYANCES, "agent", demande=self.compartment)
+        demande = self.compartment if self.compartment is not None else self.subtype
+        return resoudre(demande, vecteur, prototypes_compartiments(), famille=self.type)
 
 
 def _croyance_contestee(cur, tenant: str, agent_id: str, empreinte: str) -> bool:
@@ -1347,14 +1327,14 @@ def _croyance_contestee(cur, tenant: str, agent_id: str, empreinte: str) -> bool
 def _archiver_croyance_remplacee(cur, tenant: str, agent_id: str, ancienne: str) -> list[str]:
     """Archive la croyance remplacée ; 404 si elle n'est pas une croyance active de l'agent.
 
-    Borné au (tenant, agent) et à la famille : `replaces` ne doit pas devenir un moyen
+    Borné au (tenant, agent) et au compartiment : `replaces` ne doit pas devenir un moyen
     d'archiver n'importe quel souvenir par identifiant.
     """
     cur.execute(
         "UPDATE memories SET status = 'archived', updated_at = CURRENT_TIMESTAMP "
-        "WHERE id = %s AND tenant_id = %s AND agent_id = %s AND type = %s "
+        "WHERE id = %s AND tenant_id = %s AND agent_id = %s AND compartment = %s "
         "AND status = 'active' RETURNING id",
-        (ancienne, tenant, agent_id, FAMILLE_REFLEXIVE))
+        (ancienne, tenant, agent_id, COMPARTIMENT_CROYANCES))
     if cur.fetchone() is None:
         raise HTTPException(status_code=404,
                             detail=f"Aucune croyance active {ancienne} à remplacer.")
@@ -1364,6 +1344,8 @@ def _archiver_croyance_remplacee(cur, tenant: str, agent_id: str, ancienne: str)
 def _memoire_existante(cur, tenant: str, agent_id: str, empreinte: str,
                        cle_idempotence: str | None):
     """Cherche une mémoire ACTIVE déjà écrite en direct pour ce contenu (ou cette clé).
+
+    Renvoie `(id, compartiment)` ou None.
 
     Bornée à `status = 'active'` et à `source_event_id IS NULL`, exactement comme les index
     uniques qu'elle double :
@@ -1377,25 +1359,26 @@ def _memoire_existante(cur, tenant: str, agent_id: str, empreinte: str,
     """
     if cle_idempotence:
         cur.execute(
-            "SELECT id FROM memories "
+            "SELECT id, compartment FROM memories "
             "WHERE tenant_id = %s AND agent_id = %s AND idempotency_key = %s "
             "AND status = 'active' AND source_event_id IS NULL LIMIT 1",
             (tenant, agent_id, cle_idempotence),
         )
         ligne = cur.fetchone()
         if ligne is not None:
-            return ligne[0]
+            return ligne[0], ligne[1]
     cur.execute(
-        "SELECT id FROM memories "
+        "SELECT id, compartment FROM memories "
         "WHERE tenant_id = %s AND agent_id = %s AND content_hash = %s "
         "AND status = 'active' AND source_event_id IS NULL LIMIT 1",
         (tenant, agent_id, empreinte),
     )
     ligne = cur.fetchone()
-    return ligne[0] if ligne is not None else None
+    return (ligne[0], ligne[1]) if ligne is not None else None
 
 
-def _reponse_memoire(memory: "MemoryInput", memory_id: str, statut: str, registre):
+def _reponse_memoire(memory: "MemoryInput", memory_id: str, statut: str,
+                     rangement: Rangement) -> dict:
     """Corps de réponse de `POST /v1/memories`, identique quel que soit le statut.
 
     `duplicate` rend la MÊME forme que `created`, avec l'identifiant de la ligne déjà en
@@ -1403,23 +1386,36 @@ def _reponse_memoire(memory: "MemoryInput", memory_id: str, statut: str, registr
     seule différence visible est `status`. Deux formes de réponse pour un même endpoint
     obligeraient chaque client à traiter le cas dégradé séparément — et donc à l'oublier.
 
-    Le registre est PASSÉ et non rechargé : le chemin de création en a déjà besoin pour
-    décider de l'intrication, et le relire ici doublerait la lecture sur le chemin chaud.
+    Le compartiment est TOUJOURS rendu, avec qui l'a choisi : un agent qui n'a rien
+    précisé, ou qui a donné un nom inconnu, doit voir où son souvenir a été rangé pour
+    pouvoir le corriger (v0.3 : un libellé métier retombait dans `facts` sans le dire).
     """
+    compartiment = PAR_NOM[rangement.compartiment]
     return {
         "status": statut,
         "memory_id": memory_id,
-        # Collection du context_packet où ce souvenir sera servi. Rendue explicite
-        # parce qu'un sous-type libre retombe sur la collection du TYPE : sans cette
-        # information, l'appelant ne peut pas savoir que son libellé métier n'a pas
-        # produit le routage fin qu'il imaginait.
-        # Routage résolu par le REGISTRE de cet agent, et non plus par la cascade
-        # de `if` : une collection qu'il a déclarée lui-même est donc honorée ici.
-        "collection": route_memory(memory.type, memory.subtype, registre),
-        "canonical_subtype": is_canonical(memory.type, memory.subtype),
+        "compartment": compartiment.nom,
+        "region": compartiment.region,
+        # `agent` : nom valide fourni ; `alias` : ancien nom de collection converti ;
+        # `moteur` : classé par similarité ; `existant` : doublon, rangement d'origine.
+        "compartment_origin": rangement.origine,
+        "classification_similarity": rangement.similarite,
+        "requested": rangement.demande,
         # Projet effectivement enregistré (normalisé) : None = souvenir global.
         "project": memory.project,
     }
+
+
+def _provenance(memory: "MemoryInput", rangement: Rangement) -> dict:
+    """Provenance d'un souvenir écrit en direct."""
+    if memory.est_croyance:
+        provenance: dict[str, Any] = {"about": memory.about}
+        if memory.evidence:
+            provenance["evidence"] = memory.evidence
+        return provenance
+    if rangement.origine in ("alias", "moteur") and rangement.demande:
+        return {"requested_compartment": rangement.demande}
+    return {}
 
 
 @v1_router.post("/memories", status_code=201)
@@ -1458,21 +1454,19 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             existant = _memoire_existante(cur, tenant, memory.agent_id, empreinte,
                                           memory.idempotency_key)
             if existant is not None:
-                # Réponse construite AVANT le rollback : `_reponse_memoire` lit le registre
-                # de collections, donc il lui faut la transaction encore ouverte.
-                reponse = _reponse_memoire(
-                    memory, str(existant), "duplicate",
-                    charger_registre(cur, tenant, memory.agent_id))
                 conn.rollback()      # lecture seule : ne rien laisser en transaction
                 MEMORY_WRITES.labels("duplicate").inc()
                 logger.info("Écriture directe déjà présente : relance traitée en no-op.",
-                            extra={"agent_id": memory.agent_id, "memory_id": str(existant)})
-                return reponse
+                            extra={"agent_id": memory.agent_id, "memory_id": str(existant[0])})
+                # Rangement d'ORIGINE : un doublon ne se reclasse pas.
+                return _reponse_memoire(memory, str(existant[0]), "duplicate",
+                                        Rangement(existant[1], "existant",
+                                                  demande=memory.compartment))
 
             # Une croyance CONTESTÉE par l'utilisateur ne se réécrit pas à l'identique : sans
             # ce contrôle, l'agent la renoterait à la session suivante et la contestation
             # n'aurait servi à rien. Reformuler (avec de nouveaux indices) reste possible.
-            if memory.type == FAMILLE_REFLEXIVE and _croyance_contestee(
+            if memory.est_croyance and _croyance_contestee(
                     cur, tenant, memory.agent_id, empreinte):
                 conn.rollback()
                 raise HTTPException(
@@ -1481,11 +1475,14 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                            "pas être réenregistrée telle quelle.")
 
             embedding = get_embedder().embed_one(memory.content)
+            # Le compartiment se décide APRÈS l'embedding : le classement par similarité
+            # réutilise le vecteur du souvenir, aucun appel d'embedding supplémentaire.
+            rangement = memory.rangement(embedding)
+            compartiment = PAR_NOM[rangement.compartiment]
 
             # Gestion des contradictions
             new_mem_dict = {
-                "type": memory.type,
-                "subtype": memory.subtype,
+                "compartment": compartiment.nom,
                 "content": memory.content
             }
             # Archivage sur verdict EXPLICITE de contradiction seulement (cf. governance).
@@ -1500,7 +1497,7 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             # entre deux requêtes concurrentes portant le même contenu, fenêtre que le
             # SELECT seul laisse ouverte.
             query = """
-                INSERT INTO memories (tenant_id, agent_id, type, subtype, content, embedding,
+                INSERT INTO memories (tenant_id, agent_id, type, compartment, content, embedding,
                                       confidence, importance, status, content_hash, idempotency_key,
                                       project, provenance)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s)
@@ -1510,8 +1507,9 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             cur.execute(query, (
                 tenant,
                 memory.agent_id,
-                memory.type,
-                memory.subtype,
+                # Famille DÉDUITE du compartiment : plus personne ne la fournit.
+                compartiment.famille,
+                compartiment.nom,
                 memory.content,
                 embedding,
                 memory.confidence,
@@ -1519,8 +1517,9 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                 empreinte,
                 memory.idempotency_key,
                 memory.project,
-                # Indices d'une croyance (ids de souvenirs) : c'est ce qui la rend contrôlable.
-                json.dumps({"evidence": memory.evidence} if memory.evidence else {}),
+                # Croyance : indices (ids de souvenirs, c'est ce qui la rend contrôlable) et
+                # sujet. Autre souvenir : nom demandé quand le moteur a dû trancher.
+                json.dumps(_provenance(memory, rangement)),
             ))
             ligne = cur.fetchone()
             if ligne is None:
@@ -1532,13 +1531,14 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
                 gagnante = _memoire_existante(cur, tenant, memory.agent_id, empreinte,
                                               memory.idempotency_key)
                 reponse = _reponse_memoire(
-                    memory, str(gagnante) if gagnante else "", "duplicate",
-                    charger_registre(cur, tenant, memory.agent_id))
+                    memory, str(gagnante[0]) if gagnante else "", "duplicate",
+                    Rangement(gagnante[1], "existant", demande=memory.compartment)
+                    if gagnante else rangement)
                 conn.commit()
                 MEMORY_WRITES.labels("duplicate").inc()
                 logger.info("Course d'insertion perdue sur un contenu identique : no-op.",
                             extra={"agent_id": memory.agent_id,
-                                   "memory_id": str(gagnante) if gagnante else None})
+                                   "memory_id": str(gagnante[0]) if gagnante else None})
                 return reponse
 
             new_id = ligne[0]
@@ -1551,12 +1551,6 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             if superseded:
                 link_supersedes(cur, new_id, superseded)
 
-            # Registre : déclarer la collection si l'agent range hors registre (audit
-            # 11/08 — les rayons fantômes ne doivent pas re-dériver après le backfill).
-            # AVANT le chargement ci-dessous, pour que l'intrication lise le flag déclaré.
-            _declarer_collection_manquante(cur, tenant, memory.agent_id,
-                                           memory.type, memory.subtype)
-
             # ── Graphe d'intrication ──────────────────────────────────────────────────────
             # Tissé ICI depuis le 01/08. Auparavant `_entangle` n'existait que dans le worker,
             # donc une écriture directe ne construisait AUCUNE arête : la phase 2 de Q-EM
@@ -1565,22 +1559,20 @@ def create_memory(memory: MemoryInput, auth: AuthContext | None = Depends(get_au
             # souvenirs, 0 arête, après des semaines d'usage.
             # Dans la même transaction que l'insertion : une arête sans son souvenir n'a pas
             # de sens, et l'inverse non plus.
-            # Isolé sur un SAVEPOINT : un registre illisible ne doit pas avorter la
-            # transaction qui porte l'INSERT (cf. `collections.charger_registre`).
-            registre = charger_registre(cur, tenant, memory.agent_id)
-            if registre.entangle_pour(memory.type, memory.subtype):
-                entangle(cur, tenant, memory.agent_id, new_id, memory.subtype, embedding,
+            # Seuls les compartiments qui intriquent tissent des liens (les épisodes et
+            # les observations, nombreux et peu discriminants, densifieraient le graphe
+            # sans gain ; les réflexes, présents partout, deviendraient des hubs).
+            if compartiment.intrique:
+                entangle(cur, tenant, memory.agent_id, new_id, compartiment.nom, embedding,
                          project=memory.project)
 
-            # Réponse assemblée dans la MÊME transaction que l'insertion : `charger_registre`
-            # lit en base, et le faire après le commit ouvrirait une transaction de plus.
-            reponse = _reponse_memoire(memory, str(new_id), "created", registre)
+            reponse = _reponse_memoire(memory, str(new_id), "created", rangement)
             conn.commit()
             MEMORY_WRITES.labels("created").inc()
 
             logger.info("Mémoire créée en direct par l'agent : %s", new_id,
-                        extra={"agent_id": memory.agent_id, "memory_type": memory.type,
-                               "subtype": memory.subtype})
+                        extra={"agent_id": memory.agent_id, "compartment": compartiment.nom,
+                               "compartment_origin": rangement.origine})
             return reponse
     except HTTPException:
         raise
@@ -1595,9 +1587,9 @@ class RetrieveRequest(BaseModel):
     agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$")
     query: str = Field(..., min_length=1, max_length=8000)
     limit: int = Field(default=5, ge=1, le=100)
-    memory_type: MemoryType | None = None
-    # Symétrique de `ContextConstraints.collections` : viser un rayon plutôt qu'une famille.
-    collections: list[str] | None = Field(default=None, max_length=32)
+    # Restreint la recherche à certains compartiments. None = tous.
+    compartments: list[CompartmentName] | None = Field(  # type: ignore[valid-type]
+        default=None, max_length=len(NOMS))
     # Filtre projet (lot B). None = tous projets confondus (historique). Avec un projet,
     # `include_global` ajoute les souvenirs globaux (préférences, conventions générales).
     project: str | None = Field(default=None, max_length=64,
@@ -1627,19 +1619,16 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
         vector_str = to_pgvector(query_vector)
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # Préfixé `m.` : le chemin hybride aliase `memories` en m dans les deux branches.
-            # `type_filter` est un fragment CHOISI par le serveur (deux valeurs
-            # possibles), jamais une chaine fournie par l'appelant : le type de memoire
-            # est valide en amont par Pydantic (Literal, cf. exemption S608 dans ruff.toml).
+            # `type_filter` est un fragment CHOISI par le serveur (formes fixes), jamais
+            # une chaine fournie par l'appelant : les compartiments passent en paramètre
+            # lié et sont validés en amont par Pydantic (Literal, cf. S608 dans ruff.toml).
             # Le fragment et `filtre_params` sont construits ENSEMBLE et dans le même ordre :
             # les trois requêtes ci-dessous sont positionnelles, et un décalage y serait muet
             # (les types concordent) — il fausserait le filtre au lieu de lever.
-            type_filter = "AND m.type = %s" if request.memory_type else ""
+            type_filter = "AND m.compartment = ANY(%s)" if request.compartments else ""
             filtre_params: list = [tenant, request.agent_id]
-            if request.memory_type:
-                filtre_params.append(request.memory_type)
-            if request.collections:
-                type_filter += " AND m.subtype = ANY(%s)"
-                filtre_params.append(request.collections)
+            if request.compartments:
+                filtre_params.append(list(request.compartments))
             # Projet (lot B) : même fragment que `_fetch_candidates`, ajouté en dernier.
             frag_projet, p_projet = filtre_projet(request.project, request.include_global,
                                                   alias="m.")
@@ -1650,7 +1639,7 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
 
             if not RETRIEVAL_HYBRID:
                 cur.execute(f"""
-                    SELECT m.id, m.type, m.subtype, m.content, m.confidence, m.importance,
+                    SELECT m.id, m.compartment, m.content, m.confidence, m.importance,
                            m.last_accessed_at, m.occurred_at,
                            (1 - (m.embedding <=> %s::vector)) AS similarity
                     FROM memories m
@@ -1708,7 +1697,7 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
                     ) u
                     GROUP BY id
                 )
-                SELECT m.id, m.type, m.subtype, m.content, m.confidence, m.importance,
+                SELECT m.id, m.compartment, m.content, m.confidence, m.importance,
                        m.last_accessed_at, m.occurred_at,
                        (1 - (m.embedding <=> %s::vector)) AS similarity,
                        r.rank_vec, r.rank_fts
@@ -1744,348 +1733,7 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
         pool.putconn(conn)
 
 
-# Plafond du nombre de collections qu'un agent peut se créer. Ce n'est pas une limite
-# technique : c'est un garde-fou de LISIBILITÉ. Un LLM à qui l'on donne le droit de créer
-# une catégorie en crée une à chaque nouveauté ; quarante rayons produisent un paquet de
-# contexte éclaté en quarante sections dont trente-cinq vides — plus dur à exploiter pour le
-# modèle que les sept d'origine. Le contrôle anti-doublon SÉMANTIQUE (comparaison des
-# descriptions) et la fusion viendront compléter ce plafond ; il est volontairement en place
-# dès l'ouverture de la création, pour qu'aucune fenêtre ne laisse la taxonomie s'emballer.
-MAX_COLLECTIONS_PER_AGENT = int(os.getenv("MAX_COLLECTIONS_PER_AGENT", "50"))
-
-# Cosinus au-delà duquel deux descriptions de collection décrivent la même chose. 0,85 est
-# volontairement plus haut que le seuil de redondance des souvenirs (0,75) : refuser à tort
-# une collection légitime est plus coûteux que d'en laisser passer une proche — l'agent peut
-# fusionner après coup, mais un refus le laisse sans rayon où ranger.
-COLLECTION_DUP_THRESHOLD = float(os.getenv("COLLECTION_DUP_THRESHOLD", "0.85"))
-
-# Sections canoniques du context_packet, DÉRIVÉES des collections livrées avec le moteur —
-# jamais réécrites à la main (même règle que `taxonomy.VALID_SUBTYPES`, cf. CLAUDE.md §3).
-# Elles sont interdites comme `packet_key` d'une collection d'agent : voir le refus dans
-# `create_collection`.
-CLES_PAQUET_CANONIQUES: frozenset[str] = frozenset(c.packet_key for c in SYSTEM_COLLECTIONS)
-
-# Jours sans écriture au-delà desquels une collection vide est signalée comme dormante.
-# Une collection créée puis jamais utilisée est le premier symptôme d'une taxonomie qui
-# part en morceaux ; la signaler est ce qui permet de la fusionner ou de la supprimer.
-COLLECTION_STALE_DAYS = int(os.getenv("COLLECTION_STALE_DAYS", "14"))
-
-
-def _cosinus(a, b) -> float:
-    """Cosinus entre deux vecteurs. 0.0 si l'un est nul (jamais une division par zéro)."""
-    va, vb = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-    normes = float(np.linalg.norm(va) * np.linalg.norm(vb))
-    return float(va @ vb / normes) if normes else 0.0
-
-
-def _collection_trop_proche(cur, tenant: str, agent_id: str, description: str,
-                            vecteur) -> tuple[str, float] | None:
-    """Une collection existante décrit-elle déjà la même chose ?
-
-    ## Le moteur retourné contre sa propre dérive
-
-    Un LLM à qui l'on donne le droit de créer une catégorie en crée une à chaque nuance :
-    `clients_paca`, puis `clients_region_paca`, puis `prospects_paca`. Aucune n'est fausse,
-    et le résultat est une mémoire éparpillée où plus rien ne se retrouve. Un contrôle sur
-    le NOM n'y peut rien — ces trois-là sont trois chaînes distinctes.
-
-    La description, elle, est du texte : on la compare avec l'outil que le produit sait
-    déjà faire, la similarité vectorielle. C'est le même mécanisme que le filtre de
-    redondance des souvenirs, appliqué à la taxonomie.
-
-    Les descriptions sans vecteur en base (collections système, et celles reprises par la
-    migration) sont embarquées À LA VOLÉE, en un seul appel groupé. Sans cela, la protection
-    serait inopérante précisément contre les doublons des sept rayons livrés — le cas le
-    plus probable pour un agent qui débute.
-    """
-    cur.execute(
-        "SELECT name, description, description_embedding::text FROM memory_collections "
-        "WHERE created_by = 'system' OR (tenant_id = %s AND agent_id = %s)",
-        (tenant, agent_id),
-    )
-    lignes = [dict(li) if isinstance(li, dict) else
-              {"name": li[0], "description": li[1], "description_embedding": li[2]}
-              for li in cur.fetchall()]
-
-    connus: list[tuple[str, Any]] = []
-    a_embarquer: list[tuple[str, str]] = []
-    for li in lignes:
-        if not (li["description"] or "").strip():
-            continue                      # rien à comparer
-        if li["description_embedding"]:
-            connus.append((li["name"], parse_embedding(li["description_embedding"])))
-        else:
-            a_embarquer.append((li["name"], li["description"]))
-
-    if a_embarquer:
-        # Un seul appel groupé : l'interface Embedder est batch, et la création de
-        # collection est une opération rare.
-        vecteurs = get_embedder().embed([d for _, d in a_embarquer])
-        connus.extend((nom, vec) for (nom, _), vec in zip(a_embarquer, vecteurs, strict=False))
-
-    meilleur: tuple[str, float] | None = None
-    for nom, autre in connus:
-        score = _cosinus(vecteur, autre)
-        if score >= COLLECTION_DUP_THRESHOLD and (meilleur is None or score > meilleur[1]):
-            meilleur = (nom, score)
-    return meilleur
-
-
-class CollectionInput(BaseModel):
-    """Déclaration d'un nouveau rayon par l'agent lui-même."""
-
-    agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$")
-    # Devient la valeur de `memories.subtype`. Snake_case minuscule : ce nom voyage jusque
-    # dans les clés du context_packet, il doit rester lisible et stable.
-    name: str = Field(..., min_length=2, max_length=64, pattern=r"^[a-z0-9_]+$",
-                      json_schema_extra={"example": "clients_paca"})
-    family: Literal["semantic", "episodic", "procedural", "working"] = Field(
-        ..., json_schema_extra={"example": "semantic"})
-    # OBLIGATOIRE, et ce n'est pas de la bureaucratie : elle sera vectorisée pour refuser
-    # une collection qui en double une autre, et c'est aussi ce que l'agent relira dans
-    # `list_collections` pour décider s'il doit créer ou réutiliser.
-    description: str = Field(..., min_length=10, max_length=500)
-    entangle: bool = Field(
-        default=True,
-        description="Cette collection tisse-t-elle des liens 'entangled_with' ? "
-                    "Vrai pour un savoir structurant, faux pour du volumineux peu "
-                    "discriminant (brouillons, journaux bruts).")
-    # Plusieurs collections peuvent alimenter une même section du paquet. Par défaut chacune
-    # a la sienne, ce qui est le cas attendu.
-    packet_key: str | None = Field(default=None, min_length=2, max_length=64,
-                                   pattern=r"^[a-z0-9_]+$")
-
-
-@v1_router.post("/collections", status_code=201)
-def create_collection(payload: CollectionInput, auth: AuthContext | None = Depends(get_auth)):
-    """Déclare une collection. C'est l'acte par lequel l'agent structure sa propre mémoire.
-
-    ## Pourquoi la création est EXPLICITE et non implicite
-
-    Écrire dans une collection inexistante ne la crée pas. Un rangement auto-créé à la
-    volée serait indiscernable d'une faute de frappe : `clients_paca`, `client_paca` et
-    `clientspaca` cohabiteraient, chacun avec sa section dans le paquet, et personne ne
-    saurait laquelle fait foi. Un acte délibéré produit une taxonomie qu'on peut relire.
-
-    ## Ce qui est refusé
-
-    - un nom CANONIQUE (`fact`, `preference`, `rule`…). Le registre sait techniquement faire
-      primer une collection d'agent sur son homonyme système, mais ouvrir ça ici laisserait
-      un agent rerouter en silence tout ce qui est déjà rangé sous ce nom ;
-    - un doublon exact pour ce même agent ;
-    - le dépassement de `MAX_COLLECTIONS_PER_AGENT`.
-    - une `packet_key` CANONIQUE (`rules`, `facts`, `preferences`…), cf. ci-dessous.
-    """
-    tenant = resolve_tenant(auth)
-    require_scope(auth, "write")
-    resolve_agent(auth, payload.agent_id)
-
-    if is_canonical(payload.family, payload.name):
-        raise HTTPException(
-            status_code=422,
-            detail=f"'{payload.name}' est une collection système de la famille "
-                   f"'{payload.family}' : elle existe déjà et sert tous les agents. "
-                   f"Choisir un autre nom, ou écrire directement dedans.",
-        )
-
-    # Clé de paquet EFFECTIVE : à défaut de `packet_key`, c'est le nom qui la porte (même
-    # expression qu'à l'INSERT plus bas). Contrôler seulement le champ explicite laisserait
-    # passer une collection nommée `rules` — le contrôle `is_canonical` ci-dessus porte sur
-    # le NOM d'une collection (`rule`), pas sur la clé de section (`rules`).
-    cle_paquet = payload.packet_key or payload.name
-    if cle_paquet in CLES_PAQUET_CANONIQUES:
-        # Aucun enjeu d'isolation — c'est le paquet du même agent. L'enjeu est que
-        # `rules` est la rubrique la plus IMPÉRATIVE du prompt système : y greffer une
-        # collection d'agent transforme un contenu mémorisé (donc potentiellement dicté par
-        # un tiers) en consigne structurelle. Une section canonique n'est alimentée que par
-        # la collection système qui la porte.
-        raise HTTPException(
-            status_code=422,
-            detail=f"'{cle_paquet}' est une section canonique du context_packet : une "
-                   f"collection d'agent ne peut pas s'y greffer. Laisser `packet_key` vide "
-                   f"(la collection aura sa propre section) ou en choisir une autre.",
-        )
-
-    if db_pool is None:
-        raise HTTPException(status_code=503, detail="Pool PostgreSQL non initialisé")
-    conn = db_pool.getconn()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "SELECT count(*) AS n FROM memory_collections "
-                "WHERE tenant_id = %s AND agent_id = %s AND created_by = 'agent'",
-                (tenant, payload.agent_id),
-            )
-            existantes = cur.fetchone()["n"]
-            if existantes >= MAX_COLLECTIONS_PER_AGENT:
-                conn.rollback()
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Plafond atteint ({MAX_COLLECTIONS_PER_AGENT} collections). "
-                           f"Une taxonomie qui grossit sans fin devient illisible : "
-                           f"réutiliser une collection existante, ou en fusionner deux.",
-                )
-
-            # Anti-doublon SÉMANTIQUE. Le contrôle d'unicité du nom ne protège de rien ici :
-            # `clients_paca` et `clients_region_paca` sont deux chaînes distinctes qui
-            # désignent le même rayon.
-            vecteur = get_embedder().embed_one(payload.description)
-            proche = _collection_trop_proche(cur, tenant, payload.agent_id,
-                                             payload.description, vecteur)
-            if proche is not None:
-                conn.rollback()
-                nom_proche, score = proche
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"'{nom_proche}' décrit déjà la même chose (similarité "
-                           f"{score:.2f}). Y ranger ce souvenir plutôt que de créer un "
-                           f"rayon de plus. Si les deux sont réellement distincts, "
-                           f"reformuler la description pour dire en quoi.",
-                )
-
-            cur.execute(
-                """
-                INSERT INTO memory_collections
-                    (tenant_id, agent_id, name, family, packet_key, entangle, description,
-                     description_embedding, created_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'agent')
-                ON CONFLICT DO NOTHING
-                RETURNING id;
-                """,
-                (tenant, payload.agent_id, payload.name, payload.family,
-                 payload.packet_key or payload.name, payload.entangle, payload.description,
-                 to_pgvector(vecteur)),
-            )
-            ligne = cur.fetchone()
-            if ligne is None:
-                conn.rollback()
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"La collection '{payload.name}' existe déjà pour cet agent.",
-                )
-            audit(cur, tenant, "create_collection", auth, agent_id=payload.agent_id,
-                  name=payload.name, family=payload.family, entangle=payload.entangle)
-            conn.commit()
-
-        logger.info("Collection '%s' déclarée par l'agent %s (famille %s, intrication %s).",
-                    payload.name, payload.agent_id, payload.family, payload.entangle)
-        return {
-            "status": "created",
-            "name": payload.name,
-            "family": payload.family,
-            "packet_key": payload.packet_key or payload.name,
-            "entangle": payload.entangle,
-            # Ce qu'il faut passer à `store_memory` pour écrire dedans : sans ce rappel,
-            # l'agent doit deviner que « collection » se traduit par (type, subtype).
-            "usage": {"type": payload.family, "subtype": payload.name},
-        }
-    except HTTPException:
-        raise
-    except Exception:
-        conn.rollback()
-        logger.error("Erreur lors de la création de la collection.", exc_info=True)
-        raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
-    finally:
-        db_pool.putconn(conn)
-
-
-class MergeInput(BaseModel):
-    agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$")
-    source: str = Field(..., min_length=2, max_length=64, pattern=r"^[a-z0-9_]+$")
-    target: str = Field(..., min_length=2, max_length=64, pattern=r"^[a-z0-9_]+$")
-
-
-@v1_router.post("/collections/merge")
-def merge_collections(payload: MergeInput, auth: AuthContext | None = Depends(get_auth)):
-    """Verse les souvenirs de `source` dans `target`, puis supprime `source`.
-
-    ## Pourquoi cette opération est indispensable
-
-    Sans elle, une taxonomie ne peut que grossir. Le plafond et l'anti-doublon ralentissent
-    la dérive, ils ne la corrigent pas : dès que deux rayons proches ont été créés, seule
-    la fusion permet de revenir en arrière. C'est le ramasse-miettes de la structure.
-
-    ## Deux refus, pour deux raisons distinctes
-
-    - **`source` doit appartenir à l'agent.** Une collection système sert tous les agents :
-      la fusionner depuis une requête d'agent la retirerait à tout le monde.
-    - **Même famille des deux côtés.** La famille porte un COMPORTEMENT (intrication,
-      décroissance, section de repli). Déplacer un souvenir de `episodic` vers `semantic`
-      changerait donc la manière dont le moteur le traite, sans que personne ne l'ait
-      demandé. Un rangement ne doit pas modifier une sémantique.
-
-    Aucun souvenir n'est détruit : seule l'étiquette change. L'opération est journalisée.
-    """
-    tenant = resolve_tenant(auth)
-    require_scope(auth, "write")
-    resolve_agent(auth, payload.agent_id)
-
-    if payload.source == payload.target:
-        raise HTTPException(status_code=422, detail="Source et cible identiques.")
-
-    pool = get_db_pool()
-    conn = pool.getconn()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "SELECT name, family, created_by FROM memory_collections "
-                "WHERE name = ANY(%s) AND (created_by = 'system' "
-                "   OR (tenant_id = %s AND agent_id = %s))",
-                ([payload.source, payload.target], tenant, payload.agent_id),
-            )
-            par_nom = {li["name"]: li for li in cur.fetchall()}
-            source, cible = par_nom.get(payload.source), par_nom.get(payload.target)
-
-            if source is None:
-                raise HTTPException(status_code=404,
-                                    detail=f"Collection source '{payload.source}' inconnue.")
-            if cible is None:
-                raise HTTPException(status_code=404,
-                                    detail=f"Collection cible '{payload.target}' inconnue.")
-            if source["created_by"] == "system":
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"'{payload.source}' est une collection système : elle sert tous "
-                           f"les agents et ne peut pas être fusionnée.")
-            if source["family"] != cible["family"]:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Familles différentes ('{source['family']}' vers "
-                           f"'{cible['family']}'). La famille décide de l'intrication et de "
-                           f"la décroissance : la changer modifierait le traitement des "
-                           f"souvenirs déplacés, pas seulement leur rangement.")
-
-            cur.execute(
-                "UPDATE memories SET subtype = %s, updated_at = CURRENT_TIMESTAMP "
-                "WHERE tenant_id = %s AND agent_id = %s AND type = %s AND subtype = %s",
-                (payload.target, tenant, payload.agent_id, source["family"], payload.source),
-            )
-            deplacees = cur.rowcount
-            cur.execute(
-                "DELETE FROM memory_collections WHERE tenant_id = %s AND agent_id = %s "
-                "AND name = %s AND created_by = 'agent'",
-                (tenant, payload.agent_id, payload.source),
-            )
-            audit(cur, tenant, "merge_collections", auth, agent_id=payload.agent_id,
-                  source=payload.source, target=payload.target, moved=deplacees)
-            conn.commit()
-
-        logger.info("Fusion de collections : %s -> %s (%d souvenirs déplacés).",
-                    payload.source, payload.target, deplacees)
-        return {"status": "merged", "source": payload.source, "target": payload.target,
-                "moved_memories": deplacees}
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception:
-        conn.rollback()
-        logger.error("Erreur lors de la fusion de collections.", exc_info=True)
-        raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
-    finally:
-        pool.putconn(conn)
-
-
-# ─── Croyances : ce que l'agent pense (famille `reflective`, lot C) ─────────
+# ─── Croyances : ce que l'agent pense (compartiment `croyances`, lot C) ─────
 # Lecture et contestation exposées À PART de /retrieve : l'utilisateur doit pouvoir voir,
 # d'un seul appel, TOUT ce que l'agent pense de lui — et le contester. C'est la condition
 # pour qu'un agent ait le droit de se forger une opinion sur la personne qu'il sert.
@@ -2103,21 +1751,20 @@ def list_beliefs(agent_id: str, about: Literal["user", "humans"] | None = None,
     tenant = resolve_tenant(auth)
     require_scope(auth, "read")
     resolve_agent(auth, agent_id)
-    collections = {"user": ["user_model"], "humans": ["human_insights"]}.get(
-        about or "", ["user_model", "human_insights"])
+    sujets = [about] if about else ["user", "humans"]
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
-            SELECT id, subtype, content, confidence, provenance->'evidence' AS evidence,
-                   project, created_at
+            SELECT id, COALESCE(provenance->>'about', 'user') AS about, content, confidence,
+                   provenance->'evidence' AS evidence, project, created_at
             FROM memories
-            WHERE tenant_id = %s AND agent_id = %s AND type = %s AND status = 'active'
-              AND subtype = ANY(%s)
+            WHERE tenant_id = %s AND agent_id = %s AND compartment = %s AND status = 'active'
+              AND COALESCE(provenance->>'about', 'user') = ANY(%s)
             ORDER BY confidence DESC, created_at DESC
-        """, (tenant, agent_id, FAMILLE_REFLEXIVE, collections))
+        """, (tenant, agent_id, COMPARTIMENT_CROYANCES, sujets))
         lignes = cur.fetchall()
     return {"beliefs": [
         {"id": str(r["id"]),
-         "about": "user" if r["subtype"] == "user_model" else "humans",
+         "about": r["about"],
          "content": r["content"], "confidence": r["confidence"],
          "evidence": r["evidence"] or [], "project": r["project"],
          "created_at": r["created_at"].isoformat()}
@@ -2139,10 +1786,10 @@ def contest_belief(belief_id: uuid.UUID, payload: ContestInput,
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE memories SET status = 'contested', updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s AND tenant_id = %s AND agent_id = %s AND type = %s
+                WHERE id = %s AND tenant_id = %s AND agent_id = %s AND compartment = %s
                   AND status = 'active'
                 RETURNING id
-            """, (str(belief_id), tenant, payload.agent_id, FAMILLE_REFLEXIVE))
+            """, (str(belief_id), tenant, payload.agent_id, COMPARTIMENT_CROYANCES))
             if cur.fetchone() is None:
                 conn.rollback()
                 raise HTTPException(status_code=404,
@@ -2153,82 +1800,33 @@ def contest_belief(belief_id: uuid.UUID, payload: ContestInput,
     return {"status": "contested", "belief_id": str(belief_id)}
 
 
-@v1_router.get("/collections")
-def list_collections(agent_id: str, auth: AuthContext | None = Depends(get_auth)):
-    """Registre des collections visibles par un agent : les système et les siennes.
+@v1_router.get("/compartments")
+def list_compartments(agent_id: str, auth: AuthContext | None = Depends(get_auth)):
+    """Les 9 compartiments, avec leur fonction et le nombre de souvenirs de l'agent.
 
-    Un agent ne peut pas structurer ce qu'il ne peut pas consulter. C'est cet endpoint qui
-    rend la collection réellement observable — et donc de premier ordre. L'outil MCP
-    `list_collections` s'y branchera au lot 3, avec `create_collection`.
-
-    `memory_count` est calculé ici plutôt que maintenu dans une colonne : une collection
-    déclarée mais vide est une information utile (l'agent l'a créée puis n'en a rien fait),
-    et un compteur dénormalisé dériverait au premier écart d'écriture.
+    C'est ce que l'agent consulte pour juger où ranger. La liste est FIXE (propriété du
+    moteur) : il n'existe ni création ni fusion, l'agent choisit, il ne crée pas.
+    `memory_count` est calculé ici plutôt que maintenu : un compteur dénormalisé dériverait
+    au premier écart d'écriture.
     """
     tenant = resolve_tenant(auth)
     require_scope(auth, "read")
     resolve_agent(auth, agent_id)
-    pool = get_db_pool()
-    conn = pool.getconn()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            registre = charger_registre(cur, tenant, agent_id)
-            cur.execute(
-                "SELECT type AS family, subtype AS name, count(*) AS n "
-                "FROM memories WHERE tenant_id = %s AND agent_id = %s AND status = 'active' "
-                "GROUP BY 1, 2",
-                (tenant, agent_id),
-            )
-            comptes = {(ligne["family"], ligne["name"]): ligne["n"]
-                       for ligne in cur.fetchall()}
-            # Âge des collections de l'agent : une collection déclarée puis jamais utilisée
-            # est le premier symptôme d'une taxonomie qui se disperse. La signaler est ce
-            # qui rend la fusion possible — un défaut qu'on ne voit pas ne se corrige pas.
-            cur.execute(
-                "SELECT name, family, "
-                "EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at)) / 86400 AS jours "
-                "FROM memory_collections WHERE tenant_id = %s AND agent_id = %s",
-                (tenant, agent_id),
-            )
-            ages = {(li["family"], li["name"]): float(li["jours"] or 0)
-                    for li in cur.fetchall()}
-            conn.rollback()  # lecture seule
-
-        collections = []
-        for col in sorted(registre.collections,
-                          key=lambda c: (c.created_by, c.family, c.name)):
-            nombre = comptes.get((col.family, col.name), 0)
-            age = ages.get((col.family, col.name))
-            collections.append({
-                "name": col.name,
-                "family": col.family,
-                "packet_key": col.packet_key,
-                "description": col.description,
-                "entangle": col.entangle,
-                "created_by": col.created_by,
-                "memory_count": nombre,
-                # Vide ET ancienne. Une collection créée il y a dix minutes et encore vide
-                # est normale : l'agent est en train de la remplir.
-                "stale": bool(col.created_by == "agent" and nombre == 0
-                              and age is not None and age >= COLLECTION_STALE_DAYS),
-            })
-        return {
-            "agent_id": agent_id,
-            "collections": collections,
-            "packet_keys": list(registre.packet_keys()),
-            "limits": {
-                "max_collections": MAX_COLLECTIONS_PER_AGENT,
-                "used": sum(1 for c in collections if c["created_by"] == "agent"),
-            },
-        }
-    except HTTPException:
-        raise
-    except Exception:
-        conn.rollback()
-        logger.error("Erreur de lecture du registre de collections.", exc_info=True)
-        raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
-    finally:
-        pool.putconn(conn)
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT compartment, count(*) AS n FROM memories "
+            "WHERE tenant_id = %s AND agent_id = %s AND status = 'active' GROUP BY 1",
+            (tenant, agent_id),
+        )
+        comptes = {ligne["compartment"]: ligne["n"] for ligne in cur.fetchall()}
+        conn.rollback()  # lecture seule
+    compartiments = []
+    for fiche in catalogue():
+        fiche["memory_count"] = comptes.get(fiche["name"], 0)
+        compartiments.append(fiche)
+    return {"agent_id": agent_id, "compartments": compartiments,
+            # Anciens noms acceptés à l'écriture pendant la transition (v0.4 → v0.5).
+            "legacy_aliases": dict(sorted(ALIAS.items()))}
 
 
 @v1_router.delete("/memories")

@@ -68,7 +68,8 @@ def handle_contradictions(
     préférence globale : les deux coexistent, et c'est le filtre de lecture qui sert la
     plus spécifique dans le projet concerné.
     """
-    if new_memory.get("type") != "semantic" or new_memory.get("subtype") != "preference":
+    # v0.4 : les préférences fermes vivent dans le compartiment `reflexes` (tronc cérébral).
+    if new_memory.get("compartment") != "reflexes":
         return []
 
     # Repli de sûreté : sans embedding, pas de pré-filtre possible -> on ne touche à rien.
@@ -87,8 +88,7 @@ def handle_contradictions(
         FROM memories
         WHERE tenant_id = %s
           AND agent_id = %s
-          AND type = 'semantic'
-          AND subtype = 'preference'
+          AND compartment = 'reflexes'
           AND status = 'active'
           AND project IS NOT DISTINCT FROM %s
           AND (1 - (embedding <=> %s::vector)) >= %s

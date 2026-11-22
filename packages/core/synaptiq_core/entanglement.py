@@ -66,7 +66,7 @@ RELATION_INTRICATION = "entangled_with"
 # mais une requête sans concaténation ne se relit pas pour vérifier qu'elle est sûre.
 # `{filtre_projet}` : fragment fixe de `project.filtre_projet` (vide pour un souvenir global).
 _SQL_VOISINS = """
-    SELECT id, type, subtype, (1 - (embedding <=> %s::vector)) AS similarity
+    SELECT id, type, compartment, (1 - (embedding <=> %s::vector)) AS similarity
     FROM memories
     WHERE tenant_id = %s AND agent_id = %s AND id != %s AND status = 'active' {filtre_projet}
     ORDER BY embedding <=> %s::vector
@@ -103,7 +103,7 @@ def seuil_intrication() -> float:
     return float(os.getenv("QEM_ENTANGLE_THRESHOLD", "0.7"))
 
 
-def entangle(cur, tenant_id: str, agent_id: str, new_mem_id, subtype: str | None,
+def entangle(cur, tenant_id: str, agent_id: str, new_mem_id, compartment: str | None,
              embedding, threshold: float | None = None, project: str | None = None) -> int:
     """Relie un souvenir à ses plus proches voisins sémantiques. Retourne le nombre d'arêtes.
 
@@ -116,7 +116,7 @@ def entangle(cur, tenant_id: str, agent_id: str, new_mem_id, subtype: str | None
     supersession détruit de la donnée à la lecture ; elle exige un verdict explicite et relève
     de `governance` (cf. l'en-tête du module). Ne pas réintroduire de règle de typage ici.
 
-    `subtype` reste au contrat d'appel (les deux chemins d'écriture le passent) et n'est plus
+    `compartment` reste au contrat d'appel (les deux chemins d'écriture le passent) et n'est plus
     utilisé que pour la journalisation : le garder évite de toucher `apps/` et laisse la porte
     ouverte à un pré-filtre PAR TYPE — mais un pré-filtre ne serait toujours pas un verdict.
 
@@ -147,10 +147,10 @@ def entangle(cur, tenant_id: str, agent_id: str, new_mem_id, subtype: str | None
         similarity = float(rel_row[3] or 0.0)
         if similarity <= threshold:
             continue
-        target_id, target_subtype = rel_row[0], rel_row[2]
+        target_id, target_compartment = rel_row[0], rel_row[2]
         voisins.append((new_mem_id, target_id, RELATION_INTRICATION, similarity))
         logger.info("Intrication Q-EM : %s (%s) --(%s)--> %s (%s, sim=%.2f)",
-                    new_mem_id, subtype, RELATION_INTRICATION, target_id, target_subtype,
+                    new_mem_id, compartment, RELATION_INTRICATION, target_id, target_compartment,
                     similarity)
 
     # Phase 4 : pré-calcul des voisins à 2 sauts.

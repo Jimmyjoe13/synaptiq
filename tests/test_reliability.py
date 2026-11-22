@@ -255,10 +255,10 @@ class TestReliability(unittest.TestCase):
         }
 
         faits = [
-            {"extracted": True, "type": "semantic", "subtype": "fact",
+            {"extracted": True, "compartment": "savoirs",
              "content": "Caroline a adopté un beagle", "summary": "Adoption",
              "confidence": 1.0, "importance": 0.8, "occurred_at": None},
-            {"extracted": True, "type": "semantic", "subtype": "preference",
+            {"extracted": True, "compartment": "reflexes",
              "content": "Caroline préfère courir le matin", "summary": "Préférence",
              "confidence": 0.9, "importance": 0.6, "occurred_at": None},
         ]

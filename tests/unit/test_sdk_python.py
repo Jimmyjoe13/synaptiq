@@ -31,7 +31,7 @@ def appels(monkeypatch):
         enregistres.append({"url": url, "payload": json, "headers": headers,
                             "timeout": timeout, "params": params})
         return _Reponse({"status": "ok", "memories": [], "memory_id": "mem-1",
-                         "collections": [], "limits": {"max_collections": 50, "used": 0}})
+                         "compartments": []})
 
     import synaptiq_sdk.client as module
     monkeypatch.setattr(module.requests, "post", _requete)
@@ -76,10 +76,10 @@ def test_build_context_transmet_budget_et_explain(appels):
     assert charge["explain"] is True
 
 
-def test_build_context_types_de_memoire_par_defaut(appels):
+def test_build_context_tous_les_compartiments_par_defaut(appels):
+    """Rien n'est imposé : le serveur prend les 9 compartiments."""
     SynaptiqClient().build_context(agent_id="a", session_id="s", task="t", query="q")
-    assert appels[0]["payload"]["constraints"]["memory_types"] == [
-        "semantic", "episodic", "procedural", "working", "reflective"]
+    assert appels[0]["payload"]["constraints"] == {"max_tokens": 1200}
 
 
 def test_panne_reseau_leve_une_erreur_explicite(monkeypatch):
@@ -113,57 +113,51 @@ def test_les_appels_ont_un_timeout(appels):
     assert appels[0]["timeout"] is not None
 
 
-# ─── Collections : la taxonomie que l'agent se donne ────────────────────────
+# ─── Compartiments : 9 régions fixes, l'agent choisit où ranger ─────────────
 
-def test_les_collections_sont_omises_quand_absentes(appels):
-    """Une liste vide serait un filtre qui ne ramène rien ; l'absence doit tout balayer.
+def test_les_compartiments_sont_omis_quand_absents(appels):
+    """Une liste vide serait refusée ; l'absence doit tout balayer.
 
     C'est la distinction que `None` porte et qu'une valeur par défaut `[]` détruirait.
     """
     client = SynaptiqClient()
     client.build_context(agent_id="a", session_id="s", task="t", query="q")
     client.retrieve(agent_id="a", query="q")
-    assert "collections" not in appels[0]["payload"]["constraints"]
-    assert "collections" not in appels[1]["payload"]
+    assert "compartments" not in appels[0]["payload"]["constraints"]
+    assert "compartments" not in appels[1]["payload"]
 
 
-def test_les_collections_sont_transmises_quand_fournies(appels):
+def test_les_compartiments_sont_transmis_quand_fournis(appels):
     client = SynaptiqClient()
     client.build_context(agent_id="a", session_id="s", task="t", query="q",
-                         collections=["clients_paca"])
-    client.retrieve(agent_id="a", query="q", collections=["clients_paca"])
-    assert appels[0]["payload"]["constraints"]["collections"] == ["clients_paca"]
-    assert appels[1]["payload"]["collections"] == ["clients_paca"]
+                         compartments=["alertes"])
+    client.retrieve(agent_id="a", query="q", compartments=["alertes"])
+    assert appels[0]["payload"]["constraints"]["compartments"] == ["alertes"]
+    assert appels[1]["payload"]["compartments"] == ["alertes"]
 
 
-def test_list_collections_est_un_get_versionne(appels):
-    SynaptiqClient().list_collections(agent_id="agentA")
-    assert appels[0]["url"].endswith("/v1/collections")
+def test_store_memory_compartiment_facultatif(appels):
+    client = SynaptiqClient()
+    client.store_memory(agent_id="a", content="x")
+    client.store_memory(agent_id="a", content="y", compartment="savoir_faire")
+    assert "compartment" not in appels[0]["payload"]
+    assert appels[1]["payload"]["compartment"] == "savoir_faire"
+    assert "type" not in appels[1]["payload"] and "subtype" not in appels[1]["payload"]
+
+
+def test_note_belief_vise_le_compartiment_croyances(appels):
+    SynaptiqClient().note_belief(agent_id="a", content="x", about="humans")
+    assert appels[0]["payload"]["compartment"] == "croyances"
+    assert appels[0]["payload"]["about"] == "humans"
+
+
+def test_list_compartments_est_un_get_versionne(appels):
+    SynaptiqClient().list_compartments(agent_id="agentA")
+    assert appels[0]["url"].endswith("/v1/compartments")
     assert appels[0]["params"] == {"agent_id": "agentA"}
 
 
-def test_create_collection_transmet_la_famille_et_l_intrication(appels):
-    SynaptiqClient().create_collection(
-        agent_id="agentA", name="clients_paca", family="semantic",
-        description="Clients de la region PACA.", entangle=False)
-    charge = appels[0]["payload"]
-    assert appels[0]["url"].endswith("/v1/collections")
-    assert charge["family"] == "semantic"
-    assert charge["entangle"] is False
-    # `packet_key` non fourni : le serveur retombe sur le nom. Ne pas l'envoyer à None,
-    # ce serait une valeur explicite là où l'on veut le défaut du serveur.
-    assert "packet_key" not in charge
-
-
-def test_merge_collections_appelle_la_bonne_route(appels):
-    SynaptiqClient().merge_collections(agent_id="agentA", source="a_vider",
-                                       target="la_cible")
-    assert appels[0]["url"].endswith("/v1/collections/merge")
-    assert appels[0]["payload"] == {"agent_id": "agentA", "source": "a_vider",
-                                    "target": "la_cible"}
-
-
-def test_une_panne_sur_les_collections_leve_une_erreur_explicite(monkeypatch):
+def test_une_panne_sur_les_compartiments_leve_une_erreur_explicite(monkeypatch):
     """Comme le reste du SDK : jamais de `None` silencieux sur une panne réseau."""
     import synaptiq_sdk.client as module
 
@@ -171,9 +165,5 @@ def test_une_panne_sur_les_collections_leve_une_erreur_explicite(monkeypatch):
         raise ConnectionError("injoignable")
 
     monkeypatch.setattr(module.requests, "get", _casse)
-    monkeypatch.setattr(module.requests, "post", _casse)
-    with pytest.raises(RuntimeError, match="collections"):
-        SynaptiqClient().list_collections(agent_id="a")
-    with pytest.raises(RuntimeError, match="collection"):
-        SynaptiqClient().create_collection(agent_id="a", name="n", family="semantic",
-                                           description="d")
+    with pytest.raises(RuntimeError, match="compartiments"):
+        SynaptiqClient().list_compartments(agent_id="a")

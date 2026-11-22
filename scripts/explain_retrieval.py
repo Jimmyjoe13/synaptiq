@@ -53,9 +53,9 @@ def seed(conn, n: int) -> None:
         for i in range(n):
             contenu = " ".join(rng.sample(MOTS, 6)) + f" enregistrement {i}"
             cur.execute(
-                "INSERT INTO memories (tenant_id, agent_id, type, subtype, content, embedding, "
-                "confidence, importance, status) "
-                "VALUES (%s, %s, 'semantic', 'fact', %s, %s, 1.0, 0.5, 'active')",
+                "INSERT INTO memories (tenant_id, agent_id, type, compartment, content, "
+                "embedding, confidence, importance, status) "
+                "VALUES (%s, %s, 'semantic', 'savoirs', %s, %s, 1.0, 0.5, 'active')",
                 (TENANT, AGENT, contenu, _vecteur_unitaire(rng)),
             )
         conn.commit()

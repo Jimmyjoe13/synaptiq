@@ -27,12 +27,17 @@ from synaptiq_core import (
     link_supersedes,
 )
 
-# Registre des collections : l'intrication est décidée par collection, plus par instance
-from synaptiq_core.collections import charger_registre
+# Compartiments (v0.4) : mêmes règles de rangement que l'API, prototypes partagés
+from synaptiq_core.compartments import (
+    COMPARTIMENTS,
+    PAR_NOM,
+    famille_de,
+    normaliser_extraction,
+    prototypes,
+)
 from synaptiq_core.embeddings import generate_mock_embedding  # noqa: F401 (compat rétro tests)
 from synaptiq_core.observability import configure_logging, set_trace_id
 from synaptiq_core.project import normaliser_projet
-from synaptiq_core.taxonomy import DEFAULT_SUBTYPE, VALID_SUBTYPES, normalize_extraction
 
 # Configuration du logging
 configure_logging("synaptiq-worker")
@@ -83,44 +88,16 @@ LLM_RETRY_BACKOFF_S = float(os.getenv("LLM_RETRY_BACKOFF_S", "2.0"))
 # partagé avec l'API, qui intrique désormais aussi. Le figer à l'import ici en faisait un
 # réglage que seul le worker voyait.
 
-# Types de mémoire éligibles à l'intrication automatique (liste séparée par des virgules).
-# Défaut 'procedural,semantic' : les souvenirs DURABLES (règles, erreurs, bonnes pratiques,
-# faits, préférences) tissent le graphe exploité par le multi-hop de build_context.
-# `episodic` est exclu par défaut — les épisodes bruts sont nombreux et peu discriminants,
-# les intriquer densifie le graphe sans gain de pertinence. L'ajouter reste possible ici.
-QEM_ENTANGLE_TYPES = {
-    t.strip() for t in os.getenv("QEM_ENTANGLE_TYPES", "procedural,semantic").split(",") if t.strip()
-}
-
-
-def _is_entanglement_candidate(memory_data: dict, registry=None) -> bool:
+def _is_entanglement_candidate(memory_data: dict) -> bool:
     """Une mémoire doit-elle chercher des voisins à intriquer ?
 
-    Historiquement restreint à `procedural` + `semantic/preference`, ce qui laissait le
-    graphe VIDE dès que l'extraction retombait en `episodic/interaction` (cas du mode
-    d'extraction heuristique) : sans arêtes, la propagation d'activation de build_context
-    n'a rien à propager et Q-EM dégénère en simple top-k vectoriel.
-
-    ## La décision passe de l'instance à la collection
-
-    `QEM_ENTANGLE_TYPES` est un réglage d'INSTANCE : il vaut pour les quatre familles, donc
-    pour tous les agents et tous leurs rayons à la fois. Exclure `episodic` globalement était
-    le bon défaut — les épisodes bruts sont nombreux et peu discriminants — mais c'était
-    aussi une décision impossible à nuancer : une collection d'épisodes réellement
-    structurante (des comptes rendus de réunion, par exemple) ne pouvait pas tisser d'arête.
-
-    Or le multi-hop est la seule dimension où Q-EM creuse nettement l'écart sur la baseline.
-    Pouvoir densifier le graphe là où l'agent sait que ça compte est le gain mesurable de ce
-    lot, et non un simple confort de rangement.
-
-    Sans registre, on retombe exactement sur le comportement précédent.
+    v0.4 : c'est le COMPARTIMENT qui décide (`Compartiment.intrique`), exactement comme sur
+    le chemin d'écriture directe de l'API. La variable d'instance `QEM_ENTANGLE_TYPES` et
+    le registre de collections ont disparu : un seul réglage, au même endroit, pour les
+    deux chemins.
     """
-    if registry is not None:
-        return registry.entangle_pour(memory_data.get("type"), memory_data.get("subtype"))
-    return (
-        memory_data.get("type") in QEM_ENTANGLE_TYPES
-        or memory_data.get("subtype") == "preference"
-    )
+    compartiment = PAR_NOM.get(memory_data.get("compartment") or "")
+    return bool(compartiment and compartiment.intrique)
 
 
 def _heuristic_extract(event_content: str) -> dict:
@@ -138,7 +115,7 @@ def _heuristic_extract(event_content: str) -> dict:
     )
     if error_match:
         return {
-            "extracted": True, "type": "procedural", "subtype": "code_error_resolution",
+            "extracted": True, "compartment": "alertes",
             "content": f"Résolution de bug/erreur détectée : {error_match.group(0).strip()}",
             "summary": "Résolution d'erreur de code", "confidence": 0.85, "importance": 0.7,
         }
@@ -149,7 +126,7 @@ def _heuristic_extract(event_content: str) -> dict:
     )
     if best_practice_match:
         return {
-            "extracted": True, "type": "procedural", "subtype": "coding_best_practices",
+            "extracted": True, "compartment": "savoir_faire",
             "content": f"Directive de conception/code : {best_practice_match.group(0).strip()}",
             "summary": "Directive de conception de code", "confidence": 0.9, "importance": 0.8,
         }
@@ -160,13 +137,13 @@ def _heuristic_extract(event_content: str) -> dict:
     )
     if pref_match:
         return {
-            "extracted": True, "type": "semantic", "subtype": "preference",
+            "extracted": True, "compartment": "reflexes",
             "content": f"L'utilisateur a spécifié une préférence : {pref_match.group(1).strip()}",
             "summary": "Préférence utilisateur extraite", "confidence": 0.9, "importance": 0.8,
         }
     # Défaut : épisode générique
     return {
-        "extracted": True, "type": "episodic", "subtype": "interaction",
+        "extracted": True, "compartment": "episodes",
         "content": f"Interaction : {event_content}",
         "summary": "Épisode d'interaction", "confidence": 0.8, "importance": 0.4,
     }
@@ -181,13 +158,6 @@ MAX_FACTS_PER_EVENT = int(os.getenv("MAX_FACTS_PER_EVENT", "5"))
 # de module). Elle était DÉFINIE ici, donc seul ce chemin l'appliquait : `POST /v1/memories`
 # n'écrivait aucun `content_hash` et rien n'y empêchait le doublon silencieux. Même histoire
 # que la taxonomie ci-dessous — une règle implémentée dans un seul des deux chemins d'écriture.
-
-
-# Taxonomie PARTAGÉE avec l'API (packages/core/synaptiq_core/taxonomy.py). Elle vivait ici,
-# donc elle n'était appliquée que sur ce chemin d'extraction : l'écriture directe
-# `POST /v1/memories` acceptait n'importe quel sous-type. Deux chemins, deux règles.
-_VALID_SUBTYPES = VALID_SUBTYPES      # conservés comme alias : lisibilité locale du module
-_DEFAULT_SUBTYPE = DEFAULT_SUBTYPE
 
 
 def _parse_occurred_at(value) -> "datetime | None":
@@ -207,17 +177,16 @@ def _parse_occurred_at(value) -> "datetime | None":
     return None
 
 
-def _validate_extraction(data: dict, event_content: str, registry=None) -> dict:
+def _validate_extraction(data: dict, event_content: str) -> dict:
     """Normalise et valide UN fait de la sortie LLM ; corrige les incohérences.
 
-    Ne lève jamais : un modèle qui hallucine un type doit produire une mémoire dégradée,
-    pas faire perdre l'événement (cf. `taxonomy.normalize_extraction`).
+    Ne lève jamais : un modèle qui hallucine doit produire une mémoire dégradée, pas faire
+    perdre l'événement.
 
-    Le registre, quand il est fourni, préserve les collections que l'agent a déclarées :
-    sans lui, l'extraction écrasait `clients_paca` en `fact` alors que l'écriture directe
-    l'aurait conservé.
+    Le compartiment proposé par le modèle est CONSERVÉ BRUT ici : il ne peut être vérifié
+    qu'une fois le fait vectorisé (un nom inconnu se classe par similarité). La décision
+    finale est prise dans `process_event` par `compartments.normaliser_extraction`.
     """
-    mtype, subtype = normalize_extraction(data.get("type"), data.get("subtype"), registry)
 
     def _clamp(value, default):
         try:
@@ -227,8 +196,9 @@ def _validate_extraction(data: dict, event_content: str, registry=None) -> dict:
 
     return {
         "extracted": True,
-        "type": mtype,
-        "subtype": subtype,
+        # Proposition du modèle ; un ancien `subtype` reste lu (modèle ou prompt v0.3).
+        "compartment": data.get("compartment") or data.get("subtype"),
+        "legacy_type": data.get("type"),
         "content": (data.get("content") or event_content).strip(),
         "summary": (data.get("summary") or "Mémoire extraite").strip(),
         "confidence": _clamp(data.get("confidence"), 0.9),
@@ -237,7 +207,7 @@ def _validate_extraction(data: dict, event_content: str, registry=None) -> dict:
     }
 
 
-def _validate_extractions(payload, event_content: str, registry=None) -> list:
+def _validate_extractions(payload, event_content: str) -> list:
     """Normalise la sortie LLM en une LISTE de faits valides.
 
     Tolère les trois formes rencontrées : {"memories": [...]}, une liste nue, ou un objet
@@ -258,7 +228,7 @@ def _validate_extractions(payload, event_content: str, registry=None) -> list:
     for item in items[:MAX_FACTS_PER_EVENT]:
         if not isinstance(item, dict):
             continue
-        fait = _validate_extraction(item, event_content, registry)
+        fait = _validate_extraction(item, event_content)
         cle = fait["content"].strip().lower()
         if not cle or cle in vus:
             continue
@@ -281,15 +251,14 @@ _MEMORY_JSON_SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "type": {"type": "string"},
-                        "subtype": {"type": "string"},
+                        "compartment": {"type": "string"},
                         "content": {"type": "string"},
                         "summary": {"type": "string"},
                         "occurred_at": {"type": "string"},
                         "confidence": {"type": "number"},
                         "importance": {"type": "number"},
                     },
-                    "required": ["type", "subtype", "content", "summary",
+                    "required": ["compartment", "content", "summary",
                                  "occurred_at", "confidence", "importance"],
                 },
             },
@@ -317,8 +286,7 @@ def _response_format_for(mode: str | None) -> dict | None:
     return None
 
 
-def call_llm_extractor(event_content: str, occurred_at: str | None = None,
-                       registry=None) -> list:
+def call_llm_extractor(event_content: str, occurred_at: str | None = None) -> list:
     """Extrait les mémoires consolidées d'un événement brut. Retourne une LISTE de faits.
 
     - Sans clé LLM (ou LLM_PROVIDER=mock) : heuristiques regex locales (un seul fait).
@@ -363,17 +331,13 @@ def call_llm_extractor(event_content: str, occurred_at: str | None = None,
         "'last Saturday', 'next month') into an ABSOLUTE date, computed from the "
         "interaction timestamp above. Put it in `occurred_at` as ISO 'YYYY-MM-DD'. "
         "Use an empty string only when the fact carries no date at all.\n"
-        "3. Classify each fact:\n"
-        "   - type 'procedural': subtype 'code_error_resolution' (errors/tracebacks and "
-        "their fix) or 'coding_best_practices' (architecture rules, conventions).\n"
-        "   - type 'semantic': subtype 'preference' (an explicit taste or choice) or "
-        "'fact' (a stable fact about a person, entity or the world).\n"
-        "   - type 'episodic': subtype 'interaction' (only when nothing durable is stated).\n"
+        "3. Put each fact in ONE `compartment` (use the exact identifier):\n"
+        f"{_CONSIGNE_COMPARTIMENTS}"
         "4. Write `content` and `summary` IN THE SAME LANGUAGE as the interaction. "
         "Never translate.\n"
         "5. Write `content` in the third person as a self-contained sentence, "
         "understandable without the conversation (name people explicitly, never 'he'/'she').\n\n"
-        "Reply with a SINGLE JSON object: {\"memories\": [{\"type\":..., \"subtype\":..., "
+        "Reply with a SINGLE JSON object: {\"memories\": [{\"compartment\":..., "
         "\"content\":..., \"summary\": \"short title\", \"occurred_at\": \"YYYY-MM-DD\", "
         "\"confidence\": float 0-1, \"importance\": float 0-1}, ...]}."
     )
@@ -435,7 +399,7 @@ def call_llm_extractor(event_content: str, occurred_at: str | None = None,
         # Tolérance : certains modèles encadrent le JSON en markdown malgré response_format
         if "```" in raw:
             raw = raw[raw.find("{"): raw.rfind("}") + 1]
-        faits = _validate_extractions(json.loads(raw), event_content, registry)
+        faits = _validate_extractions(json.loads(raw), event_content)
         logger.info("%d fait(s) extrait(s) de l'événement.", len(faits))
         return faits
     except Exception:
@@ -444,8 +408,14 @@ def call_llm_extractor(event_content: str, occurred_at: str | None = None,
         return [_heuristic_extract(event_content)]
 
 
+# Consigne de classement de l'extracteur, DÉRIVÉE des compartiments du cœur. `croyances`
+# en est absent : un extracteur ne produit jamais de croyance.
+_CONSIGNE_COMPARTIMENTS = "".join(
+    f"   - '{c.nom}': {c.description}\n" for c in COMPARTIMENTS if c.ecriture_directe)
+
+
 _INSERT_MEMORY = """
-    INSERT INTO memories (tenant_id, agent_id, type, subtype, content, summary, embedding,
+    INSERT INTO memories (tenant_id, agent_id, type, compartment, content, summary, embedding,
                           confidence, importance, provenance, source_event_id,
                           occurred_at, content_hash, project)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -461,9 +431,9 @@ def _entangle(cur, tenant_id: str, agent_id: str, new_mem_id, fact: dict, embedd
     Le corps vit dans `synaptiq_core.entanglement` : il était DÉFINI ici, donc seul le chemin
     `/v1/events` tissait des arêtes et une écriture directe n'en construisait aucune. Cette
     enveloppe ne fait qu'adapter la signature historique (`fact` complet) à celle du cœur,
-    qui ne prend que le `subtype` dont la règle a besoin.
+    qui ne prend que le compartiment (journalisation).
     """
-    entangle(cur, tenant_id, agent_id, new_mem_id, fact.get('subtype'), embedding,
+    entangle(cur, tenant_id, agent_id, new_mem_id, fact.get('compartment'), embedding,
              project=project)
 
 
@@ -492,31 +462,25 @@ def process_event(event: dict) -> bool:
     logger.info("Traitement de l'événement %s pour l'agent %s.", event_id, agent_id,
                 extra={"event_id": str(event_id), "agent_id": agent_id, "tenant_id": tenant_id})
 
-    # 0. Registre des collections de cet agent, chargé AVANT l'extraction.
-    #
-    # Emprunt de connexion à part, volontairement court : les étapes 1 et 2 sont deux appels
-    # RÉSEAU (LLM puis embeddings, jusqu'à 30 s chacun). Garder une connexion du pool
-    # mobilisée pendant ce temps assècherait le pool sous charge — c'est précisément pour
-    # cela que l'écriture n'emprunte qu'à l'étape 3.
-    #
-    # Le registre est nécessaire dès l'extraction : sans lui, `normalize_extraction` écrasait
-    # toute collection non canonique par le défaut de sa famille. Un `clients_paca` proposé
-    # par le LLM devenait `fact`, alors que l'écriture directe l'aurait conservé — deux
-    # chemins, deux règles, la divergence que la taxonomie partagée avait déjà eu à corriger.
     pool = get_db_pool()
-    conn_registre = pool.getconn()
-    try:
-        with conn_registre.cursor() as cur_reg:
-            registre = charger_registre(cur_reg, tenant_id, agent_id)
-        conn_registre.rollback()  # lecture seule
-    finally:
-        pool.putconn(conn_registre)
 
     # 1. Extraction : 1 à N faits, datés quand l'interaction le permet
-    facts = call_llm_extractor(content, occurred_at=event_time, registry=registre)
+    facts = call_llm_extractor(content, occurred_at=event_time)
 
     # 2. Embeddings en UN SEUL appel pour tous les faits (l'interface Embedder est batch)
-    embeddings = get_embedder().embed([f['content'] for f in facts])
+    embedder = get_embedder()
+    embeddings = embedder.embed([f['content'] for f in facts])
+
+    # 2bis. Compartiment définitif, une fois le fait vectorisé : nom valide conservé, ancien
+    # nom converti, inconnu (ou croyance hallucinée) classé par similarité. MÊMES règles et
+    # MÊMES prototypes que l'écriture directe de l'API.
+    if len(embeddings) == len(facts):
+        protos = prototypes(embedder)
+        for fact, embedding in zip(facts, embeddings, strict=True):
+            rangement = normaliser_extraction(fact.get('compartment'), embedding, protos,
+                                              famille=fact.get('legacy_type'))
+            fact['compartment'] = rangement.compartiment
+            fact['compartment_origin'] = rangement.origine
 
     # 3. Écriture en base : contradictions, insertion, intrication
     conn = pool.getconn()
@@ -533,9 +497,11 @@ def process_event(event: dict) -> bool:
                 superseded = handle_contradictions(cur, tenant_id, agent_id, fact, embedding,
                                                    project=project)
 
-                provenance = {"source": "event", "event_id": event_id}
+                provenance = {"source": "event", "event_id": event_id,
+                              "compartment_origin": fact.get('compartment_origin')}
                 cur.execute(_INSERT_MEMORY, (
-                    tenant_id, agent_id, fact['type'], fact['subtype'], fact['content'],
+                    tenant_id, agent_id, famille_de(fact['compartment']), fact['compartment'],
+                    fact['content'],
                     fact['summary'], embedding, fact['confidence'], fact['importance'],
                     json.dumps(provenance), event_id,
                     fact.get('occurred_at'), content_hash(fact['content']), project,
@@ -546,8 +512,9 @@ def process_event(event: dict) -> bool:
                     continue
                 created += 1
                 new_mem_id = row[0]
-                logger.info("Mémoire %s créée (%s/%s, date=%s).", new_mem_id,
-                            fact['type'], fact['subtype'], fact.get('occurred_at') or "—")
+                logger.info("Mémoire %s créée (compartiment %s, %s, date=%s).", new_mem_id,
+                            fact['compartment'], fact.get('compartment_origin'),
+                            fact.get('occurred_at') or "—")
 
                 # 3bis. Traçabilité de la supersession : sans cette arête, un archivage
                 # serait indiscernable d'une disparition (rien ne dirait par quoi la
@@ -555,8 +522,8 @@ def process_event(event: dict) -> bool:
                 if superseded:
                     link_supersedes(cur, new_mem_id, superseded)
 
-                # 4. Graphe d'intrication : la collection décide, plus la variable globale.
-                if _is_entanglement_candidate(fact, registre):
+                # 4. Graphe d'intrication : le compartiment décide.
+                if _is_entanglement_candidate(fact):
                     _entangle(cur, tenant_id, agent_id, new_mem_id, fact, embedding,
                               project=project)
 
@@ -820,7 +787,7 @@ def main():
                 # Avant, chaque message était traité séquentiellement, limitant le débit
                 # à ~0.2-0.5 événements/seconde avec un LLM lent (2-5s par extraction).
                 # Avec WORKER_MAX_PARALLEL=4, le débit passe à ~1-2 événements/seconde.
-                msg_list = [(msg_id, fields) for msg_id, fields in messages]
+                msg_list = list(messages)
                 _handle_batch(r, msg_list)
         except KeyboardInterrupt:
             logger.info("Arrêt du worker par l'utilisateur.")

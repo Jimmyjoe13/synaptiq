@@ -27,7 +27,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from synaptiq_core.collections import FAMILLE_REFLEXIVE, SYSTEM_PACKET_KEYS, CollectionRegistry
+from synaptiq_core.compartments import (
+    COMPARTIMENT_CROYANCES,
+    COMPARTIMENT_REFLEXES,
+    PAR_NOM,
+    demi_vie,
+    packet_vide,
+    parts_max,
+)
 from synaptiq_core.qem import (
     apply_contradictions,
     collapse_by_utility,
@@ -40,25 +47,9 @@ from synaptiq_core.retrieval import DEFAULT_RRF_K, reciprocal_rank_fusion
 
 logger = logging.getLogger("synaptiq-core.context")
 
-# Les clés canoniques, pour la réponse vide en l'absence de registre (contrat stable).
-# Conservé comme constante : plusieurs tests et intégrations s'y réfèrent. DÉRIVÉ de
-# `SYSTEM_PACKET_KEYS` (9 clés depuis le 26/09) : une seconde liste écrite à la main avait
-# déjà divergé une fois, cf. CLAUDE.md §3.
-PACKET_VIDE: dict[str, list[str]] = {cle: [] for cle in SYSTEM_PACKET_KEYS}
-
-
-def packet_vide(registry: CollectionRegistry | None = None) -> dict[str, list[str]]:
-    """Paquet vide portant TOUTES les sections du registre, agent comprises.
-
-    Sans cette fonction, une recherche sans résultat renvoyait les sept clés canoniques
-    tandis qu'une recherche fructueuse en renvoyait davantage : le consommateur aurait vu
-    la forme de la réponse changer selon qu'il y a des souvenirs ou non. Une collection
-    déclarée doit apparaître même vide — c'est précisément l'information « j'ai créé ce
-    rayon et il ne contient rien ».
-    """
-    if registry is None:
-        return dict(PACKET_VIDE)
-    return {cle: [] for cle in registry.packet_keys()}
+# Paquet vide : les 9 compartiments (forme stable). Conservé comme constante publique,
+# DÉRIVÉ de `compartments.COMPARTIMENTS` — jamais une seconde liste écrite à la main.
+PACKET_VIDE: dict[str, list[str]] = packet_vide()
 
 
 @dataclass(frozen=True)
@@ -83,27 +74,42 @@ class RetrievalConfig:
     # Collapse (cf. `qem.collapse_by_utility`) : meilleurs admis d'office, exposant β.
     collapse_top_k: int = 3
     density_exponent: float = 0.5
-    # Part max du budget pour les croyances (famille `reflective`, lot C).
-    reflective_max_share: float = 0.15
+    # Part max du budget par compartiment plafonné (rôle de l'hypothalamus). Les défauts
+    # viennent des compartiments ; ces deux champs permettent de les surcharger par
+    # instance ou par banc (QEM_CROYANCES_MAX_SHARE, QEM_REFLEXES_MAX_SHARE).
+    croyances_max_share: float = 0.15
+    reflexes_max_share: float = 0.20
+    # Nombre max de réflexes injectés à CHAQUE contexte, quelle que soit la question
+    # (tronc cérébral). 0 = désactive l'injection systématique.
+    reflexes_injectes: int = 8
     # Demi-vie de la décroissance temporelle, en jours. Recalibrée de 90 → 14 le 11/08 :
     # à 90 jours sur un corpus de 13 jours, la décroissance était inerte (amplitude
     # 0,89–1,00 mesurée par l'audit) — elle ne triait rien. 14 jours la rend perceptible
     # sur l'horizon réel d'une mémoire d'agent.
     recency_halflife_days: float = 14.0
 
+    def parts(self) -> dict[str, float]:
+        """Parts max effectives par compartiment."""
+        return parts_max({COMPARTIMENT_CROYANCES: self.croyances_max_share,
+                          COMPARTIMENT_REFLEXES: self.reflexes_max_share})
+
 
 class MemoryStore(Protocol):
     """Accès aux mémoires, borné à un (tenant, agent) fixés à la construction.
 
-    Les lignes retournées sont des mappings portant au moins : `id`, `type`, `subtype`,
+    Les lignes retournées sont des mappings portant au moins : `id`, `type`, `compartment`,
     `content`, `confidence`, `importance`, `last_accessed_at`, `created_at`, `occurred_at`,
     `embedding` (séquence de flottants, déjà désérialisée).
     """
 
     def fetch_candidates(self, query_vector: Sequence[float], query_text: str,
-                         memory_types: list[str]) -> list[dict]:
+                         compartments: list[str]) -> list[dict]:
         """Candidats de la phase de superposition, avec `similarity`, `age_seconds`,
         `rank_vec` et `rank_fts` (ces deux derniers pouvant être None)."""
+
+    def fetch_ancres(self, compartment: str, limit: int) -> list[dict]:
+        """Souvenirs actifs d'un compartiment injecté d'office (réflexes), les plus
+        importants d'abord, avec `age_seconds`. Même périmètre que la recherche (projet)."""
 
     def fetch_relationships(self, memory_ids: list[str]) -> list[dict]:
         """Arêtes touchant l'un des ids (comme source OU comme cible)."""
@@ -119,7 +125,7 @@ def _candidat_depuis_ligne(ligne: dict, score: float, recency_factor: float) -> 
     return {
         "id": str(ligne["id"]),
         "type": ligne["type"],
-        "subtype": ligne["subtype"],
+        "compartment": ligne["compartment"],
         "content": ligne["content"],
         "confidence": float(ligne["confidence"] or 1.0),
         "importance": float(ligne["importance"] or 0.5),
@@ -154,12 +160,11 @@ def build_context_packet(
     store: MemoryStore,
     query_vector: Sequence[float],
     query_text: str,
-    memory_types: list[str],
+    compartments: list[str],
     max_tokens: int,
     config: RetrievalConfig,
     trace_id: str,
     explain: bool = False,
-    registry: CollectionRegistry | None = None,
     explain_level: str = "selected",
     record_access: bool = True,
 ) -> dict[str, Any]:
@@ -176,7 +181,7 @@ def build_context_packet(
     `record_access=False` n'écrit rien : un diagnostic ne doit pas modifier la récence
     qu'il mesure (le premier banc a réécrit `last_accessed_at` en production).
     """
-    lignes = store.fetch_candidates(query_vector, query_text, memory_types)
+    lignes = store.fetch_candidates(query_vector, query_text, compartments)
 
     scores_rrf = _scores_de_fusion(lignes, config)
     meilleur_rrf = max(scores_rrf.values()) if scores_rrf else 0.0
@@ -200,11 +205,13 @@ def build_context_packet(
     for ligne in lignes:
         mem_id = str(ligne["id"])
         similarite = max(0.0, float(ligne.get("similarity") or 0.0))
-        croyance = ligne.get("type") == FAMILLE_REFLEXIVE
-        # Une croyance ne s'use pas avec le temps : elle se RÉVISE (remplacement) ou se
-        # conteste. La décroissance la ferait disparaître sans que rien ne l'ait infirmée.
-        recency_factor = 1.0 if croyance else compute_recency_factor(
-            ligne.get("age_seconds"), config.recency_halflife_days)
+        compartiment = ligne.get("compartment")
+        croyance = compartiment == COMPARTIMENT_CROYANCES
+        # Oubli PROPRE au compartiment : rapide pour les observations, nul pour les
+        # réflexes et les croyances (une croyance se révise ou se conteste, elle ne s'use
+        # pas : la décroissance la ferait disparaître sans que rien ne l'ait infirmée).
+        recency_factor = compute_recency_factor(
+            ligne.get("age_seconds"), demi_vie(str(compartiment), config.recency_halflife_days))
         # Pertinence de départ. En hybride, elle vient du rang FUSIONNÉ (normalisé sur le
         # meilleur candidat) et non du seul cosinus : sans cela, un souvenir trouvé
         # uniquement par le plein texte entrerait avec un score faible et serait éliminé par
@@ -214,14 +221,17 @@ def build_context_packet(
         else:
             pertinence = similarite
         score = initial_score(pertinence, recency_factor)
+        # Poids du compartiment (l'amygdale renforce les souvenirs marquants : alertes).
+        if compartiment in PAR_NOM:
+            score *= PAR_NOM[compartiment].poids
         if croyance:
             # Une hypothèse peu assurée ne doit pas passer devant un fait aussi pertinent.
             score *= float(ligne.get("confidence") or 0.0)
         candidates[mem_id] = _candidat_depuis_ligne(ligne, score, recency_factor)
 
-    if not candidates:
+    if not candidates and not _ancres_actives(compartments, config):
         return {
-            "context_packet": packet_vide(registry),
+            "context_packet": packet_vide(),
             "token_estimate": 0,
             "selected_memory_ids": [],
             "trace_id": trace_id,
@@ -254,14 +264,22 @@ def build_context_packet(
     propagate_entanglement(candidates, relationships,
                            config.entangle_damping, config.entangle_max_hops,
                            aggregation=config.entangle_aggregation)
+    # Réflexes (tronc cérébral) : injectés à CHAQUE contexte, quelle que soit la question.
+    # Ajoutés APRÈS la propagation, délibérément : présents dans tous les paquets, ils
+    # deviendraient sinon des « hubs » qui diffusent leur activation vers les mêmes voisins
+    # à chaque requête (le travers corrigé par l'agrégation `max` au banc du 26/09).
+    ancres = _injecter_ancres(store, candidates, compartments, config)
+
     annulations: dict[str, dict] = {}
     apply_contradictions(candidates, relationships, journal=annulations)
-    filter_redundancy(candidates, config.redundancy_threshold, proteges=priorites,
-                      journal=annulations)
+    # Les ancres ne sont PAS protégées de la redondance : deux réflexes qui disent la même
+    # chose n'ont pas à occuper deux fois le paquet (le mieux classé gagne, règle du 26/09).
+    filter_redundancy(candidates, config.redundancy_threshold,
+                      proteges=priorites, journal=annulations)
     context_packet, selected_ids, token_count = collapse_by_utility(
-        candidates, max_tokens, registry, priorites,
+        candidates, max_tokens, priorites,
         top_k=config.collapse_top_k, density_exponent=config.density_exponent,
-        reflective_max_share=config.reflective_max_share)
+        parts_max=config.parts(), ancres=ancres)
 
     if selected_ids and record_access:
         store.mark_accessed(selected_ids)
@@ -275,12 +293,35 @@ def build_context_packet(
         "selected_memory_ids": selected_ids,
         "trace_id": trace_id,
         "retrieval_trace": _trace(candidates, selected_ids, annulations, priorites,
-                                  explain_level) if explain else None,
+                                  explain_level, ancres) if explain else None,
     }
 
 
+def _ancres_actives(compartments: list[str], config: RetrievalConfig) -> bool:
+    return COMPARTIMENT_REFLEXES in compartments and config.reflexes_injectes > 0
+
+
+def _injecter_ancres(store: MemoryStore, candidates: dict[str, dict],
+                     compartments: list[str], config: RetrievalConfig) -> list[str]:
+    """Ajoute les réflexes à injecter d'office ; renvoie leurs ids, du plus important au
+    moins important. Un réflexe déjà ramené par la recherche garde son score (il est
+    seulement promu en tête) ; les autres entrent avec leur importance comme score."""
+    if not _ancres_actives(compartments, config):
+        return []
+    ancres: list[str] = []
+    for ligne in store.fetch_ancres(COMPARTIMENT_REFLEXES, config.reflexes_injectes):
+        mem_id = str(ligne["id"])
+        if mem_id not in candidates:
+            importance = max(0.01, float(ligne.get("importance") or 0.5))
+            candidates[mem_id] = _candidat_depuis_ligne(ligne, importance, 1.0)
+            candidates[mem_id]["similarity"] = 0.0
+        ancres.append(mem_id)
+    return ancres
+
+
 def _trace(candidates: dict[str, dict], selected_ids: list[str],
-           annulations: dict[str, dict], priorites: list[str], niveau: str) -> list[dict]:
+           annulations: dict[str, dict], priorites: list[str], niveau: str,
+           ancres: Sequence[str] = ()) -> list[dict]:
     """Trace d'explication. `selected` : les retenus (contrat historique) ; `all` : tous
     les candidats, retenus d'abord, avec le motif d'exclusion des autres."""
     retenus = set(selected_ids)
@@ -296,11 +337,13 @@ def _trace(candidates: dict[str, dict], selected_ids: list[str],
             "similarity": c["similarity"],
             "recency_factor": c.get("recency_factor", 0.0),
             "score": c["score"],
+            "compartment": c.get("compartment"),
         }
         if memory_id in retenus:
             # Libellé historique conservé (contrat) ; la priorité est un champ à part.
             entree["selection_reason"] = "selected_by_utility_under_token_budget"
             entree["priority"] = memory_id in priorites
+            entree["anchor"] = memory_id in ancres
         elif memory_id in annulations:
             entree["selection_reason"] = f"cancelled_{annulations[memory_id]['motif']}"
             entree["cancelled_by"] = annulations[memory_id]["par"]
@@ -327,8 +370,14 @@ class InMemoryStore:
         self.relations = [dict(r) for r in (relations or [])]
         self.acces_marques: list[str] = []
 
-    def fetch_candidates(self, query_vector, query_text, memory_types):
-        return [dict(m) for m in self.memoires.values() if m["type"] in memory_types]
+    def fetch_candidates(self, query_vector, query_text, compartments):
+        return [dict(m) for m in self.memoires.values() if m["compartment"] in compartments]
+
+    def fetch_ancres(self, compartment, limit):
+        lignes = [dict(m) for m in self.memoires.values()
+                  if m["compartment"] == compartment and m.get("status", "active") == "active"]
+        lignes.sort(key=lambda m: -float(m.get("importance") or 0.5))
+        return lignes[:limit]
 
     def fetch_relationships(self, memory_ids):
         connus = set(memory_ids)

@@ -15,6 +15,7 @@ for _p in (_racine, os.path.join(_racine, "packages", "core")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from synaptiq_core.compartments import COMPARTIMENT_CROYANCES, COMPARTIMENTS, PAR_NOM
 from synaptiq_core.observability import configure_logging
 
 # Journalisation sur STDERR, jamais stdout : en transport `stdio`, stdout porte le JSON-RPC
@@ -302,35 +303,50 @@ def _echec(operation: str, err: Exception) -> str:
     raise ToolError(f"{operation} : {err}") from err
 
 
-@mcp.tool()
-def store_memory(content: str, memory_type: str, subtype: str | None = None,
-                 project: str | None = None) -> str:
-    """
-    Enregistre de maniere autonome un fait, une preference, une regle ou un episode dans la memoire SynaptiQ.
+# Fiche des compartiments pour les descriptions d'outils, DÉRIVÉE du cœur : un agent lit
+# exactement la liste que le moteur applique (jamais une seconde liste écrite à la main).
+_FICHE_COMPARTIMENTS = "\n".join(
+    f"      - '{c.nom}' ({c.region}) : {c.description}"
+    for c in COMPARTIMENTS if c.ecriture_directe)
 
-    Le couple (memory_type, subtype) designe une COLLECTION. `subtype` est le nom du rayon :
-    utiliser `list_collections` pour voir ceux qui existent, `create_collection` pour en
-    ouvrir un nouveau. Un nom NON declare est accepte, mais le souvenir est alors range dans
-    la section par defaut de sa famille -- la reponse le dit explicitement.
+_DESCRIPTION_STORE = f"""
+    Enregistre un souvenir dans la memoire SynaptiQ, rangee comme un cerveau en compartiments
+    FIXES. Tu ne crees rien : tu juges seulement dans quel compartiment ranger ce souvenir.
+
+    Compartiments :
+{_FICHE_COMPARTIMENTS}
+
+    Si tu hesites, omets `compartment` : le moteur classe le souvenir par similarite et te
+    dit ou il l'a range. Pour une hypothese sur l'utilisateur ou les humains, utiliser
+    note_belief (compartiment 'croyances'), jamais store_memory.
 
     Args:
-        content: Le souvenir ou fait a retenir (ex: 'L'utilisateur prefere les rapports courts').
-        memory_type: La famille de memoire ('semantic' pour les faits/preferences, 'procedural' pour les regles/playbooks, 'episodic' pour les actions/resultats, 'working' pour le volatil).
-        subtype: Nom de la collection (ex: 'preference', 'rule', 'clients_paca').
+        content: Le souvenir a retenir, en phrase autonome (ex: 'Jimmy prefere les rapports courts').
+        compartment: Un des compartiments ci-dessus (ex: 'savoir_faire'). Facultatif.
         project: Projet auquel le souvenir appartient (ex: 'synaptiq', 'emile'). Omettre pour un souvenir GLOBAL, valable dans tous les projets (preferences de l'utilisateur, conventions generales). Un fait propre a un projet doit porter son projet : sinon il pollue le rappel des autres.
-    """
+"""
+
+
+@mcp.tool(description=_DESCRIPTION_STORE)
+def store_memory(content: str, compartment: str | None = None,
+                 project: str | None = None) -> str:
     url = f"{SYNAPTIQ_API_URL}/v1/memories"
     try:
+        # Les croyances passent par le garde-fou de note_belief (confiance, indices, refus
+        # des inferences sensibles) : les accepter ici le contournerait.
+        if compartment and compartment in PAR_NOM and not PAR_NOM[compartment].ecriture_directe:
+            return ("[REFUSE] Le compartiment 'croyances' se remplit avec note_belief "
+                    "(hypothese + confiance + indices), pas avec store_memory.")
         # `require_agent_id()` DANS le try : une identite manquante devient un message
         # exploitable par l'agent, pas une exception qui traverse le protocole MCP.
         payload = {
             "agent_id": require_agent_id(),
-            "type": memory_type,
-            "subtype": subtype,
             "content": content,
             "confidence": 1.0,
             "importance": 0.5,
         }
+        if compartment:
+            payload["compartment"] = compartment
         projet = _projet(project)
         if projet:
             payload["project"] = projet
@@ -341,201 +357,93 @@ def store_memory(content: str, memory_type: str, subtype: str | None = None,
         response.raise_for_status()
         res_data = response.json()
 
-        # ── Le verdict de rangement est RENDU a l'agent ──
-        # L'API renvoie `collection` et `canonical_subtype` depuis toujours ; cet outil les
-        # jetait et ne retournait que l'identifiant. L'agent croyait donc ranger finement
-        # alors que son libelle metier retombait dans la section par defaut de sa famille,
-        # et rien ne le detrompait. Un moteur de memoire ne doit pas laisser croire a un
-        # classement qui n'a pas eu lieu.
-        collection = res_data.get("collection")
+        # ── Le rangement est RENDU a l'agent ──
+        # Un moteur de memoire ne doit pas laisser croire a un classement qui n'a pas eu
+        # lieu (v0.3 : un libelle metier retombait en silence dans la section par defaut).
+        lieu = f"'{res_data.get('compartment')}' ({res_data.get('region')})"
         # `duplicate` : ce contenu etait deja en base sous cette identite, l'API a neutralise
         # l'ecriture et rend la ligne existante. C'est dit a l'agent plutot que presente comme
         # une creation -- sinon il croit avoir ajoute un souvenir alors qu'il a reecrit le
         # meme, et peut boucler en reformulant pour « corriger » un echec qui n'existe pas.
         if res_data.get("status") == "duplicate":
-            message = (f"[DEJA PRESENT] Ce contenu est deja en memoire (ID: "
-                       f"{res_data.get('memory_id')}, section '{collection}'). Rien n'a ete "
-                       f"ajoute : l'ecriture directe est idempotente sur le contenu. Pour "
-                       f"corriger un souvenir, en ecrire un NOUVEAU qui enonce la version a "
-                       f"jour -- une reformulation a l'identique ne cree rien.")
-            return message
+            return (f"[DEJA PRESENT] Ce contenu est deja en memoire (ID: "
+                    f"{res_data.get('memory_id')}, compartiment {lieu}). Rien n'a ete "
+                    f"ajoute : l'ecriture directe est idempotente sur le contenu. Pour "
+                    f"corriger un souvenir, en ecrire un NOUVEAU qui enonce la version a "
+                    f"jour -- une reformulation a l'identique ne cree rien.")
         portee = (f"projet '{res_data['project']}'" if res_data.get("project")
                   else "global")
         message = (f"[SUCCESS] Memoire enregistree. ID: {res_data.get('memory_id')} | "
-                   f"servie dans la section '{collection}' | {portee}")
-        if subtype and not res_data.get("canonical_subtype") and collection != subtype:
-            message += (f".\n[INFO] '{subtype}' n'est pas une collection declaree : le "
-                        f"souvenir est range dans '{collection}', la section par defaut de "
-                        f"la famille '{memory_type}'. Pour qu'il ait sa propre section, "
-                        f"appeler create_collection(name='{subtype}', "
-                        f"family='{memory_type}', description=...).")
+                   f"compartiment {lieu} | {portee}")
+        origine = res_data.get("compartment_origin")
+        if origine == "moteur":
+            demande = res_data.get("requested")
+            motif = (f"'{demande}' n'est pas un compartiment" if demande
+                     else "aucun compartiment indique")
+            message += (f".\n[INFO] {motif} : le moteur l'a classe par similarite "
+                        f"({res_data.get('classification_similarity')}). Si ce n'est pas le "
+                        f"bon, reecrire en precisant compartment (cf. list_compartments).")
+        elif origine == "alias":
+            message += (f".\n[INFO] '{res_data.get('requested')}' est un ancien nom de "
+                        f"collection, converti en '{res_data.get('compartment')}'. Utiliser "
+                        f"desormais directement ce nom de compartiment.")
         return message
     except Exception as e:
         return _echec("Echec de l'enregistrement de la memoire", e)
 
 
 @mcp.tool()
-def list_collections() -> str:
+def list_compartments() -> str:
     """
-    Liste les collections de la memoire de cet agent : les rayons ou ranger un souvenir.
-
-    A APPELER AVANT de creer une collection, et avant d'inventer un `subtype` dans
-    store_memory. Une collection existante qui convient doit toujours etre reutilisee :
-    une taxonomie qui se demultiplie a chaque nuance devient illisible, pour l'agent comme
-    pour le modele qui lit le contexte.
-
-    Deux origines :
-      - `systeme` : livrees avec le moteur, communes a tous les agents.
-      - `agent`   : creees par cet agent, pour lui seul.
+    Liste les compartiments de la memoire (fixes, comme les regions d'un cerveau), leur
+    fonction et le nombre de souvenirs que tu y as ranges. A consulter quand tu hesites
+    sur le compartiment ou ranger un souvenir.
     """
-    url = f"{SYNAPTIQ_API_URL}/v1/collections"
+    url = f"{SYNAPTIQ_API_URL}/v1/compartments"
     try:
         response = _lire(url, {"agent_id": require_agent_id()})
         response.raise_for_status()
         data = response.json()
-        collections = data.get("collections", [])
-        if not collections:
-            return "Aucune collection (registre vide)."
-
-        lignes = ["Collections de la memoire SynaptiQ :"]
-        dormantes = []
-        for col in collections:
-            origine = "systeme" if col["created_by"] == "system" else "agent"
-            graphe = "intriquee" if col["entangle"] else "hors graphe"
-            marque = " | DORMANTE" if col.get("stale") else ""
-            if col.get("stale"):
-                dormantes.append(col["name"])
-            lignes.append(
-                f"- {col['name']} [{origine} | famille={col['family']} | {graphe} | "
-                f"{col['memory_count']} souvenir(s){marque}] -> section '{col['packet_key']}'"
-                + (f"\n    {col['description']}" if col.get("description") else "")
-            )
-
-        limites = data.get("limits") or {}
-        if limites:
-            lignes.append(f"\nQuota : {limites.get('used')} / "
-                          f"{limites.get('max_collections')} collections creees.")
-        if dormantes:
-            # Une collection declaree puis jamais remplie est le premier symptome d'une
-            # taxonomie qui se disperse. La signaler est ce qui permet de la corriger.
-            lignes.append(
-                f"[ATTENTION] Collections creees mais restees vides : {', '.join(dormantes)}. "
-                f"Les reutiliser, ou les verser dans un autre rayon via merge_collections.")
+        lignes = ["Compartiments de la memoire SynaptiQ :"]
+        for c in data.get("compartments", []):
+            drapeaux = []
+            if c.get("always_injected"):
+                drapeaux.append("injecte a chaque contexte")
+            if not c.get("direct_write"):
+                drapeaux.append("via note_belief seulement")
+            if c.get("max_share", 1.0) < 1.0:
+                drapeaux.append(f"max {int(c['max_share'] * 100)} % du contexte")
+            suffixe = f" | {', '.join(drapeaux)}" if drapeaux else ""
+            lignes.append(f"- {c['name']} [{c['region']} | oubli {c['forgetting']} | "
+                          f"{c['memory_count']} souvenir(s){suffixe}]\n    {c['description']}")
         return "\n".join(lignes)
     except Exception as e:
-        return _echec("Echec de la lecture des collections", e)
+        return _echec("Echec de la lecture des compartiments", e)
 
 
 @mcp.tool()
-def merge_collections(source: str, target: str) -> str:
-    """
-    Verse tous les souvenirs de la collection `source` dans `target`, puis supprime `source`.
-
-    C'est l'outil d'entretien de la taxonomie. A utiliser des que deux rayons se recouvrent
-    (`clients_paca` et `clients_region_paca`, par exemple) : une memoire eparpillee entre
-    des rayons quasi identiques est une memoire ou plus rien ne se retrouve.
-
-    Aucun souvenir n'est detruit -- seule leur etiquette change.
-
-    Contraintes : `source` doit etre une collection creee par cet agent (les collections
-    systeme servent tous les agents), et les deux doivent appartenir a la MEME famille --
-    la famille decide de l'intrication et de la decroissance, la changer modifierait le
-    traitement des souvenirs et pas seulement leur rangement.
-
-    Args:
-        source: Collection a vider puis supprimer.
-        target: Collection qui recoit les souvenirs.
-    """
-    url = f"{SYNAPTIQ_API_URL}/v1/collections/merge"
-    try:
-        response = _poster(url, {"agent_id": require_agent_id(),
-                                 "source": source, "target": target})
-        if response.status_code in (404, 409, 422):
-            return f"[REFUSE] {response.json().get('detail', response.text)}"
-        response.raise_for_status()
-        data = response.json()
-        return (f"[SUCCESS] '{data.get('source')}' versee dans '{data.get('target')}' : "
-                f"{data.get('moved_memories')} souvenir(s) deplace(s).")
-    except Exception as e:
-        return _echec("Echec de la fusion", e)
-
-
-@mcp.tool()
-def create_collection(name: str, family: str, description: str,
-                      entangle: bool = True) -> str:
-    """
-    Cree un nouveau rayon dans la memoire de cet agent, pour y classer une categorie de
-    souvenirs qui n'a pas encore sa place.
-
-    A n'utiliser QUE si `list_collections` ne montre rien de convenable : reutiliser vaut
-    toujours mieux que multiplier. Une collection est un engagement durable, pas une
-    etiquette jetable.
-
-    La FAMILLE n'est pas une categorie de rangement, c'est un COMPORTEMENT du moteur, et
-    elle ne peut pas etre inventee. Choisir parmi :
-      - 'semantic'   : savoirs stables (faits, preferences, profils, referentiels).
-      - 'procedural' : regles, procedures, resolutions d'erreur, conventions.
-      - 'episodic'   : evenements dates (comptes rendus, incidents, historique).
-      - 'working'    : volatil, jetable apres usage.
-
-    Args:
-        name: Nom du rayon, en minuscules_avec_underscores (ex: 'clients_paca').
-        family: 'semantic' | 'procedural' | 'episodic' | 'working'.
-        description: A quoi sert ce rayon et ce qu'on y range. Sert a decider plus tard s'il faut le reutiliser -- etre concret.
-        entangle: True pour un savoir structurant (le souvenir tisse des liens semantiques exploites par le rappel multi-saut). False pour du volumineux peu discriminant (brouillons, journaux bruts), afin de ne pas encombrer le graphe.
-    """
-    url = f"{SYNAPTIQ_API_URL}/v1/collections"
-    try:
-        payload = {
-            "agent_id": require_agent_id(),
-            "name": name,
-            "family": family,
-            "description": description,
-            "entangle": entangle,
-        }
-        response = _poster(url, payload)
-        if response.status_code in (409, 422):
-            # Refus METIER (doublon, nom canonique, plafond) : le detail de l'API est
-            # actionnable, il doit atteindre l'agent tel quel plutot que sous la forme
-            # d'un « HTTP 409 » qu'il ne saura pas interpreter.
-            detail = response.json().get("detail", response.text)
-            return f"[REFUSE] {detail}"
-        response.raise_for_status()
-        data = response.json()
-        usage = data.get("usage", {})
-        return (f"[SUCCESS] Collection '{data.get('name')}' creee "
-                f"(famille {data.get('family')}, section '{data.get('packet_key')}'). "
-                f"Pour y ecrire : store_memory(content=..., "
-                f"memory_type='{usage.get('type')}', subtype='{usage.get('subtype')}').")
-    except Exception as e:
-        return _echec("Echec de la creation de la collection", e)
-
-@mcp.tool()
-def recall_memories(query: str, limit: int = 5, memory_type: str | None = None,
-                    collections: list[str] | None = None,
+def recall_memories(query: str, limit: int = 5, compartments: list[str] | None = None,
                     project: str | None = None) -> str:
     """
-    Recherche sementiquement des souvenirs ou regles dans la memoire SynaptiQ pour adapter les reponses ou actions de l'agent.
+    Recherche semantiquement des souvenirs dans la memoire SynaptiQ pour adapter les reponses ou actions de l'agent.
 
     Args:
         query: Le sujet ou mot-cle a rechercher (ex: 'preferences style ecriture').
         limit: Nombre maximum de souvenirs a ramener (default: 5).
-        memory_type: Filtrer par famille de memoire ('semantic', 'procedural', 'episodic', 'working', 'reflective').
-        collections: Restreindre a ces collections (cf. list_collections). Cible un rayon precis plutot qu'une famille entiere : moins de candidats, donc moins de bruit.
+        compartments: Restreindre a ces compartiments (ex: ['alertes', 'savoir_faire'] pour un debogage). Omettre pour tout balayer. Cf. list_compartments.
         project: Restreindre a ce projet (ex: 'synaptiq') ; les souvenirs globaux restent inclus. Fortement recommande des que la question porte sur un projet precis : sans filtre, les autres projets noient le resultat.
     """
     url = f"{SYNAPTIQ_API_URL}/v1/retrieve"
     try:
-        payload = {
+        payload: dict = {
             "agent_id": require_agent_id(),
             "query": query,
             "limit": limit,
-            "memory_type": memory_type,
         }
         # Omis quand absent : une liste vide serait un filtre qui ne ramene rien, alors que
         # l'absence de filtre doit tout balayer.
-        if collections:
-            payload["collections"] = collections
+        if compartments:
+            payload["compartments"] = compartments
         projet = _projet(project)
         if projet:
             payload["project"] = projet
@@ -551,49 +459,46 @@ def recall_memories(query: str, limit: int = 5, memory_type: str | None = None,
 
         output = ["Souvenirs retrouves dans SynaptiQ :"]
         for mem in memories:
-            output.append(f"- [{mem['type'].upper()} / {mem['subtype'] or 'general'}] {mem['content']} (Confidence: {mem['confidence']})")
+            output.append(f"- [{_libelle(mem.get('compartment'))}] {mem['content']} "
+                          f"(Confidence: {mem['confidence']})")
         return "\n".join(output)
     except Exception as e:
         return _echec("Echec de la recherche de souvenirs", e)
 
 
-# Libelles lisibles des sept sections livrees avec le moteur. Les sections creees par
-# l'agent n'y figurent pas : elles portent deja le nom qu'il leur a donne.
-_LIBELLES_CANONIQUES = {
-    "facts": "FAITS", "preferences": "PREFERENCES", "episodes": "EPISODES",
-    "rules": "REGLES", "best_practices": "BONNES PRATIQUES",
-    "errors": "ERREURS", "examples": "EXEMPLES",
-    # Croyances (famille `reflective`) : le libelle rappelle au modele que ce sont des
-    # hypotheses de l'agent, a verifier, et non des faits.
-    "user_model": "CE QUE JE PENSE DE L'UTILISATEUR (hypotheses)",
-    "human_insights": "REFLEXIONS SUR LES HUMAINS (hypotheses)",
-}
+def _libelle(nom: str | None) -> str:
+    """Libelle lisible d'un compartiment : sa region et son titre."""
+    c = PAR_NOM.get(nom or "")
+    if c is None:
+        return (nom or "?").upper()
+    if c.nom == COMPARTIMENT_CROYANCES:
+        # Rappelle au modele que ce sont des hypotheses de l'agent, pas des faits.
+        return f"{c.region.upper()} - {c.titre.upper()} (hypotheses)"
+    return f"{c.region.upper()} - {c.titre.upper()}"
 
 
 @mcp.tool()
 def build_context(task: str, query: str, max_tokens: int = 1200,
-                  collections: list[str] | None = None,
+                  compartments: list[str] | None = None,
                   project: str | None = None) -> str:
     """
-    Assemble un paquet de contexte compact (Q-EM) pret a injecter dans le prompt systeme
-    de l'agent : faits, preferences, episodes, regles, bonnes pratiques, erreurs, plus une
-    section par collection que cet agent s'est creee.
+    Assemble un paquet de contexte compact (Q-EM) pret a injecter dans le prompt systeme de
+    l'agent, organise par compartiment (reflexes, decisions, savoir-faire, alertes,
+    environnement, savoirs, episodes, observations, croyances). Les reflexes y sont injectes
+    a chaque fois, quelle que soit la question.
 
     Args:
         task: La tache en cours (ex: 'Rediger un email de suivi B2B').
         query: La requete de rappel semantique (ex: 'style d'ecriture, preferences client').
         max_tokens: Budget de tokens du contexte (default: 1200).
-        collections: Restreindre le rappel a ces collections (cf. list_collections). Cible un rayon precis au lieu de ratisser toute la memoire : moins de bruit a budget de tokens egal. Omettre pour tout balayer.
+        compartments: Restreindre le rappel a ces compartiments (cf. list_compartments). Omettre pour tout balayer.
         project: Projet de la tache en cours (ex: 'synaptiq'). Le paquet ne contient alors que ce projet et les souvenirs globaux.
     """
     url = f"{SYNAPTIQ_API_URL}/v1/context/build"
     try:
-        contraintes: dict = {
-            "max_tokens": max_tokens,
-            "memory_types": ["semantic", "episodic", "procedural", "working", "reflective"],
-        }
-        if collections:
-            contraintes["collections"] = collections
+        contraintes: dict = {"max_tokens": max_tokens}
+        if compartments:
+            contraintes["compartments"] = compartments
         projet = _projet(project)
         if projet:
             contraintes["project"] = projet
@@ -613,23 +518,19 @@ def build_context(task: str, query: str, max_tokens: int = 1200,
         packet = data.get("context_packet", {})
         lines = [f"Contexte SynaptiQ (~{data.get('token_estimate', 0)} tokens) :"]
 
-        # Parcours du paquet REELLEMENT renvoye, et non d'une liste figee de sept cles.
-        # Le paquet porte desormais une section par collection de l'agent : iterer sur une
-        # table de libelles codee en dur les aurait toutes ecartees en silence -- le
-        # rangement qu'il s'est donne aurait ete invisible dans son propre contexte, et
-        # rien ne l'aurait signale. Les canoniques restent en tete, dans leur ordre.
-        ordre = [c for c in _LIBELLES_CANONIQUES if c in packet]
-        ordre += [c for c in packet if c not in _LIBELLES_CANONIQUES]
-        for cle in ordre:
-            libelle = _LIBELLES_CANONIQUES.get(cle, cle.upper())
-            for item in packet.get(cle, []):
+        # Parcours du paquet REELLEMENT renvoye (ordre des compartiments), et non d'une
+        # liste figee : une cle inattendue (serveur plus recent) reste affichee, au lieu
+        # d'etre ecartee en silence. Seules les sections non vides sont imprimees.
+        for cle, items in packet.items():
+            libelle = _libelle(cle)
+            for item in items:
                 lines.append(f"- [{libelle}] {item}")
         return "\n".join(lines) if len(lines) > 1 else "Aucun contexte pertinent trouve."
     except Exception as e:
         return _echec("Echec de la construction du contexte", e)
 
 
-# ─── Croyances : ce que l'agent pense (famille `reflective`, lot C) ─────────
+# ─── Croyances : ce que l'agent pense (compartiment `croyances`, lot C) ─────
 
 @mcp.tool()
 def note_belief(content: str, about: str = "user", confidence: float = 0.5,
@@ -663,8 +564,8 @@ def note_belief(content: str, about: str = "user", confidence: float = 0.5,
             return "[REFUSE] about doit valoir 'user' ou 'humans'."
         payload: dict = {
             "agent_id": require_agent_id(),
-            "type": "reflective",
-            "subtype": "user_model" if about == "user" else "human_insights",
+            "compartment": COMPARTIMENT_CROYANCES,
+            "about": about,
             "content": content,
             "confidence": confidence,
         }
@@ -684,7 +585,8 @@ def note_belief(content: str, about: str = "user", confidence: float = 0.5,
         if data.get("status") == "duplicate":
             return f"[DEJA PRESENT] Cette croyance est deja notee (ID: {data.get('memory_id')})."
         return (f"[SUCCESS] Croyance notee (ID: {data.get('memory_id')}), servie comme "
-                f"hypothese dans '{data.get('collection')}'.")
+                f"hypothese dans le compartiment '{data.get('compartment')}' "
+                f"({data.get('region')}).")
     except Exception as e:
         return _echec("Echec de l'enregistrement de la croyance", e)
 

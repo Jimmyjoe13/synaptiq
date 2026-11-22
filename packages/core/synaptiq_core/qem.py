@@ -11,7 +11,7 @@ Le moteur Q-EM se déroule en 4 phases (voir CLAUDE.md) :
 
 Toutes les fonctions opèrent sur :
   - `candidates` : dict[str, dict] indexé par id de mémoire. Chaque valeur porte au moins :
-        id, type, subtype, content, confidence, importance, created_at,
+        id, type, compartment, content, confidence, importance, created_at,
         last_accessed_at, embedding (list[float]), similarity, score.
     (`recency_factor` est présent pour les candidats issus de la recherche directe.)
   - `relationships` : list[dict] avec les clés source_memory_id, target_memory_id,
@@ -23,15 +23,16 @@ d'os.getenv ici, afin de tester chaque phase de manière déterministe.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from synaptiq_core.collections import CollectionRegistry
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 
-from synaptiq_core.collections import FAMILLE_REFLEXIVE
+from synaptiq_core.compartments import (
+    COMPARTIMENT_CROYANCES,
+    COMPARTIMENT_PAR_DEFAUT,
+    PAR_NOM,
+    packet_vide,
+)
 
 logger = logging.getLogger("synaptiq-core.qem")
 
@@ -330,9 +331,9 @@ def filter_redundancy(
 # Phase 4 — Mesure : routage + collapse glouton sous budget de tokens
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Pas de liste des clés du paquet ici : elle est DÉRIVÉE du registre
-# (`collections.SYSTEM_PACKET_KEYS`). Une seconde liste écrite à la main est exactement le
-# motif interdit par le CLAUDE.md §3 — celui par lequel la taxonomie a déjà divergé.
+
+# Les sections du paquet sont les 9 compartiments, dans l'ordre de
+# `compartments.COMPARTIMENTS` (`packet_vide()`). Aucune liste écrite à la main ici.
 
 
 def estimate_tokens(content: str) -> int:
@@ -340,32 +341,19 @@ def estimate_tokens(content: str) -> int:
     return max(1, int(len(content.split()) * 1.3))
 
 
-def route_memory(m_type: str, m_subtype: str | None,
-                 registry: CollectionRegistry | None = None) -> str:
-    """Détermine la clé du context_packet cible pour une mémoire (type/subtype).
+def route_memory(compartment: str | None) -> str:
+    """Section du context_packet d'un souvenir : son compartiment.
 
-    Le routage est désormais porté par un registre de collections
-    (`synaptiq_core.collections`) plutôt que par une cascade de `if` : c'est ce qui permet
-    à un agent de déclarer ses propres rayons. Sans registre fourni, on utilise celui des
-    sept collections livrées — le comportement est alors identique au précédent :
-
-      - semantic/preference              -> preferences
-      - semantic/<libre>                 -> facts
-      - episodic/<*>                     -> episodes
-      - procedural/coding_best_practices -> best_practices
-      - procedural/code_error_resolution -> errors
-      - procedural/<libre>               -> rules
-      - working/<*>                      -> examples
-
-    ⚠️ **Ne renvoie plus jamais `None`.** Un type inconnu renvoyait `None`, et
-    `collapse_by_utility` retirait alors la mémoire du paquet — après l'avoir comptée dans
-    `selected_ids` et avoir dépensé son budget de tokens. Le souvenir était retrouvé, payé,
-    puis invisible, sans le moindre signal. Un rangement de repli est signalé par un
-    avertissement et reste corrigeable ; une disparition muette, non. Voir
-    `CollectionRegistry.packet_key`.
+    ⚠️ **Ne renvoie jamais `None`** (leçon de la v0.3 : un souvenir retrouvé, compté dans
+    `selected_ids` et facturé en tokens disparaissait du paquet quand le routage échouait).
+    Un compartiment inconnu — donnée écrite à la main ou corrompue — retombe sur
+    `COMPARTIMENT_PAR_DEFAUT`, avec un avertissement : mal rangé se voit, disparu non.
     """
-    from synaptiq_core.collections import REGISTRE_SYSTEME
-    return (registry or REGISTRE_SYSTEME).packet_key(m_type, m_subtype)
+    if compartment in PAR_NOM:
+        return str(compartment)
+    logger.warning("Compartiment inconnu '%s' : rangement de repli dans '%s'.",
+                   compartment, COMPARTIMENT_PAR_DEFAUT)
+    return COMPARTIMENT_PAR_DEFAUT
 
 
 def format_entry(content: str, occurred_at) -> str:
@@ -382,7 +370,7 @@ def format_entry(content: str, occurred_at) -> str:
 
 
 def format_croyance(content: str, confidence: float) -> str:
-    """Rendu d'une croyance (famille `reflective`) : JAMAIS comme un fait.
+    """Rendu d'une croyance (compartiment `croyances`) : JAMAIS comme un fait.
 
     Le modèle qui lit le paquet doit savoir qu'il s'agit d'une hypothèse de l'agent, et à
     quel point elle est assurée ; sans ce préfixe, « Jimmy préfère décider seul » serait lu
@@ -394,121 +382,89 @@ def format_croyance(content: str, confidence: float) -> str:
 def collapse_by_utility(
     candidates: dict[str, dict],
     max_tokens: int,
-    registry: CollectionRegistry | None = None,
     priorites: Sequence[str] = (),
     top_k: int = 0,
     density_exponent: float = 1.0,
-    reflective_max_share: float = 1.0,
+    parts_max: Mapping[str, float] | None = None,
+    ancres: Sequence[str] = (),
 ) -> tuple[dict[str, list], list[str], int]:
     """Collapse glouton : maximise l'utilité/token sous contrainte `max_tokens`.
 
     Retourne `(context_packet, selected_ids, token_count)`.
 
-    ## Le paquet n'a plus un nombre de sections fixe
+    ## Le paquet a une forme FIXE : les 9 compartiments
 
-    Il portait toujours les sept mêmes clés, codées en dur. Il porte désormais celles du
-    REGISTRE : les sept canoniques d'abord (contrat préservé, elles sont toujours présentes
-    même vides), puis une section par collection que l'agent s'est déclarée. C'est ce qui
-    rend le rangement qu'il choisit réellement visible dans le contexte servi au LLM —
-    jusqu'ici son libellé métier était dilué dans `facts`.
+    Toujours les 9 sections, dans l'ordre des compartiments, même vides : un consommateur
+    n'a jamais à tester l'existence d'une clé pour savoir qu'une région n'a rien donné.
 
-    Sans registre, on retombe sur le registre système : sept clés, routage identique à
-    l'origine.
+    ## Ordre d'admission
 
-    ## `priorites` : la réponse à la question ne sort jamais du paquet (audit 11/08)
+    1. `ancres` : souvenirs injectés à chaque contexte (compartiment `reflexes`, tronc
+       cérébral), quelle que soit la question ;
+    2. `priorites` : la meilleure réponse à la question ne sort jamais du paquet (audit
+       11/08) ;
+    3. `top_k` meilleurs par SCORE, avant toute considération de coût (banc du 26/09) ;
+    4. le reste par densité `score / tokens**β` (`density_exponent`).
 
-    La densité d'utilité par token favorise les souvenirs courts : sous un budget serré,
-    le meilleur candidat du rang fusionné pouvait être éliminé par une série de souvenirs
-    brefs — le paquet répondait alors à côté de la question, sans rien signaler
-    (dégradation invisible, cf. `build_context` vs `retrieve` dans l'audit).
+    Rien de tout cela ne déroge au reste : un souvenir de score nul (annulé par
+    l'interférence) n'entre jamais, et le budget de tokens est un plafond dur.
 
-    Les ids listés dans `priorites` sont traités AVANT tous les autres, par score
-    décroissant. Ils ne dérogent à RIEN d'autre : une priorité dont le score a été annulé
-    par l'interférence (contradiction, redondance) reste exclue, et le budget de tokens
-    reste un plafond dur — une priorité plus coûteuse que le budget total n'entre pas.
+    ## `parts_max` : régulation par compartiment (rôle de l'hypothalamus)
 
-    ## `top_k` et `density_exponent` : ne plus sélectionner à la longueur (banc du 26/09)
-
-    Avec une densité `score / tokens`, un souvenir de 140 tokens au score 0,96 passait
-    derrière une douzaine de souvenirs brefs et génériques de score ~0,5 : trois souvenirs
-    attendus sortaient du paquet à 1200 tokens pour cette seule raison, et cinq « hubs »
-    courts apparaissaient dans 95 % des paquets, quelle que soit la question.
-      - `top_k` : après les priorités, les `top_k` meilleurs candidats par SCORE entrent
-        avant toute considération de coût (toujours sous le plafond du budget) ;
-      - `density_exponent` (β) : le reste est rempli par `score / tokens**β`. β=1 est la
-        densité historique ; β<1 pénalise moins la longueur.
-    Valeurs par défaut (0 et 1,0) = comportement historique exact.
-
-    ## `reflective_max_share` : les croyances ne prennent pas le paquet (lot C)
-
-    Part maximale du budget accordée aux souvenirs de la famille `reflective` (croyances
-    de l'agent). Au-delà, les croyances suivantes sont écartées même s'il reste de la
-    place : le paquet sert d'abord des FAITS, les hypothèses ne font que les nuancer.
-    1,0 (défaut) = pas de plafond.
+    Part maximale du budget accordée à un compartiment (ex. `croyances` 15 %,
+    `reflexes` 20 %). Au-delà, ses souvenirs suivants sont écartés même s'il reste de la
+    place : les réflexes ne doivent pas évincer la réponse à la question, et les
+    hypothèses ne font que nuancer les faits. Absent = pas de plafond.
     """
-    from synaptiq_core.collections import REGISTRE_SYSTEME
-    registre = registry or REGISTRE_SYSTEME
+    plafonds = {nom: int(max_tokens * part) for nom, part in (parts_max or {}).items()}
+
     # Sélection des candidats survivants + densité d'utilité par token.
     collapsed_candidates = []
     for mem_id, c in candidates.items():
         if c['score'] > 0.0:
+            compartiment = route_memory(c.get('compartment'))
             contenu = c['content']
-            if c['type'] == FAMILLE_REFLEXIVE:
+            if compartiment == COMPARTIMENT_CROYANCES:
                 contenu = format_croyance(contenu, float(c.get('confidence') or 0.0))
             entry = format_entry(contenu, c.get('occurred_at'))
             tokens = estimate_tokens(entry)
-            utility_density = c['score'] / (tokens ** density_exponent)
             collapsed_candidates.append({
                 "id": mem_id,
-                "type": c['type'],
-                "subtype": c.get('subtype'),
+                "compartment": compartiment,
                 "content": entry,
                 "tokens": tokens,
-                "utility_density": utility_density,
+                "utility_density": c['score'] / (tokens ** density_exponent),
             })
 
-    # Les priorités d'abord (dans leur ordre), puis densité d'utilité décroissante (stable
-    # sur l'ordre d'insertion). Toute priorité avec score annulé n'est pas dans la liste :
-    # elle a été filtrée juste au-dessus par `score > 0.0`.
-    # Les `top_k` meilleurs par score rejoignent les priorités, dans l'ordre du score.
+    # Ancres, puis priorités, puis `top_k` meilleurs par score (dans cet ordre), puis densité
+    # d'utilité décroissante (tri stable sur l'ordre d'insertion).
+    deja = set(ancres) | set(priorites)
     meilleurs = sorted(
-        (x["id"] for x in collapsed_candidates if x["id"] not in priorites),
+        (x["id"] for x in collapsed_candidates if x["id"] not in deja),
         key=lambda m_id: -candidates[m_id]['score'])[:max(0, top_k)]
-    ordre_priorites = {m_id: i for i, m_id in enumerate([*priorites, *meilleurs])}
+    rang_fixe: dict[str, int] = {}
+    for m_id in [*ancres, *priorites, *meilleurs]:
+        rang_fixe.setdefault(m_id, len(rang_fixe))
     collapsed_candidates.sort(
-        key=lambda x: (ordre_priorites.get(x["id"], len(ordre_priorites)),
-                       -x["utility_density"]))
+        key=lambda x: (rang_fixe.get(x["id"], len(rang_fixe)), -x["utility_density"]))
 
-    # Sections issues du registre : canoniques puis celles de l'agent. Toujours toutes
-    # présentes, y compris vides — un consommateur ne doit pas avoir à tester l'existence
-    # d'une clé pour savoir qu'une collection n'a rien donné.
-    packet: dict[str, list[str]] = {k: [] for k in registre.packet_keys()}
+    packet = packet_vide()
     selected_ids: list[str] = []
     token_count = 0
-    plafond_croyances = int(max_tokens * reflective_max_share)
-    tokens_croyances = 0
+    consommes: dict[str, int] = {}
 
     for c in collapsed_candidates:
-        croyance = c['type'] == FAMILLE_REFLEXIVE
-        if croyance and tokens_croyances + c['tokens'] > plafond_croyances:
-            continue      # quota des croyances atteint : les faits d'abord
+        compartiment = c["compartment"]
+        plafond = plafonds.get(compartiment)
+        if plafond is not None and consommes.get(compartiment, 0) + c['tokens'] > plafond:
+            continue      # quota du compartiment atteint : place à la réponse
         if token_count + c['tokens'] <= max_tokens:
             selected_ids.append(c['id'])
             token_count += c['tokens']
-            if croyance:
-                tokens_croyances += c['tokens']
-
-            # Routage complet type + sous-type vers la bonne collection logique.
-            # `route_memory` ne renvoie plus jamais None : le `if key is not None` d'avant
-            # était le point exact où une mémoire déjà comptée dans `selected_ids` et déjà
-            # facturée en tokens disparaissait du paquet sans laisser de trace.
-            key = route_memory(c['type'], c.get('subtype'), registre)
-            # `setdefault` conservé : le registre couvre les clés qu'il connaît, mais une
-            # mémoire peut porter une famille inconnue (donnée écrite par une version
-            # antérieure) et retomber sur une clé de repli. Mieux vaut une section en plus
-            # qu'un KeyError — ou pire, un retour au silence d'avant.
-            packet.setdefault(key, []).append(c['content'])
+            consommes[compartiment] = consommes.get(compartiment, 0) + c['tokens']
+            packet[compartiment].append(c['content'])
         else:
-            logger.debug(f"Q-EM: Hors budget pour {c['id']} (tokens={c['tokens']}, restant={max_tokens - token_count})")
+            logger.debug("Q-EM: Hors budget pour %s (tokens=%d, restant=%d)",
+                         c['id'], c['tokens'], max_tokens - token_count)
 
     return packet, selected_ids, token_count

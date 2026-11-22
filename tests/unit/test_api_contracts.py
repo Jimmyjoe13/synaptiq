@@ -20,14 +20,28 @@ def test_context_constraints_reject_invalid_budget_and_type():
     with pytest.raises(ValidationError):
         ContextConstraints(max_tokens=0)
     with pytest.raises(ValidationError):
-        ContextConstraints(memory_types=["unknown"])
+        ContextConstraints(compartments=["unknown"])
 
 
-def test_memory_input_rejects_invalid_score_and_type():
+def test_memory_input_rejects_invalid_score():
     with pytest.raises(ValidationError):
-        MemoryInput(agent_id="agent", type="unknown", content="memory")
+        MemoryInput(agent_id="agent", content="memory", importance=1.1)
+
+
+def test_memory_input_compartment_inconnu_accepte_pour_classement():
+    """À l'écriture, un nom inconnu n'est pas une erreur : le moteur classera."""
+    assert MemoryInput(agent_id="agent", content="m", compartment="truc").compartment == "truc"
+
+
+def test_memory_input_indices_reserves_aux_croyances():
     with pytest.raises(ValidationError):
-        MemoryInput(agent_id="agent", type="semantic", content="memory", importance=1.1)
+        MemoryInput(agent_id="agent", content="m", compartment="savoirs", evidence=["x"])
+
+
+def test_memory_input_ancienne_forme_de_croyance_convertie():
+    m = MemoryInput(agent_id="a", content="Jimmy aime X", type="reflective",
+                    subtype="human_insights", confidence=0.5)
+    assert (m.compartment, m.about) == ("croyances", "humans")
 
 
 def test_retrieve_request_limit_is_bounded():

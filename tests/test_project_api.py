@@ -31,8 +31,6 @@ def db():
 
     def _purge():
         purge_tenants(conn, TENANT)
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM memory_collections WHERE tenant_id = %s", (TENANT,))
 
     _purge()
     yield conn
@@ -54,7 +52,7 @@ def client(monkeypatch):
 
 
 def _ecrire(client, contenu, project=None):
-    corps = {"agent_id": AGENT, "type": "semantic", "subtype": "fact", "content": contenu}
+    corps = {"agent_id": AGENT, "compartment": "savoirs",  "content": contenu}
     if project is not None:
         corps["project"] = project
     r = client.post("/v1/memories", json=corps)
@@ -86,8 +84,8 @@ def test_le_projet_est_normalise_et_rendu(client, db):
 
 
 def test_nom_de_projet_invalide_refuse_en_422(client, db):
-    r = client.post("/v1/memories", json={"agent_id": AGENT, "type": "semantic",
-                                          "subtype": "fact", "content": "x",
+    r = client.post("/v1/memories", json={"agent_id": AGENT, "compartment": "savoirs",
+                                           "content": "x",
                                           "project": "mon projet"})
     assert r.status_code == 422
 

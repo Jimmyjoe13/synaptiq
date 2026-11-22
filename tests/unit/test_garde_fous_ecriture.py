@@ -1,12 +1,13 @@
-"""Garde-fous ajoutés le 11/08 après audit — quatre pannes silencieuses.
+"""Garde-fous ajoutés le 11/08 après audit — pannes silencieuses.
 
-Les quatre sont dans le job CI BLOQUANT (tests/unit/, aucune infrastructure requise) :
-un garde-fou de sécurité vérifié dans un job `continue-on-error` ne garde rien.
+Dans le job CI BLOQUANT (tests/unit/, aucune infrastructure requise) : un garde-fou de
+sécurité vérifié dans un job `continue-on-error` ne garde rien.
 
 1. `DELETE /v1/memories` sans `agent_id` ne consultait PAS le périmètre de la clé.
-2. `POST /v1/collections` acceptait une `packet_key` canonique (`rules`…).
-3. `POST /v1/memories` répondait `201 created` pour une ligne jamais écrite.
 4. `create_api_key.py` produisait par défaut une clé valable pour tous les agents.
+
+(Les garde-fous 2, 3 et 5 portaient sur le registre de collections, supprimé en v0.4 au
+profit des compartiments fixes : `tests/unit/test_compartments.py`.)
 """
 import sys
 from pathlib import Path
@@ -20,14 +21,9 @@ sys.path.insert(0, str(ROOT / "packages" / "core"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from apps.api.main import (
-    CLES_PAQUET_CANONIQUES,
     AuthContext,
-    CollectionInput,
-    _declarer_collection_manquante,
-    create_collection,
     purge_memories,
 )
-from synaptiq_core.collections import SYSTEM_COLLECTIONS, charger_registre
 
 # ─── 1. La purge ne doit pas déborder du périmètre de la clé ─────────────────
 
@@ -92,129 +88,6 @@ def test_purge_confirmation_toujours_exigee_hors_perimetre_borne():
     assert exc.value.status_code == 400
 
 
-# ─── 2. Aucune collection d'agent ne se greffe sur une section canonique ─────
-
-def test_les_cles_canoniques_derivent_des_collections_systeme():
-    """Interdiction du CLAUDE.md §3 : pas de seconde liste écrite à la main."""
-    assert CLES_PAQUET_CANONIQUES == {c.packet_key for c in SYSTEM_COLLECTIONS}
-
-
-@pytest.mark.parametrize("cle", sorted(c.packet_key for c in SYSTEM_COLLECTIONS))
-def test_packet_key_canonique_refusee(cle):
-    """`packet_key="rules"` servait les souvenirs de l'agent dans la rubrique Règles.
-
-    Pas un défaut d'isolation (c'est son propre paquet), mais une injection STRUCTURELLE :
-    un contenu mémorisé, éventuellement dicté par un tiers, se retrouvait rangé dans la
-    section la plus impérative du prompt système.
-    """
-    payload = CollectionInput(agent_id="agentA", name="un_rayon", family="semantic",
-                              description="Une description suffisamment longue.",
-                              packet_key=cle)
-    with pytest.raises(HTTPException) as exc:
-        create_collection(payload, auth=None)
-    assert exc.value.status_code == 422
-    assert cle in exc.value.detail
-
-
-def test_nom_valant_une_cle_canonique_refuse_aussi():
-    """À défaut de `packet_key`, c'est le NOM qui la porte.
-
-    `is_canonical` protège le nom d'une collection (`rule`), pas la clé de section
-    (`rules`) : contrôler seulement le champ explicite laissait la porte grande ouverte.
-    """
-    payload = CollectionInput(agent_id="agentA", name="rules", family="semantic",
-                              description="Une description suffisamment longue.")
-    with pytest.raises(HTTPException) as exc:
-        create_collection(payload, auth=None)
-    assert exc.value.status_code == 422
-
-
-def test_packet_key_libre_toujours_acceptee(monkeypatch):
-    """Le cas normal ne doit pas être fermé : plusieurs collections peuvent partager une
-    section, tant qu'elle n'est pas canonique.
-
-    Pool forcé à None (cf. `test_purge_globale_reste_possible...`) : la suite
-    d'intégration crée un vrai pool dans le même process.
-    """
-    import apps.api.main as main
-
-    monkeypatch.setattr(main, "db_pool", None)
-    payload = CollectionInput(agent_id="agentA", name="clients_paca", family="semantic",
-                              description="Les clients de la région PACA.",
-                              packet_key="clients")
-    with pytest.raises(HTTPException) as exc:
-        create_collection(payload, auth=None)
-    assert exc.value.status_code == 503        # pool absent : le contrôle est passé
-
-
-# ─── 3. Un registre illisible n'avorte pas la transaction d'écriture ─────────
-
-class CurseurTransactionnel:
-    """Curseur qui reproduit la sémantique psycopg2/PostgreSQL des transactions avortées.
-
-    Une fois une requête en échec, TOUTE requête suivante est refusée
-    (`InFailedSqlTransaction`) jusqu'à un `ROLLBACK TO SAVEPOINT` — mais `commit()` est,
-    lui, traduit en ROLLBACK silencieux par le serveur. C'est ce silence-là qui rendait la
-    perte d'écriture invisible.
-    """
-
-    def __init__(self, echouer_sur: str) -> None:
-        self.echouer_sur = echouer_sur
-        self.avortee = False
-        self.executees: list[str] = []
-
-    def execute(self, sql, params=None):
-        self.executees.append(sql.strip().split("\n")[0])
-        if sql.strip().upper().startswith("ROLLBACK TO SAVEPOINT"):
-            self.avortee = False
-            return
-        if self.avortee:
-            raise RuntimeError("current transaction is aborted, commands ignored")
-        if self.echouer_sur in sql:
-            self.avortee = True
-            erreur = RuntimeError('relation "memory_collections" does not exist')
-            erreur.pgcode = "42P01"
-            raise erreur
-
-    def fetchall(self):
-        return []
-
-    def fetchone(self):
-        return None
-
-
-def test_registre_illisible_ne_laisse_pas_la_transaction_avortee():
-    """LE correctif : après le repli, la transaction doit rester utilisable.
-
-    Sans le SAVEPOINT, l'INSERT était déjà passé mais `conn.commit()` était exécuté comme
-    un ROLLBACK par PostgreSQL, sans exception : l'API répondait `201 created` pour une
-    ligne inexistante. Sur une collection sans intrication, aucune requête ne suivait —
-    donc rien ne révélait la perte.
-    """
-    cur = CurseurTransactionnel(echouer_sur="memory_collections")
-
-    registre = charger_registre(cur, "t", "agentA")
-
-    # Repli sur les collections système, comme le veut `charger_registre`…
-    assert len(registre.collections) == len(SYSTEM_COLLECTIONS)
-    # …mais la transaction est de nouveau saine : c'est ce qui manquait.
-    assert cur.avortee is False
-    cur.execute("INSERT INTO memories DEFAULT VALUES")      # ne doit plus lever
-    assert any(s.startswith("SAVEPOINT") for s in cur.executees)
-    assert any(s.startswith("ROLLBACK TO SAVEPOINT") for s in cur.executees)
-
-
-def test_savepoint_libere_sur_le_chemin_nominal():
-    """Un registre lisible ne doit laisser aucun savepoint ouvert derrière lui."""
-    cur = CurseurTransactionnel(echouer_sur="__jamais__")
-
-    charger_registre(cur, "t", "agentA")
-
-    assert cur.executees[0] == "SAVEPOINT synaptiq_registre"
-    assert cur.executees[-1] == "RELEASE SAVEPOINT synaptiq_registre"
-    assert cur.avortee is False
-
-
 # ─── 4. Le périmètre d'agents d'une clé API est un choix explicite ───────────
 
 def _perimetre(argv):
@@ -253,81 +126,3 @@ def test_les_deux_drapeaux_ensemble_sont_refuses(capsys):
     with pytest.raises(SystemExit):
         _perimetre(["--name", "k", "--agents", "agentA", "--all-agents"])
     assert "s'excluent" in capsys.readouterr().err
-
-
-# ─── 5. Une collection manquante est déclarée à l'écriture (audit 11/08) ─────
-
-class CurseurRegistre:
-    """Curseur double : sert le registre à `charger_registre`, observe les INSERT.
-
-    Lignes au format POSITIONNEL attendu par `charger_registre` :
-    (name, family, packet_key, description, entangle, created_by).
-    """
-
-    def __init__(self, lignes_registre):
-        self.lignes_registre = lignes_registre
-        self.rowcount = 0
-        self.inserts: list[tuple] = []
-
-    def execute(self, sql, params=None):
-        debut = sql.strip().split("\n")[0]
-        if "SELECT name, family" in debut:
-            return
-        if "INSERT INTO memory_collections" in debut:
-            self.inserts.append(params)
-            self.rowcount = 1
-        else:
-            self.rowcount = 0
-
-    def fetchall(self):
-        return list(self.lignes_registre)
-
-
-def test_declaration_auto_quand_rayon_inconnu():
-    """Un sous-type libre sans ligne au registre se déclare lui-même à l'écriture."""
-    cur = CurseurRegistre([])
-    _declarer_collection_manquante(cur, "t", "agentA", "semantic", "clients_paca")
-    assert len(cur.inserts) == 1
-    tenant, agent, nom, famille, description, entangle, packet_key = cur.inserts[0]
-    assert (tenant, agent, nom, famille) == ("t", "agentA", "clients_paca", "semantic")
-    assert entangle is True                    # famille structurante
-    assert packet_key == "clients_paca"
-    assert "déclaré automatiquement" in description
-
-
-def test_declaration_auto_saute_si_collection_systeme():
-    """`rule`/`procedural` est couvert par la collection système : rien à déclarer."""
-    cur = CurseurRegistre([("rule", "procedural", "rules", "desc", True, "system")])
-    _declarer_collection_manquante(cur, "t", "agentA", "procedural", "rule")
-    assert cur.inserts == []
-
-
-def test_declaration_auto_saute_si_deja_declaree_par_l_agent():
-    """Le rayon existe déjà pour cet agent : pas de doublon."""
-    cur = CurseurRegistre([("clients_paca", "semantic", "clients_paca", "desc", True, "agent")])
-    _declarer_collection_manquante(cur, "t", "agentA", "semantic", "clients_paca")
-    assert cur.inserts == []
-
-
-def test_declaration_auto_respecte_le_plafond(monkeypatch):
-    """`MAX_COLLECTIONS_PER_AGENT` est un plafond dur, même à l'écriture."""
-    import apps.api.main as main
-
-    monkeypatch.setattr(main, "MAX_COLLECTIONS_PER_AGENT", 3)
-    lignes = [(f"c{i}", "semantic", f"c{i}", "desc", True, "agent") for i in range(3)]
-    cur = CurseurRegistre(lignes)
-    _declarer_collection_manquante(cur, "t", "agentA", "semantic", "clients_paca")
-    assert cur.inserts == []
-
-
-def test_declaration_auto_sans_soustype_ignoree():
-    cur = CurseurRegistre([])
-    _declarer_collection_manquante(cur, "t", "agentA", "semantic", None)
-    assert cur.inserts == []
-
-
-def test_declaration_auto_entangle_faux_pour_episodic():
-    """`episodic`/`working` ne tissent pas : la déclaration porte le flag à False."""
-    cur = CurseurRegistre([])
-    _declarer_collection_manquante(cur, "t", "agentA", "episodic", "session_log")
-    assert cur.inserts[0][5] is False

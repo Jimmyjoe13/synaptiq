@@ -14,64 +14,47 @@ from apps.worker.worker import (
     _validate_extraction,
 )
 
-# ─── Éligibilité à l'intrication ───
+# ─── Éligibilité à l'intrication : c'est le compartiment qui décide (v0.4) ───
 
-@pytest.mark.parametrize("mtype,subtype", [
-    ("procedural", "code_error_resolution"),
-    ("procedural", "coding_best_practices"),
-    ("procedural", "rule"),
-    ("semantic", "fact"),
-    ("semantic", "preference"),
-])
-def test_souvenirs_durables_sont_intricables(mtype, subtype):
-    assert _is_entanglement_candidate({"type": mtype, "subtype": subtype})
+@pytest.mark.parametrize("compartiment", [
+    "decisions", "savoir_faire", "alertes", "environnement", "savoirs"])
+def test_souvenirs_durables_sont_intricables(compartiment):
+    assert _is_entanglement_candidate({"compartment": compartiment})
 
 
-def test_episodic_exclu_par_defaut():
-    """Les épisodes bruts ne tissent pas le graphe (densité sans pertinence)."""
-    assert not _is_entanglement_candidate({"type": "episodic", "subtype": "interaction"})
+@pytest.mark.parametrize("compartiment", ["episodes", "observations", "reflexes",
+                                          "croyances", "inconnu", None])
+def test_hors_graphe(compartiment):
+    """Épisodes et observations (densité sans pertinence), réflexes (hubs), croyances
+    (une hypothèse ne propage rien) et compartiment inconnu : aucune arête."""
+    assert not _is_entanglement_candidate({"compartment": compartiment})
 
 
-def test_preference_intricable_meme_si_type_inattendu():
-    """Garde-fou historique : une préférence reste intricable quel que soit son type."""
-    assert _is_entanglement_candidate({"type": "working", "subtype": "preference"})
+# ─── Validation de l'extraction : proposition BRUTE, décision après vectorisation ───
 
-
-def test_types_intricables_configurables(monkeypatch):
-    """QEM_ENTANGLE_TYPES pilote le prédicat sans redéploiement de code."""
-    import apps.worker.worker as worker
-
-    monkeypatch.setattr(worker, "QEM_ENTANGLE_TYPES", {"episodic"})
-    assert worker._is_entanglement_candidate({"type": "episodic", "subtype": "interaction"})
-    assert not worker._is_entanglement_candidate({"type": "semantic", "subtype": "fact"})
-
-
-# ─── Validation de l'extraction : c'est elle qui produit le type ───
-
-def test_extraction_llm_valide_est_intricable():
-    """Une classification LLM correcte doit déboucher sur un souvenir intricable."""
+def test_extraction_conserve_la_proposition_du_modele():
     data = _validate_extraction(
-        {"type": "semantic", "subtype": "preference", "content": "Jimmy préfère les mails courts",
+        {"compartment": "reflexes", "content": "Jimmy préfère les mails courts",
          "summary": "Préférence", "confidence": 0.9, "importance": 0.8},
         "peu importe",
     )
-    assert data["type"] == "semantic"
-    assert data["subtype"] == "preference"
-    assert _is_entanglement_candidate(data)
+    assert data["compartment"] == "reflexes"
+    assert data["content"] == "Jimmy préfère les mails courts"
 
 
-def test_extraction_type_inconnu_retombe_sur_semantic():
-    """Un type hors taxonomie est normalisé en semantic/fact — donc intricable."""
-    data = _validate_extraction({"type": "inventé", "subtype": "n'importe quoi"}, "contenu brut")
-    assert data["type"] == "semantic"
-    assert data["subtype"] == "fact"
+def test_extraction_lit_encore_un_ancien_subtype():
+    """Un modèle (ou un prompt) v0.3 renvoie encore type/subtype : rien n'est perdu, la
+    conversion se fait ensuite par la table d'alias."""
+    data = _validate_extraction({"type": "procedural", "subtype": "code_error_resolution"},
+                                "contenu brut")
+    assert data["compartment"] == "code_error_resolution"
+    assert data["legacy_type"] == "procedural"
     assert data["content"] == "contenu brut"
-    assert _is_entanglement_candidate(data)
 
 
 def test_extraction_borne_les_scores():
     data = _validate_extraction(
-        {"type": "semantic", "subtype": "fact", "confidence": 42, "importance": -3}, "x"
+        {"compartment": "savoirs", "confidence": 42, "importance": -3}, "x"
     )
     assert data["confidence"] == 1.0
     assert data["importance"] == 0.0
@@ -79,7 +62,7 @@ def test_extraction_borne_les_scores():
 
 def test_extraction_scores_non_numeriques_prennent_le_defaut():
     data = _validate_extraction(
-        {"type": "semantic", "subtype": "fact", "confidence": "élevée", "importance": None}, "x"
+        {"compartment": "savoirs", "confidence": "élevée", "importance": None}, "x"
     )
     assert data["confidence"] == 0.9
     assert data["importance"] == 0.5
@@ -87,24 +70,22 @@ def test_extraction_scores_non_numeriques_prennent_le_defaut():
 
 # ─── Repli heuristique : documente ce qu'on perd sans LLM ───
 
-@pytest.mark.parametrize("texte,attendu_type,attendu_subtype", [
-    ("Erreur critique : traceback à l'import du module socket", "procedural", "code_error_resolution"),
-    ("Bonne pratique : toujours borner les requêtes SQL", "procedural", "coding_best_practices"),
-    ("Je préfère les réponses courtes et directes", "semantic", "preference"),
+@pytest.mark.parametrize("texte,attendu", [
+    ("Erreur critique : traceback à l'import du module socket", "alertes"),
+    ("Bonne pratique : toujours borner les requêtes SQL", "savoir_faire"),
+    ("Je préfère les réponses courtes et directes", "reflexes"),
 ])
-def test_heuristique_reconnait_les_tournures_cibles(texte, attendu_type, attendu_subtype):
-    data = _heuristic_extract(texte)
-    assert (data["type"], data["subtype"]) == (attendu_type, attendu_subtype)
-    assert _is_entanglement_candidate(data)
+def test_heuristique_reconnait_les_tournures_cibles(texte, attendu):
+    assert _heuristic_extract(texte)["compartment"] == attendu
 
 
 def test_heuristique_sans_motif_produit_un_episode_non_intricable():
-    """Le cas dominant sans LLM : aucune tournure reconnue -> episodic -> hors graphe.
+    """Le cas dominant sans LLM : aucune tournure reconnue -> épisode -> hors graphe.
 
     C'est précisément pourquoi `.env.example` livre un LLM d'extraction par défaut.
     """
     data = _heuristic_extract("Le rapport trimestriel a été transmis au client hier.")
-    assert data["type"] == "episodic"
+    assert data["compartment"] == "episodes"
     assert not _is_entanglement_candidate(data)
 
 
@@ -113,8 +94,8 @@ def test_heuristique_sans_motif_produit_un_episode_non_intricable():
 class _FakeResp:
     def __init__(self, status_code, payload=None):
         self.status_code = status_code
-        self._payload = payload or {"choices": [{"message": {"content": '{"type":"semantic",'
-                                                             '"subtype":"fact","content":"c",'
+        self._payload = payload or {"choices": [{"message": {"content": '{"compartment":"savoirs",'
+                                                             '"content":"c",'
                                                              '"summary":"s","confidence":0.9,'
                                                              '"importance":0.5}'}}]}
         self.headers = {}
@@ -171,7 +152,7 @@ def test_bascule_sur_json_schema_si_json_object_refuse(monkeypatch):
 
     assert vus[:2] == ["json_object", "json_schema"]
     assert worker._negotiated_format_mode == "json_schema"
-    assert res[0]["type"] == "semantic"  # extraction LLM réussie, pas un repli regex
+    assert res[0]["compartment"] == "savoirs"  # extraction LLM réussie, pas un repli regex
 
 
 def test_retombe_en_texte_libre_si_aucun_format_accepte(monkeypatch):
@@ -223,9 +204,9 @@ def test_un_evenement_produit_plusieurs_faits(monkeypatch):
     import apps.worker.worker as worker
     _reset_negociation(worker)
     memories = [
-        {"type": "semantic", "subtype": "fact", "content": "Caroline a adopté un beagle",
+        {"compartment": "savoirs", "content": "Caroline a adopté un beagle",
          "summary": "Adoption", "occurred_at": "2023-05-08", "confidence": 1, "importance": 0.8},
-        {"type": "semantic", "subtype": "preference", "content": "Caroline aime courir le matin",
+        {"compartment": "reflexes", "content": "Caroline aime courir le matin",
          "summary": "Préférence", "occurred_at": "", "confidence": 0.9, "importance": 0.6},
     ]
     monkeypatch.setattr(worker.requests, "post",
@@ -236,7 +217,7 @@ def test_un_evenement_produit_plusieurs_faits(monkeypatch):
     faits = worker.call_llm_extractor("peu importe", occurred_at="2023-05-08")
 
     assert len(faits) == 2
-    assert faits[0]["subtype"] == "fact" and faits[1]["subtype"] == "preference"
+    assert faits[0]["compartment"] == "savoirs" and faits[1]["compartment"] == "reflexes"
 
 
 def test_date_relative_resolue_en_datetime(monkeypatch):
@@ -246,7 +227,7 @@ def test_date_relative_resolue_en_datetime(monkeypatch):
     import apps.worker.worker as worker
     _reset_negociation(worker)
     monkeypatch.setattr(worker.requests, "post", lambda *a, **k: _payload([
-        {"type": "semantic", "subtype": "fact", "content": "Caroline y est allée",
+        {"compartment": "savoirs", "content": "Caroline y est allée",
          "summary": "s", "occurred_at": "2023-05-07", "confidence": 1, "importance": 0.5}]))
     monkeypatch.setattr(worker, "LLM_PROVIDER", "groq")
     monkeypatch.setattr(worker, "LLM_API_KEY", "clé")
@@ -264,7 +245,7 @@ def test_horodatage_transmis_au_prompt(monkeypatch):
 
     def capture(url, headers=None, json=None, timeout=None):
         vus.append(json["messages"][-1]["content"])
-        return _payload([{"type": "semantic", "subtype": "fact", "content": "c",
+        return _payload([{"compartment": "savoirs", "content": "c",
                           "summary": "s", "occurred_at": "", "confidence": 1, "importance": 0.5}])
 
     monkeypatch.setattr(worker.requests, "post", capture)
@@ -288,7 +269,7 @@ def test_dates_invalides_ignorees(valeur, attendu_none):
 def test_formats_de_reponse_toleres():
     """Objet unique ou liste nue : on accepte, les modèles ne suivent pas tous la consigne."""
     from apps.worker.worker import _validate_extractions
-    unique = {"type": "semantic", "subtype": "fact", "content": "un fait", "summary": "s"}
+    unique = {"compartment": "savoirs", "content": "un fait", "summary": "s"}
     assert len(_validate_extractions(unique, "brut")) == 1
     assert len(_validate_extractions([unique, dict(unique, content="autre")], "brut")) == 2
 
@@ -296,7 +277,7 @@ def test_formats_de_reponse_toleres():
 def test_faits_dupliques_ecartes():
     """Deux faits identiques entreraient en conflit sur (source_event_id, content_hash)."""
     from apps.worker.worker import _validate_extractions
-    doublon = {"type": "semantic", "subtype": "fact", "content": "Caroline a un beagle", "summary": "s"}
+    doublon = {"compartment": "savoirs", "content": "Caroline a un beagle", "summary": "s"}
     faits = _validate_extractions({"memories": [doublon, dict(doublon), doublon]}, "brut")
     assert len(faits) == 1
 
@@ -305,7 +286,7 @@ def test_nombre_de_faits_borne(monkeypatch):
     import apps.worker.worker as worker
     from apps.worker.worker import _validate_extractions
     monkeypatch.setattr(worker, "MAX_FACTS_PER_EVENT", 3)
-    trop = [{"type": "semantic", "subtype": "fact", "content": f"fait {i}", "summary": "s"}
+    trop = [{"compartment": "savoirs", "content": f"fait {i}", "summary": "s"}
             for i in range(10)]
     assert len(_validate_extractions({"memories": trop}, "brut")) == 3
 
@@ -314,7 +295,7 @@ def test_sortie_vide_retombe_sur_heuristique():
     """Plutôt qu'un événement perdu, un fait heuristique."""
     from apps.worker.worker import _validate_extractions
     faits = _validate_extractions({"memories": []}, "Je préfère les réponses courtes")
-    assert len(faits) == 1 and faits[0]["subtype"] == "preference"
+    assert len(faits) == 1 and faits[0]["compartment"] == "reflexes"
 
 
 # ─── Empreinte de contenu (idempotence du replay) ───

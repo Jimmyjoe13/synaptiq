@@ -31,9 +31,6 @@ def db():
 
     def _purge():
         purge_tenants(conn, TENANT)
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM memory_collections WHERE tenant_id = %s", (TENANT,))
-            conn.commit()
 
     _purge()
     yield conn
@@ -53,9 +50,9 @@ def client(monkeypatch):
         yield c
 
 
-def _ecrire(client, contenu, subtype="fact", type_="semantic"):
-    return client.post("/memories", json={"agent_id": AGENT, "type": type_,
-                                          "subtype": subtype, "content": contenu})
+def _ecrire(client, contenu, compartment="savoirs"):
+    return client.post("/memories", json={"agent_id": AGENT, "compartment": compartment,
+                                          "content": contenu})
 
 
 def _aretes(db, agent=AGENT):
@@ -97,7 +94,7 @@ def test_une_collection_non_structurante_ne_tisse_rien(client, db):
     _ecrire(client, "Un premier fait durable, pour avoir un voisin disponible.")
     aretes_avant = _aretes(db)
 
-    _ecrire(client, "Une note de travail jetable.", subtype="scratch", type_="working")
+    _ecrire(client, "Une note de travail jetable.", compartment="observations")
 
     assert _aretes(db) == aretes_avant, "une collection non structurante ne doit rien tisser"
 

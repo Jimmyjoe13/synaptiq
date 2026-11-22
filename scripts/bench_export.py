@@ -3,7 +3,7 @@
 Pourquoi : le banc de rappel du 26/09 a été joué directement sur l'instance de
 production. Il y a modifié `last_accessed_at` (l'API rafraîchit les accès, même en
 `explain`), il s'est donc contaminé lui-même, et il n'est pas rejouable. Ce script fige
-une photographie de l'agent (souvenirs + vecteurs + arêtes + collections) que
+une photographie de l'agent (souvenirs + vecteurs + arêtes) que
 `benchmarks/recall_bench.py` réimporte ensuite dans la base de DEV.
 
 Garanties :
@@ -48,7 +48,7 @@ from synaptiq_core.embeddings import get_embedder  # noqa: E402
 # Toutes les colonnes utiles au rejeu. `content_tsv` est GÉNÉRÉE (recalculée à l'import),
 # `embedding` part en texte pgvector ('[0.1,...]') pour rester du JSON pur.
 _COLONNES_MEMOIRE = (
-    "id, type, subtype, content, summary, embedding::text AS embedding, confidence, "
+    "id, type, compartment, content, summary, embedding::text AS embedding, confidence, "
     "importance, recency_score, access_count, last_accessed_at, created_at, updated_at, "
     "status, version, provenance, occurred_at, content_hash"
 )
@@ -113,14 +113,6 @@ def main() -> int:
             )
             aretes = cur.fetchall()
 
-            cur.execute(
-                "SELECT name, family, description, description_embedding::text AS "
-                "description_embedding, entangle, packet_key, created_at "
-                "FROM memory_collections WHERE tenant_id = %s AND agent_id = %s "
-                "AND created_by = 'agent'",
-                (args.tenant, args.agent),
-            )
-            collections = cur.fetchall()
     finally:
         conn.close()
 
@@ -155,13 +147,12 @@ def main() -> int:
         "export_now": export_now,
         "memories": memoires,
         "relationships": aretes,
-        "collections": collections,
         "queries": requetes,
     }
     chemin = os.path.join(out, f"recall_{args.agent}.json")
     with open(chemin, "w", encoding="utf-8") as f:
         json.dump(fixture, f, ensure_ascii=False, default=_json_defaut)
-    print(f"{len(memoires)} souvenirs, {len(aretes)} arêtes, {len(collections)} collections, "
+    print(f"{len(memoires)} souvenirs, {len(aretes)} arêtes, "
           f"{len(requetes)} requêtes -> {chemin}")
     return 0
 

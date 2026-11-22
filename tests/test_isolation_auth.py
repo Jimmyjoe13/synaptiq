@@ -107,10 +107,10 @@ def _seed_api_key(db, raw_key: str, tenant_id: str, scopes=None, agents=None) ->
 
 def test_retrieve_isole_par_agent(client):
     """Un agent ne récupère QUE ses propres mémoires via /retrieve."""
-    client.post("/memories", json={"agent_id": "agentA", "type": "semantic",
-                                    "subtype": "preference", "content": "pref de A"})
-    client.post("/memories", json={"agent_id": "agentB", "type": "semantic",
-                                    "subtype": "preference", "content": "pref de B"})
+    client.post("/memories", json={"agent_id": "agentA", "compartment": "reflexes",
+                                     "content": "pref de A"})
+    client.post("/memories", json={"agent_id": "agentB", "compartment": "reflexes",
+                                     "content": "pref de B"})
 
     resp = client.post("/retrieve", json={"agent_id": "agentA", "query": "peu importe"})
     assert resp.status_code == 200
@@ -121,26 +121,26 @@ def test_retrieve_isole_par_agent(client):
 
 def test_context_build_isole_par_agent(client):
     """/context/build ne ramène jamais les mémoires d'un autre agent."""
-    client.post("/memories", json={"agent_id": "agentA", "type": "semantic",
-                                    "subtype": "preference", "content": "pref de A"})
-    client.post("/memories", json={"agent_id": "agentB", "type": "semantic",
-                                    "subtype": "preference", "content": "pref de B"})
+    client.post("/memories", json={"agent_id": "agentA", "compartment": "reflexes",
+                                     "content": "pref de A"})
+    client.post("/memories", json={"agent_id": "agentB", "compartment": "reflexes",
+                                     "content": "pref de B"})
 
     resp = client.post("/context/build", json={
         "agent_id": "agentA", "session_id": "s1",
         "task": "t", "query": "q",
-        "constraints": {"max_tokens": 1000, "memory_types": ["semantic"]},
+        "constraints": {"max_tokens": 1000},
     })
     assert resp.status_code == 200
-    prefs = resp.json()["context_packet"]["preferences"]
+    prefs = resp.json()["context_packet"]["reflexes"]
     assert prefs == ["pref de A"]
 
 
 def test_body_ne_peut_pas_changer_le_tenant(client, db):
     """Un `tenant_id` injecté dans le body est ignoré : le périmètre reste l'instance."""
     # Mémoire écrite dans le tenant d'instance.
-    client.post("/memories", json={"agent_id": "agentA", "type": "semantic",
-                                   "subtype": "preference", "content": "pref de A"})
+    client.post("/memories", json={"agent_id": "agentA", "compartment": "reflexes",
+                                    "content": "pref de A"})
     # Body trafiqué avec un faux tenant_id → doit être ignoré (retour normal, périmètre instance).
     resp = client.post("/retrieve", json={"agent_id": "agentA", "query": "q",
                                           "tenant_id": "tenant_pirate"})
@@ -182,8 +182,8 @@ def test_cle_valide_scope_le_tenant_et_isole(client, db, monkeypatch):
     hy = {"Authorization": "Bearer cle-tenant-Y"}
 
     # Écriture sous le tenant X (résolu par la clé, jamais par le body).
-    r = client.post("/memories", json={"agent_id": "agentA", "type": "semantic",
-                                       "subtype": "preference", "content": "secret de X"},
+    r = client.post("/memories", json={"agent_id": "agentA", "compartment": "reflexes",
+                                        "content": "secret de X"},
                     headers=hx)
     assert r.status_code == 201
 
@@ -244,7 +244,12 @@ def test_events_signale_503_quand_la_base_est_absente(client, monkeypatch):
     `get_conn()` : un client ne pouvait plus distinguer « réessaie » de « bug serveur »,
     donc ne pouvait pas implémenter de retry correct.
     """
+    # Depuis l'auto-reconnexion (`e31f3d5`), un pool à None est RECRÉÉ à la volée : le
+    # mettre à None ne simule plus une panne (ce test était rouge depuis, la CI le masquait).
+    # Une base réellement injoignable, c'est un pool absent ET un DSN qui ne répond pas.
     monkeypatch.setattr(main, "db_pool", None)
+    monkeypatch.setattr(main, "DATABASE_URL",
+                        "postgresql://synaptiq:x@127.0.0.1:1/injoignable?connect_timeout=2")
     resp = client.post("/events", json={"agent_id": "agentA", "session_id": "s1",
                                         "content": "un evenement"})
     assert resp.status_code == 503
@@ -252,12 +257,11 @@ def test_events_signale_503_quand_la_base_est_absente(client, monkeypatch):
 
 # ─── Taxonomie appliquée à l'écriture directe (incident du 29/07) ─────────────
 
-def test_sous_type_libre_accepte_et_routage_annonce(client):
-    """Un libellé métier reste accepté, et la réponse dit OÙ le souvenir sera servi.
+def test_ancien_sous_type_libre_classe_par_le_moteur(client):
+    """Un libellé métier v0.3 n'est ni refusé ni perdu : le moteur le classe et le DIT.
 
-    Constaté en prod : des mémoires écrites via cet endpoint portaient des sous-types hors
-    taxonomie (`nana_intelligence_lead_webhook`). C'est légitime, mais l'appelant ne pouvait
-    pas savoir que son libellé ne produisait pas le routage fin qu'il imaginait.
+    Constaté en prod : des mémoires portaient `nana_intelligence_lead_webhook`. En v0.4 il
+    n'existe plus de collection libre ; la réponse nomme le compartiment retenu et l'origine.
     """
     resp = client.post("/memories", json={
         "agent_id": "agentA", "type": "semantic",
@@ -265,34 +269,28 @@ def test_sous_type_libre_accepte_et_routage_annonce(client):
     })
     assert resp.status_code == 201
     corps = resp.json()
-    # Depuis `e444408`, un libellé libre est auto-déclaré : il obtient sa propre section
-    # au lieu de retomber, invisible, dans `facts`.
-    assert corps["collection"] == "nana_intelligence_lead_webhook"
-    assert corps["canonical_subtype"] is False     # dit explicitement que c'est un libellé libre
+    assert corps["compartment_origin"] == "moteur"
+    assert corps["requested"] == "nana_intelligence_lead_webhook"
+    assert corps["compartment"] != "croyances"
 
 
-def test_sous_type_canonique_annonce_sa_collection_fine(client):
+def test_ancien_sous_type_canonique_converti_par_alias(client):
     resp = client.post("/memories", json={
         "agent_id": "agentA", "type": "semantic",
         "subtype": "preference", "content": "Jimmy préfère les mails courts",
     })
     assert resp.status_code == 201
-    assert resp.json()["collection"] == "preferences"
-    assert resp.json()["canonical_subtype"] is True
+    assert resp.json()["compartment"] == "reflexes"
+    assert resp.json()["compartment_origin"] == "alias"
 
 
-def test_sous_type_du_mauvais_type_refuse_en_422(client):
-    """Seule erreur démontrable : un sous-type canonique rattaché au mauvais type.
-
-    `semantic` + `coding_best_practices` partirait dans `facts` alors que l'auteur visait
-    `best_practices`. Avant le 29/07, l'API l'acceptait sans broncher.
-    """
+def test_croyance_hors_garde_fou_refusee_en_422(client):
+    """Écrire en `croyances` sans respecter le garde-fou (confiance 1.0 sans indice) est
+    refusé : le compartiment des croyances n'est pas une porte dérobée."""
     resp = client.post("/memories", json={
-        "agent_id": "agentA", "type": "semantic",
-        "subtype": "coding_best_practices", "content": "toujours borner les requêtes",
+        "agent_id": "agentA", "compartment": "croyances", "content": "Jimmy décide vite",
     })
     assert resp.status_code == 422
-    assert "procedural" in resp.text     # le message indique le bon type
 
 
 def test_metrics_expose_les_jauges_du_pipeline(client):
@@ -327,9 +325,9 @@ def _insert_memory_sql(db, tenant, agent, content, vec):
     """
     with db.cursor() as cur:
         cur.execute(
-            "INSERT INTO memories (tenant_id, agent_id, type, subtype, content, embedding, "
+            "INSERT INTO memories (tenant_id, agent_id, type, compartment, content, embedding, "
             "confidence, importance, status) "
-            "VALUES (%s, %s, 'semantic', 'fact', %s, %s, 1.0, 0.5, 'active') RETURNING id",
+            "VALUES (%s, %s, 'semantic', 'savoirs', %s, %s, 1.0, 0.5, 'active') RETURNING id",
             (tenant, agent, content, "[" + ",".join(map(str, vec)) + "]"),
         )
         mem_id = cur.fetchone()[0]
@@ -362,7 +360,7 @@ def test_graphe_ne_franchit_pas_la_frontiere_d_agent(client, db):
 
     resp = client.post("/context/build", json={
         "agent_id": "agentA", "session_id": "s1", "task": "t", "query": "q",
-        "constraints": {"max_tokens": 2000, "memory_types": ["semantic"]},
+        "constraints": {"max_tokens": 2000},
     })
     assert resp.status_code == 200
     tout_le_contexte = " ".join(

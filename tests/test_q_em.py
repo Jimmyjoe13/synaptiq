@@ -92,8 +92,8 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             # Insertion M1
             cur.execute(
                 """
-                INSERT INTO memories (tenant_id, agent_id, type, subtype, content, embedding, confidence, importance, status)
-                VALUES (%s, %s, 'semantic', 'fact', %s, %s, 1.0, 0.8, 'active')
+                INSERT INTO memories (tenant_id, agent_id, type, compartment, content, embedding, confidence, importance, status)
+                VALUES (%s, %s, 'semantic', 'savoirs', %s, %s, 1.0, 0.8, 'active')
                 RETURNING id;
                 """,
                 (tenant_id, agent_id, m1_content, m1_embedding)
@@ -103,8 +103,8 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             # Insertion M2
             cur.execute(
                 """
-                INSERT INTO memories (tenant_id, agent_id, type, subtype, content, embedding, confidence, importance, status)
-                VALUES (%s, %s, 'procedural', 'rule', %s, %s, 1.0, 0.9, 'active')
+                INSERT INTO memories (tenant_id, agent_id, type, compartment, content, embedding, confidence, importance, status)
+                VALUES (%s, %s, 'procedural', 'reflexes', %s, %s, 1.0, 0.9, 'active')
                 RETURNING id;
                 """,
                 (tenant_id, agent_id, m2_content, m2_embedding)
@@ -129,8 +129,7 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             "task": "Écrire un script",
             "query": "Quelles sont les préférences de Jimmy pour le dev Python ?",
             "constraints": {
-                "max_tokens": 1000,
-                "memory_types": ["semantic", "procedural"]
+                "max_tokens": 1000
             }
         })
 
@@ -140,9 +139,9 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
         selected_ids = data['selected_memory_ids']
 
         # M1 doit être présente
-        self.assertIn(m1_content, context_packet['facts'])
+        self.assertIn(m1_content, context_packet['savoirs'])
         # M2 doit avoir été intriquée et donc ramenée dans les règles, malgré l'absence de similarité directe !
-        self.assertIn(m2_content, context_packet['rules'])
+        self.assertIn(m2_content, context_packet['reflexes'])
         self.assertEqual(len(selected_ids), 2)
         print("\n[SUCCESS] Intrication quantique et propagation d'activation vérifiées !")
 
@@ -165,15 +164,15 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
         with self.db_conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO memories (tenant_id, agent_id, type, subtype, content, embedding, confidence, importance, status)
-                VALUES (%s, %s, 'semantic', 'preference', %s, %s, 1.0, 0.8, 'active');
+                INSERT INTO memories (tenant_id, agent_id, type, compartment, content, embedding, confidence, importance, status)
+                VALUES (%s, %s, 'semantic', 'reflexes', %s, %s, 1.0, 0.8, 'active');
                 """,
                 (tenant_id, agent_id, m1_content, embedding)
             )
             cur.execute(
                 """
-                INSERT INTO memories (tenant_id, agent_id, type, subtype, content, embedding, confidence, importance, status)
-                VALUES (%s, %s, 'semantic', 'preference', %s, %s, 1.0, 0.5, 'active'); -- importance plus faible
+                INSERT INTO memories (tenant_id, agent_id, type, compartment, content, embedding, confidence, importance, status)
+                VALUES (%s, %s, 'semantic', 'reflexes', %s, %s, 1.0, 0.5, 'active'); -- importance plus faible
                 """,
                 (tenant_id, agent_id, m2_content, embedding)
             )
@@ -187,8 +186,7 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             "task": "Préparer le petit déjeuner",
             "query": "Que boit Jimmy le matin ?",
             "constraints": {
-                "max_tokens": 1000,
-                "memory_types": ["semantic"]
+                "max_tokens": 1000
             }
         })
 
@@ -198,10 +196,10 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
         selected_ids = data['selected_memory_ids']
 
         # Le contexte ne doit contenir qu'UNE SEULE des deux mémoires (celle de plus forte importance, M1)
-        # Mémoires semantic/preference -> routées dans la collection 'preferences'.
+        # Deux réflexes identiques : le filtre de redondance n'en garde qu'un.
         self.assertEqual(len(selected_ids), 1, "L'interférence destructive de redondance aurait dû éliminer la mémoire en doublon.")
-        self.assertIn(m1_content, context_packet['preferences'])
-        self.assertNotIn(m2_content, context_packet['preferences'])
+        self.assertIn(m1_content, context_packet['reflexes'])
+        self.assertNotIn(m2_content, context_packet['reflexes'])
         print("[SUCCESS] Interférence destructive de redondance vérifiée !")
 
     def test_q_em_destructive_interference_contradiction(self):
@@ -224,8 +222,8 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             # Insérer M1 (créée en premier)
             cur.execute(
                 """
-                INSERT INTO memories (tenant_id, agent_id, type, subtype, content, embedding, confidence, importance, status, created_at)
-                VALUES (%s, %s, 'semantic', 'fact', %s, %s, 1.0, 0.7, 'active', '2026-07-09T08:00:00Z')
+                INSERT INTO memories (tenant_id, agent_id, type, compartment, content, embedding, confidence, importance, status, created_at)
+                VALUES (%s, %s, 'semantic', 'savoirs', %s, %s, 1.0, 0.7, 'active', '2026-07-09T08:00:00Z')
                 RETURNING id;
                 """,
                 (tenant_id, agent_id, m1_content, emb1)
@@ -235,8 +233,8 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             # Insérer M2 (créée après)
             cur.execute(
                 """
-                INSERT INTO memories (tenant_id, agent_id, type, subtype, content, embedding, confidence, importance, status, created_at)
-                VALUES (%s, %s, 'semantic', 'fact', %s, %s, 1.0, 0.7, 'active', '2026-07-09T09:00:00Z')
+                INSERT INTO memories (tenant_id, agent_id, type, compartment, content, embedding, confidence, importance, status, created_at)
+                VALUES (%s, %s, 'semantic', 'savoirs', %s, %s, 1.0, 0.7, 'active', '2026-07-09T09:00:00Z')
                 RETURNING id;
                 """,
                 (tenant_id, agent_id, m2_content, emb2)
@@ -261,8 +259,7 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
             "task": "Planifier une réunion",
             "query": "Quelles sont les heures d'ouverture à Paris ?",
             "constraints": {
-                "max_tokens": 1000,
-                "memory_types": ["semantic"]
+                "max_tokens": 1000
             }
         })
 
@@ -273,8 +270,8 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
 
         # Le contexte ne doit contenir que M2 (la plus récente)
         self.assertEqual(len(selected_ids), 1, "La contradiction aurait dû éliminer la mémoire obsolète.")
-        self.assertIn(m2_content, context_packet['facts'])
-        self.assertNotIn(m1_content, context_packet['facts'])
+        self.assertIn(m2_content, context_packet['savoirs'])
+        self.assertNotIn(m1_content, context_packet['savoirs'])
         print("[SUCCESS] Interférence destructive de contradiction vérifiée !")
 
     def test_q_em_classification_and_auto_entanglement(self):
@@ -339,7 +336,7 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
         with self.db_conn.cursor(cursor_factory=RealDictCursor) as cur:
             # Récupérer les souvenirs créés
             cur.execute(
-                "SELECT id, type, subtype, content FROM memories WHERE tenant_id = %s AND agent_id = %s ORDER BY created_at ASC;",
+                "SELECT id, type, compartment, content FROM memories WHERE tenant_id = %s AND agent_id = %s ORDER BY created_at ASC;",
                 (tenant_id, agent_id)
             )
             rows = cur.fetchall()
@@ -350,10 +347,10 @@ class TestQuantumEntanglementMemory(unittest.TestCase):
 
             # Vérifier la classification
             self.assertEqual(err_mem['type'], 'procedural')
-            self.assertEqual(err_mem['subtype'], 'code_error_resolution')
+            self.assertEqual(err_mem['compartment'], 'alertes')
 
             self.assertEqual(bp_mem['type'], 'procedural')
-            self.assertEqual(bp_mem['subtype'], 'coding_best_practices')
+            self.assertEqual(bp_mem['compartment'], 'savoir_faire')
 
             # Vérifier que la relation d'intrication a été créée automatiquement.
             # CORRIGÉ le 11/08 (audit) : le tissage ne produit plus JAMAIS de

@@ -47,7 +47,7 @@ def client(monkeypatch):
 
 
 def _ecrire(client, contenu=CONTENU, **extra):
-    charge = {"agent_id": "agent_idem", "type": "semantic", "subtype": "fact",
+    charge = {"agent_id": "agent_idem", "compartment": "savoirs",
               "content": contenu}
     charge.update(extra)
     return client.post("/memories", json=charge)

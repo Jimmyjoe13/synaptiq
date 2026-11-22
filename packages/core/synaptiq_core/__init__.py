@@ -1,13 +1,16 @@
 """synaptiq_core — logique partagée entre l'API et le worker (embeddings, gouvernance)."""
 
-from synaptiq_core.collections import (
-    FAMILIES,
-    FAMILY_FALLBACK_KEY,
-    SYSTEM_COLLECTIONS,
-    SYSTEM_PACKET_KEYS,
-    Collection,
-    CollectionRegistry,
-    CollectionStore,
+from synaptiq_core.compartments import (
+    ALIAS,
+    COMPARTIMENTS,
+    NOMS,
+    Compartiment,
+    Rangement,
+    catalogue,
+    classer,
+    depuis_ancien,
+    normaliser_extraction,
+    resoudre,
 )
 from synaptiq_core.context_builder import (
     InMemoryStore,
@@ -50,13 +53,6 @@ from synaptiq_core.retrieval import (
     fuse_and_rank,
     reciprocal_rank_fusion,
 )
-from synaptiq_core.taxonomy import (
-    DEFAULT_SUBTYPE,
-    VALID_SUBTYPES,
-    SubtypeMismatch,
-    normalize_extraction,
-    validate_subtype,
-)
 
 __all__ = [
     "Embedder",
@@ -95,21 +91,18 @@ __all__ = [
     "route_memory",
     "estimate_tokens",
     "format_entry",
-    # Collections : le rangement est un objet que l'agent possède, la famille reste au
-    # moteur (elle porte le comportement : intrication, décroissance, section de repli)
-    "Collection",
-    "CollectionRegistry",
-    "CollectionStore",
-    "SYSTEM_COLLECTIONS",
-    "SYSTEM_PACKET_KEYS",
-    "FAMILIES",
-    "FAMILY_FALLBACK_KEY",
-    # Taxonomie partagée par les DEUX chemins d'écriture (API directe et extraction worker)
-    "VALID_SUBTYPES",
-    "DEFAULT_SUBTYPE",
-    "SubtypeMismatch",
-    "validate_subtype",
-    "normalize_extraction",
+    # Compartiments (v0.4) : 9 régions fixes, propriété du moteur. L'agent juge seulement
+    # où ranger ; le moteur classe par similarité quand il ne sait pas.
+    "Compartiment",
+    "COMPARTIMENTS",
+    "NOMS",
+    "ALIAS",
+    "Rangement",
+    "resoudre",
+    "classer",
+    "normaliser_extraction",
+    "depuis_ancien",
+    "catalogue",
     # Recherche hybride : fusion de classements (vectoriel + plein texte)
     "reciprocal_rank_fusion",
     "fuse_and_rank",

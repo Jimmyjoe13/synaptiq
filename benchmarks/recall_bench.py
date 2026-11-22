@@ -64,6 +64,13 @@ def _parse_ts(v):
     return dt.datetime.fromisoformat(v) if v else None
 
 
+def _rangement(m: dict) -> tuple[str, str]:
+    """(famille, compartiment) d'un souvenir de fixture, quelle que soit sa version."""
+    from synaptiq_core.compartments import depuis_ancien, famille_de
+    nom = m.get("compartment") or depuis_ancien(m.get("type"), m.get("subtype"))[0]
+    return famille_de(nom), nom
+
+
 def importer_fixture(conn, fixture: dict) -> dict:
     """Réimporte la fixture sous TENANT_BANC. Retourne l'état d'accès initial par id.
 
@@ -82,17 +89,18 @@ def importer_fixture(conn, fixture: dict) -> dict:
     with conn.cursor() as cur:
         # Périmètre du banc UNIQUEMENT (les arêtes partent en cascade avec les mémoires).
         cur.execute("DELETE FROM memories WHERE tenant_id = %s", (TENANT_BANC,))
-        cur.execute("DELETE FROM memory_collections WHERE tenant_id = %s", (TENANT_BANC,))
 
         lignes = [(
-            m["id"], TENANT_BANC, agent, m["type"], m["subtype"], m["content"], m["summary"],
+            # Fixture v0.4 : `compartment` ; fixture antérieure : (type, subtype) converti
+            # par la même table que la migration (repli par famille pour un nom inconnu).
+            m["id"], TENANT_BANC, agent, *_rangement(m), m["content"], m["summary"],
             m["embedding"], m["confidence"], m["importance"], m["recency_score"],
             m["access_count"], dec(m["last_accessed_at"]), dec(m["created_at"]),
             dec(m["updated_at"]), m["status"], m["version"], json.dumps(m["provenance"] or {}),
             dec(m["occurred_at"]), m["content_hash"],
         ) for m in fixture["memories"]]
         psycopg2.extras.execute_values(cur, """
-            INSERT INTO memories (id, tenant_id, agent_id, type, subtype, content, summary,
+            INSERT INTO memories (id, tenant_id, agent_id, type, compartment, content, summary,
                 embedding, confidence, importance, recency_score, access_count,
                 last_accessed_at, created_at, updated_at, status, version, provenance,
                 occurred_at, content_hash)
@@ -105,13 +113,6 @@ def importer_fixture(conn, fixture: dict) -> dict:
             [(a["source_memory_id"], a["target_memory_id"], a["relation_type"], a["weight"],
               dec(a["created_at"])) for a in fixture["relationships"]])
 
-        for c in fixture["collections"]:
-            cur.execute("""
-                INSERT INTO memory_collections (tenant_id, agent_id, name, family, description,
-                    description_embedding, entangle, packet_key, created_by)
-                VALUES (%s,%s,%s,%s,%s,%s::vector,%s,%s,'agent')""",
-                (TENANT_BANC, agent, c["name"], c["family"], c["description"],
-                 c["description_embedding"], c["entangle"], c["packet_key"]))
     conn.commit()
     return {m["id"]: (m["access_count"], dec(m["last_accessed_at"])) for m in fixture["memories"]}
 

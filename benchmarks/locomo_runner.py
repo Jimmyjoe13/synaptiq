@@ -204,8 +204,7 @@ def context_qem(client: TestClient, agent: str, question: str, max_tokens: int) 
     r = client.post("/context/build", json={
         "agent_id": agent, "session_id": "bench",
         "task": question, "query": question,
-        "constraints": {"max_tokens": max_tokens,
-                        "memory_types": ["semantic", "episodic", "procedural", "working"]},
+        "constraints": {"max_tokens": max_tokens},
     })
     if r.status_code != 200:
         return "", 0

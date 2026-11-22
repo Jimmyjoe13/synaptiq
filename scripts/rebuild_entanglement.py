@@ -47,6 +47,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "packages", "core"))
+from synaptiq_core.compartments import COMPARTIMENTS
 from synaptiq_core.entanglement import VOISINS_EXAMINES, seuil_intrication
 
 # `.env` RACINE, comme `main.py` / `worker.py` / `relay.py`. Un `load_dotenv()` nu cherche à
@@ -64,14 +65,12 @@ TENANT = os.getenv("SYNAPTIQ_TENANT", "default")
 
 # Une seule requête ensembliste plutôt qu'une boucle Python : `CROSS JOIN LATERAL` rejoue le
 # `ORDER BY embedding <=> ... LIMIT n` du chemin d'écriture pour CHAQUE souvenir, en profitant
-# de l'index HNSW. Les collections dont `entangle` est faux sont exclues par la jointure sur
-# `memory_collections` — un rayon marqué non structurant ne doit pas se retrouver tissé ici.
+# de l'index HNSW. Seuls les compartiments qui intriquent (`Compartiment.intrique`) sont
+# tissés : mêmes règles que les deux chemins d'écriture (v0.4).
 SQL_RECONSTRUCTION = """
 INSERT INTO relationships (source_memory_id, target_memory_id, relation_type, weight)
 SELECT s.id, n.id, 'entangled_with', n.sim
 FROM memories s
-LEFT JOIN memory_collections mc
-       ON mc.tenant_id = s.tenant_id AND mc.agent_id = s.agent_id AND mc.name = s.subtype
 CROSS JOIN LATERAL (
     SELECT m.id, (1 - (m.embedding <=> s.embedding)) AS sim
     FROM memories m
@@ -84,9 +83,8 @@ WHERE s.tenant_id = %(tenant)s
   AND (%(agent)s IS NULL OR s.agent_id = %(agent)s)
   AND s.status = 'active'
   AND n.sim > %(seuil)s
-  -- Collection déclarée : son propre flag décide. Collection libre : défaut historique de la
-  -- famille (`procedural` et `semantic` structurent, `episodic` et `working` non).
-  AND COALESCE(mc.entangle, s.type IN ('procedural', 'semantic'))
+  -- Le compartiment décide (épisodes, observations, réflexes et croyances : hors graphe).
+  AND s.compartment = ANY(%(intriquants)s)
 ON CONFLICT (source_memory_id, target_memory_id) DO NOTHING;
 """
 
@@ -185,6 +183,7 @@ def main() -> int:
 
     seuil = args.threshold if args.threshold is not None else seuil_intrication()
     params = {"tenant": TENANT, "agent": args.agent, "seuil": seuil,
+              "intriquants": [c.nom for c in COMPARTIMENTS if c.intrique],
               "voisins": VOISINS_EXAMINES}
 
     conn = psycopg2.connect(DATABASE_URL)

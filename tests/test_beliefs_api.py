@@ -43,15 +43,15 @@ def client(monkeypatch, db):
         yield c
 
 
-def _noter(client, contenu, confiance=0.4, subtype="user_model", **extra):
+def _noter(client, contenu, confiance=0.4, about="user", **extra):
     return client.post("/v1/memories", json={
-        "agent_id": AGENT, "type": "reflective", "subtype": subtype,
+        "agent_id": AGENT, "compartment": "croyances", "about": about,
         "content": contenu, "confidence": confiance, **extra})
 
 
 def _fait(client, contenu):
-    r = client.post("/v1/memories", json={"agent_id": AGENT, "type": "episodic",
-                                          "subtype": "interaction", "content": contenu})
+    r = client.post("/v1/memories", json={"agent_id": AGENT, "compartment": "episodes",
+                                           "content": contenu})
     assert r.status_code == 201, r.text
     return r.json()["memory_id"]
 
@@ -59,7 +59,7 @@ def _fait(client, contenu):
 def test_une_croyance_est_enregistree_puis_listee(client):
     r = _noter(client, "Jimmy prefere qu'on lui propose un plan court avant d'agir")
     assert r.status_code == 201, r.text
-    assert r.json()["collection"] == "user_model"
+    assert r.json()["compartment"] == "croyances"
     croyances = client.get("/v1/beliefs", params={"agent_id": AGENT}).json()["beliefs"]
     assert len(croyances) == 1
     assert croyances[0]["about"] == "user"
@@ -83,14 +83,14 @@ def test_confiance_forte_exige_des_indices(client):
 
 
 def test_un_tiers_peut_etre_nomme(client):
-    r = _noter(client, "Regis prefere recevoir les CSV le lundi", subtype="human_insights")
+    r = _noter(client, "Regis prefere recevoir les CSV le lundi", about="humans")
     assert r.status_code == 201, r.text
     croyances = client.get("/v1/beliefs", params={"agent_id": AGENT, "about": "humans"})
     assert croyances.json()["beliefs"][0]["about"] == "humans"
 
 
 def test_evidence_hors_croyance_refusee(client):
-    r = client.post("/v1/memories", json={"agent_id": AGENT, "type": "semantic",
+    r = client.post("/v1/memories", json={"agent_id": AGENT, "compartment": "savoirs",
                                           "content": "un fait", "evidence": ["x"]})
     assert r.status_code == 422
 
@@ -134,5 +134,5 @@ def test_la_croyance_est_servie_comme_hypothese(client):
         "agent_id": AGENT, "session_id": "s", "task": "t",
         "query": "comment presenter un plan a Jimmy", "constraints": {"max_tokens": 1200}})
     assert r.status_code == 200, r.text
-    assert r.json()["context_packet"]["user_model"] == [
+    assert r.json()["context_packet"]["croyances"] == [
         "(hypothèse, confiance 0.5) Jimmy valide plus vite un plan illustre par un exemple"]

@@ -7,7 +7,7 @@ from synaptiq_core.belief_guard import (
     categorie_sensible,
     valider_croyance,
 )
-from synaptiq_core.taxonomy import normalize_extraction
+from synaptiq_core.compartments import normaliser_extraction
 
 
 @pytest.mark.parametrize("texte,categorie", [
@@ -60,4 +60,7 @@ def test_les_tiers_sont_autorises():
 
 def test_un_extracteur_ne_produit_jamais_de_croyance():
     """Une croyance est formulée délibérément, jamais extraite d'un tour de dialogue."""
-    assert normalize_extraction("reflective", "user_model") == ("semantic", "fact")
+    for demande in ("croyances", "user_model", "human_insights"):
+        rangement = normaliser_extraction(demande, None, {}, famille="reflective")
+        assert rangement.compartiment != "croyances"
+        assert rangement.origine == "moteur"

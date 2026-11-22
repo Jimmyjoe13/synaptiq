@@ -76,6 +76,26 @@ def auth_desactivee_par_defaut(request):
     main.AUTH_REQUIRED = ancien
 
 
+@pytest.fixture(autouse=True)
+def cache_de_contexte_desactive(request):
+    """Désactive le cache Redis de `/context/build` pendant les tests d'intégration.
+
+    Le cache (Phase 1, TTL 60 s) est indexé par (tenant, agent, requête…), pas par le
+    contenu de la base. Deux exécutions rapprochées d'un même test recréent les souvenirs
+    avec de NOUVEAUX identifiants, mais la seconde reçoit le paquet de la première : test
+    instable, constaté le 22/11 sur `test_context_build_ne_sert_pas_un_autre_projet`.
+    Un test qui viserait le cache lui-même le réactive par monkeypatch.
+    """
+    if "integration" not in request.keywords:
+        yield
+        return
+    import apps.api.main as main
+    ancien = main.CONTEXT_CACHE_ENABLED
+    main.CONTEXT_CACHE_ENABLED = False
+    yield
+    main.CONTEXT_CACHE_ENABLED = ancien
+
+
 def pytest_collection_modifyitems(config, items):
     for item in items:
         path = str(item.fspath).replace("\\", "/")

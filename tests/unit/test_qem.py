@@ -23,7 +23,7 @@ def _cand(mem_id, **kw):
     base = {
         "id": mem_id,
         "type": "semantic",
-        "subtype": "fact",
+        "compartment": "savoirs",
         "content": "contenu",
         "confidence": 1.0,
         "importance": 0.5,
@@ -67,8 +67,8 @@ def test_propagation_intrication():
     Réplique en pur la logique de `test_q_em_entanglement_propagation`.
     """
     candidates = {
-        "M1": _cand("M1", type="semantic", subtype="fact", similarity=1.0, score=1.0),
-        "M2": _cand("M2", type="procedural", subtype="rule", similarity=0.0, score=0.0),
+        "M1": _cand("M1", compartment="savoirs", similarity=1.0, score=1.0),
+        "M2": _cand("M2", compartment="reflexes", similarity=0.0, score=0.0),
     }
     relationships = [
         {"source_memory_id": "M1", "target_memory_id": "M2",
@@ -216,7 +216,7 @@ def test_contradicts_reste_symetrique_et_arbitre_par_l_age():
 
 # ─── Le bug de perte silencieuse : tissage -> interférence, bout en bout ──────
 
-def _tisser(subtype_nouveau, id_nouveau, voisins):
+def _tisser(compartiment_nouveau, id_nouveau, voisins):
     """Rejoue `entangle()` sur un curseur double et rend les arêtes au format `qem`."""
     from synaptiq_core import entangle
 
@@ -232,7 +232,7 @@ def _tisser(subtype_nouveau, id_nouveau, voisins):
             return voisins
 
     cur = _Cur()
-    entangle(cur, "t", "a", id_nouveau, subtype_nouveau, [0.1] * 8, threshold=0.7)
+    entangle(cur, "t", "a", id_nouveau, compartiment_nouveau, [0.1] * 8, threshold=0.7)
     return [{"source_memory_id": s, "target_memory_id": c, "relation_type": r, "weight": p}
             for s, c, r, p in cur.aretes]
 
@@ -240,13 +240,13 @@ def _tisser(subtype_nouveau, id_nouveau, voisins):
 def _pratique_et_erreur(ordre_ecriture):
     """Une bonne pratique et le journal d'erreur associé, cosinus 0,74, dans l'ordre donné."""
     ecrit_en_premier, ecrit_en_second = ordre_ecriture
-    sous_types = {"PRATIQUE": "coding_best_practices", "ERREUR": "code_error_resolution"}
+    sous_types = {"PRATIQUE": "savoir_faire", "ERREUR": "alertes"}
     candidates = {
         ecrit_en_premier: _cand(ecrit_en_premier, type="procedural",
-                                subtype=sous_types[ecrit_en_premier],
+                                compartment=sous_types[ecrit_en_premier],
                                 created_at=datetime(2026, 7, 1), score=0.8, similarity=0.8),
         ecrit_en_second: _cand(ecrit_en_second, type="procedural",
-                               subtype=sous_types[ecrit_en_second],
+                               compartment=sous_types[ecrit_en_second],
                                created_at=datetime(2026, 8, 1), score=0.8, similarity=0.8),
     }
     # Le second souvenir écrit tisse vers le premier, déjà en base.
@@ -482,33 +482,31 @@ def test_collapse_respecte_budget():
     # A tient dans le budget (1 <= 1), B est hors budget
     assert selected_ids == ["A"]
     assert token_count == 1
-    assert "un" in packet["facts"]
+    assert "un" in packet["savoirs"]
 
 
-def test_collapse_routage_par_type():
-    """Routage effectif : semantic/fact->facts, procedural/rule->rules,
-    episodic->episodes, working->examples."""
+def test_collapse_routage_par_compartiment():
+    """Chaque souvenir est servi dans la section de SON compartiment."""
     candidates = {
-        "F": _cand("F", type="semantic", subtype="fact", content="fait", score=1.0),
-        "R": _cand("R", type="procedural", subtype="rule", content="regle", score=1.0),
-        "E": _cand("E", type="episodic", subtype="interaction", content="episode", score=1.0),
-        "W": _cand("W", type="working", subtype=None, content="exemple", score=1.0),
+        "F": _cand("F", compartment="savoirs", content="fait", score=1.0),
+        "R": _cand("R", compartment="reflexes", content="regle", score=1.0),
+        "E": _cand("E", compartment="episodes", content="episode", score=1.0),
+        "O": _cand("O", compartment="observations", content="mesure", score=1.0),
     }
     packet, selected_ids, _ = collapse_by_utility(candidates, max_tokens=1000)
-    assert set(selected_ids) == {"F", "R", "E", "W"}
-    assert packet["facts"] == ["fait"]
-    assert packet["rules"] == ["regle"]
+    assert set(selected_ids) == {"F", "R", "E", "O"}
+    assert packet["savoirs"] == ["fait"]
+    assert packet["reflexes"] == ["regle"]
     assert packet["episodes"] == ["episode"]
-    assert packet["examples"] == ["exemple"]
+    assert packet["observations"] == ["mesure"]
 
 
-def test_collapse_packet_toujours_ses_cles_canoniques():
-    """Le context_packet expose toujours ses 9 clés canoniques (7 + 2 croyances), même à vide."""
+def test_collapse_packet_toujours_ses_9_compartiments():
+    """Le context_packet expose toujours les 9 compartiments, dans l'ordre, même à vide."""
     packet, _, _ = collapse_by_utility({}, max_tokens=1000)
-    assert set(packet.keys()) == {
-        "facts", "preferences", "episodes", "rules", "best_practices", "errors", "examples",
-        "user_model", "human_insights",
-    }
+    assert list(packet) == ["reflexes", "decisions", "savoir_faire", "alertes",
+                            "environnement", "savoirs", "episodes", "observations",
+                            "croyances"]
     assert all(v == [] for v in packet.values())
 
 
@@ -520,7 +518,7 @@ def test_collapse_ignore_score_nul():
     }
     packet, selected_ids, _ = collapse_by_utility(candidates, max_tokens=1000)
     assert selected_ids == ["OK"]
-    assert "jette" not in packet["facts"]
+    assert "jette" not in packet["savoirs"]
 
 
 # ─── Priorités : la réponse à la question ne sort pas du paquet (audit 11/08) ─
@@ -539,7 +537,7 @@ def test_collapse_priorite_entre_meme_si_sa_densite_est_faible():
     packet, selected_ids, _ = collapse_by_utility(
         candidates, max_tokens=200, priorites=["TOP"])
     assert "TOP" in selected_ids
-    assert "la reponse " in packet["facts"][0]
+    assert "la reponse " in packet["savoirs"][0]
 
 
 def test_collapse_priorite_annulee_par_l_interference_reste_exclue():
@@ -585,43 +583,46 @@ def test_collapse_sans_priorites_comportement_inchange():
     assert selected_ids == ["FORTE", "FAIBLE"]
 
 
-# ─── Routage correct (helper pur) : type/subtype -> clé du packet ────────────
+# ─── Routage (helper pur) : compartiment -> section du paquet ─────────────────
 
-def test_route_memory_routage_correct():
-    """route_memory implémente le routage INTENDÉ par type/subtype (7 clés)."""
-    assert route_memory("semantic", "preference") == "preferences"
-    assert route_memory("semantic", "fact") == "facts"
-    assert route_memory("episodic", "interaction") == "episodes"
-    assert route_memory("procedural", "coding_best_practices") == "best_practices"
-    assert route_memory("procedural", "code_error_resolution") == "errors"
-    assert route_memory("procedural", "rule") == "rules"
-    assert route_memory("working", None) == "examples"
-    # Une famille inconnue renvoyait `None`, et `collapse_by_utility` retirait alors la
-    # mémoire du paquet — après l'avoir comptée dans `selected_ids` et facturée en tokens.
-    # Elle retombe désormais sur une section de repli (cf. tests/unit/test_collections.py).
-    assert route_memory("inconnu", None) == "facts"
+def test_route_memory_rend_le_compartiment():
+    assert route_memory("savoir_faire") == "savoir_faire"
+    assert route_memory("croyances") == "croyances"
 
 
-def test_collapse_routage_par_soustype():
-    """Le collapse propage le sous-type : les collections logiques dédiées sont remplies.
+def test_route_memory_ne_renvoie_jamais_none():
+    """RÉGRESSION v0.3 : un routage `None` retirait du paquet un souvenir déjà compté et
+    facturé. Un compartiment inconnu (donnée corrompue) retombe sur `savoirs`."""
+    assert route_memory("inconnu") == "savoirs"
+    assert route_memory(None) == "savoirs"
 
-    semantic/preference -> preferences, procedural/coding_best_practices -> best_practices,
-    procedural/code_error_resolution -> errors.
-    """
+
+def test_collapse_plafonne_un_compartiment_sans_bloquer_les_autres():
+    """`parts_max` : un compartiment plafonné cède la place, les autres continuent."""
+    candidates = {f"R{i}": _cand(f"R{i}", compartment="reflexes", content="regle " * 10,
+                                 score=1.0) for i in range(5)}
+    candidates["S"] = _cand("S", compartment="savoirs", content="la reponse", score=0.1)
+    packet, ids, _ = collapse_by_utility(candidates, max_tokens=100,
+                                         parts_max={"reflexes": 0.2})
+    assert len(packet["reflexes"]) == 1        # 13 tokens par réflexe, plafond 20
+    assert "S" in ids
+
+
+def test_collapse_ancres_passent_en_premier():
+    """Les ancres (réflexes injectés d'office) précèdent même les priorités."""
     candidates = {
-        "P": _cand("P", type="semantic", subtype="preference", content="pref", score=1.0),
-        "BP": _cand("BP", type="procedural", subtype="coding_best_practices",
-                    content="bp", score=1.0),
-        "ER": _cand("ER", type="procedural", subtype="code_error_resolution",
-                    content="err", score=1.0),
+        "A": _cand("A", compartment="reflexes", content="reflexe", score=0.01),
+        "P": _cand("P", content="reponse " * 30, score=1.0),
     }
+    _, ids, _ = collapse_by_utility(candidates, max_tokens=45, priorites=["P"], ancres=["A"])
+    assert ids[0] == "A"
+
+
+def test_collapse_croyance_rendue_comme_hypothese():
+    candidates = {"C": _cand("C", compartment="croyances", content="Jimmy aime X",
+                             confidence=0.6, score=1.0)}
     packet, _, _ = collapse_by_utility(candidates, max_tokens=1000)
-    assert packet["preferences"] == ["pref"]
-    assert packet["best_practices"] == ["bp"]
-    assert packet["errors"] == ["err"]
-    # Ces contenus ne doivent plus « fuiter » dans facts/rules.
-    assert packet["facts"] == []
-    assert packet["rules"] == []
+    assert packet["croyances"] == ["(hypothèse, confiance 0.6) Jimmy aime X"]
 
 
 # ─── Selection sous max_tokens ───
@@ -643,13 +644,13 @@ def test_la_date_prefixe_le_souvenir():
     candidates = {"m1": _cand("m1", content="Caroline est allee a un groupe de soutien",
                               score=1.0, occurred_at=datetime(2023, 5, 7))}
     packet, _, _ = collapse_by_utility(candidates, max_tokens=10_000)
-    assert packet["facts"] == ["[2023-05-07] Caroline est allee a un groupe de soutien"]
+    assert packet["savoirs"] == ["[2023-05-07] Caroline est allee a un groupe de soutien"]
 
 
 def test_souvenir_sans_date_inchange():
     candidates = {"m1": _cand("m1", content="Caroline aime les beagles", score=1.0)}
     packet, _, _ = collapse_by_utility(candidates, max_tokens=10_000)
-    assert packet["facts"] == ["Caroline aime les beagles"]
+    assert packet["savoirs"] == ["Caroline aime les beagles"]
 
 
 def test_le_prefixe_est_compte_dans_le_budget():

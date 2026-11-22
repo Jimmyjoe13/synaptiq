@@ -12,17 +12,18 @@ from synaptiq_core.context_builder import (
     build_context_packet,
 )
 
-TOUS_TYPES = ["semantic", "episodic", "procedural", "working", "reflective"]
+TOUS = ["reflexes", "decisions", "savoir_faire", "alertes", "environnement", "savoirs",
+        "episodes", "observations", "croyances"]
 CONFIG = RetrievalConfig(hybrid=False, recency_halflife_days=0.0)
 
 
-def _mem(mem_id, contenu="contenu", type_="semantic", subtype="fact",
+def _mem(mem_id, contenu="contenu", type_="semantic", compartment="savoirs",
          similarity=1.0, embedding=None, importance=0.5, **extra):
     """Ligne telle que la renvoie un MemoryStore (vecteur déjà désérialisé)."""
     ligne = {
         "id": mem_id,
         "type": type_,
-        "subtype": subtype,
+        "compartment": compartment,
         "content": contenu,
         "confidence": 1.0,
         "importance": importance,
@@ -41,7 +42,7 @@ def _mem(mem_id, contenu="contenu", type_="semantic", subtype="fact",
 
 def _construire(store, **kw):
     params = dict(query_vector=[1.0, 0.0, 0.0], query_text="requête",
-                  memory_types=TOUS_TYPES, max_tokens=1000, config=CONFIG,
+                  compartments=TOUS, max_tokens=1000, config=CONFIG,
                   trace_id="trace_test")
     params.update(kw)
     return build_context_packet(store, **params)
@@ -50,12 +51,10 @@ def _construire(store, **kw):
 # ─── Contrat de réponse ──────────────────────────────────────────────────────
 
 def test_magasin_vide_renvoie_les_cles_canoniques():
-    """Contrat stable côté consommateur : le paquet porte toujours ses 9 collections
-    canoniques (les 7 historiques + les 2 sections de croyances du 26/09)."""
+    """Contrat stable côté consommateur : le paquet porte toujours les 9 compartiments,
+    dans l'ordre, même vides."""
     resultat = _construire(InMemoryStore())
-    assert set(resultat["context_packet"]) == {
-        "facts", "preferences", "episodes", "rules", "best_practices", "errors", "examples",
-        "user_model", "human_insights"}
+    assert list(resultat["context_packet"]) == TOUS
     assert all(v == [] for v in resultat["context_packet"].values())
     assert resultat["token_estimate"] == 0
     assert resultat["selected_memory_ids"] == []
@@ -77,18 +76,73 @@ def test_explain_absent_par_defaut():
     assert trace[0]["selection_reason"] == "selected_by_utility_under_token_budget"
 
 
-def test_routage_par_type_et_soustype():
+def test_routage_par_compartiment():
     store = InMemoryStore([
-        _mem("F", contenu="un fait", subtype="fact"),
-        _mem("P", contenu="une préférence", subtype="preference",
+        _mem("F", contenu="un fait"),
+        _mem("D", contenu="une décision", compartment="decisions",
              embedding=[0.0, 1.0, 0.0]),
-        _mem("R", contenu="une règle", type_="procedural", subtype="rule",
+        _mem("A", contenu="une erreur résolue", type_="procedural", compartment="alertes",
              embedding=[0.0, 0.0, 1.0]),
     ])
     packet = _construire(store)["context_packet"]
-    assert packet["facts"] == ["un fait"]
-    assert packet["preferences"] == ["une préférence"]
-    assert packet["rules"] == ["une règle"]
+    assert packet["savoirs"] == ["un fait"]
+    assert packet["decisions"] == ["une décision"]
+    assert packet["alertes"] == ["une erreur résolue"]
+
+
+# ─── Comportements propres aux compartiments (v0.4) ──────────────────────────
+
+def test_les_reflexes_sont_injectes_quelle_que_soit_la_question():
+    """Tronc cérébral : un réflexe sans aucun rapport avec la requête entre quand même."""
+    store = InMemoryStore([
+        _mem("Q", contenu="la réponse"),
+        _mem("R", contenu="toujours tutoyer", type_="procedural", compartment="reflexes",
+             similarity=0.0, embedding=[0.0, 0.0, 1.0], importance=0.9),
+    ])
+    # La recherche ne ramène que Q : le magasin en mémoire filtre sur les compartiments
+    # demandés, on l'en empêche en ne demandant pas `reflexes` à la recherche.
+    store.fetch_candidates = lambda v, t, c: [m for m in store.memoires.values()
+                                              if m["id"] == "Q"]
+    resultat = _construire(store, explain=True)
+    assert resultat["context_packet"]["reflexes"] == ["toujours tutoyer"]
+    assert resultat["selected_memory_ids"][0] == "R"
+    assert resultat["retrieval_trace"][0]["anchor"] is True
+
+
+def test_pas_d_injection_si_les_reflexes_ne_sont_pas_demandes():
+    store = InMemoryStore([_mem("R", contenu="toujours tutoyer", compartment="reflexes")])
+    resultat = _construire(store, compartments=["savoirs"])
+    assert resultat["context_packet"]["reflexes"] == []
+
+
+def test_injection_desactivable():
+    store = InMemoryStore([_mem("R", contenu="toujours tutoyer", compartment="reflexes")])
+    store.fetch_candidates = lambda v, t, c: []
+    resultat = _construire(store, config=RetrievalConfig(hybrid=False, reflexes_injectes=0))
+    assert resultat["selected_memory_ids"] == []
+
+
+def test_l_oubli_depend_du_compartiment():
+    """Même âge, même demi-vie d'instance : l'observation s'efface 8x plus vite que le
+    savoir-faire (facteurs 0,5 et 4)."""
+    age = 14 * 86400.0
+    store = InMemoryStore([
+        _mem("O", compartment="observations", age_seconds=age),
+        _mem("S", compartment="savoir_faire", age_seconds=age, embedding=[0.0, 1.0, 0.0]),
+        _mem("R", compartment="reflexes", age_seconds=age, embedding=[0.0, 0.0, 1.0]),
+    ])
+    trace = {e["memory_id"]: e for e in _construire(
+        store, explain=True, explain_level="all",
+        config=RetrievalConfig(hybrid=False, recency_halflife_days=14.0))["retrieval_trace"]}
+    assert round(trace["O"]["recency_factor"], 3) == 0.25
+    assert round(trace["S"]["recency_factor"], 3) == round(0.5 ** 0.25, 3)
+    assert trace["R"]["recency_factor"] == 1.0
+
+
+def test_les_alertes_pesent_plus_lourd():
+    store = InMemoryStore([_mem("A", compartment="alertes")])
+    trace = _construire(store, explain=True)["retrieval_trace"]
+    assert trace[0]["score"] == 1.15
 
 
 # ─── Complétion du graphe d'intrication ──────────────────────────────────────
@@ -109,8 +163,8 @@ def test_intrication_ramene_un_voisin_non_trouve_par_la_recherche():
     config = RetrievalConfig(hybrid=False, recency_halflife_days=0.0,
                              entangle_damping=0.5, entangle_max_hops=1)
     packet = _construire(store, config=config)["context_packet"]
-    assert "point d'entrée" in packet["facts"]
-    assert "ramenée par le graphe" in packet["facts"]
+    assert "point d'entrée" in packet["savoirs"]
+    assert "ramenée par le graphe" in packet["savoirs"]
 
 
 def test_intrication_desactivee_ne_ramene_rien():
@@ -124,7 +178,7 @@ def test_intrication_desactivee_ne_ramene_rien():
                                      embedding=[0.0, 1.0, 0.0], similarity=0.0)
     config = RetrievalConfig(hybrid=False, recency_halflife_days=0.0, entangle_max_hops=0)
     packet = _construire(store, config=config)["context_packet"]
-    assert "ramenée par le graphe" not in packet["facts"]
+    assert "ramenée par le graphe" not in packet["savoirs"]
 
 
 def test_l_isolation_repose_sur_le_magasin_pas_sur_l_orchestration():
@@ -301,10 +355,10 @@ def test_record_access_false_n_ecrit_rien():
 
 
 
-# ─── Croyances (famille `reflective`, lot C) ─────────────────────────────────
+# ─── Croyances (compartiment `croyances`, lot C) ─────────────────────────────
 
 def _croyance(mem_id, contenu, confiance, **kw):
-    return _mem(mem_id, contenu=contenu, type_="reflective", subtype="user_model",
+    return _mem(mem_id, contenu=contenu, type_="reflective", compartment="croyances",
                 confidence=confiance, **kw)
 
 
@@ -312,7 +366,7 @@ def test_une_croyance_est_rendue_comme_une_hypothese():
     """Jamais comme un fait : le modèle doit savoir que c'est une hypothèse de l'agent."""
     store = InMemoryStore([_croyance("B", "Jimmy prefere decider vite", 0.6)])
     resultat = _construire(store, config=RetrievalConfig(hybrid=False))
-    assert resultat["context_packet"]["user_model"] == [
+    assert resultat["context_packet"]["croyances"] == [
         "(hypothèse, confiance 0.6) Jimmy prefere decider vite"]
 
 

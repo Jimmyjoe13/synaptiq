@@ -54,9 +54,14 @@ COLLECTIONS_GLOBALES = {"preference", "jimmy_workflow", "session_log"}
 
 
 def classer(contenu: str, subtype: str | None,
-            mots_cles: dict[str, list[str]]) -> tuple[str | None, str, str]:
-    """(projet ou None, méthode, confiance) pour un souvenir."""
-    if subtype in COLLECTIONS_GLOBALES:
+            mots_cles: dict[str, list[str]],
+            compartiment: str | None = None) -> tuple[str | None, str, str]:
+    """(projet ou None, méthode, confiance) pour un souvenir.
+
+    `subtype` = ancien nom de collection (`memories.legacy_subtype` depuis la v0.4) ; les
+    réflexes (préférences, règles de travail) sont transverses par nature.
+    """
+    if subtype in COLLECTIONS_GLOBALES or compartiment == "reflexes":
         return None, "collection_globale", "haute"
     texte = contenu.lower()
     hits = {p: sum(len(re.findall(m, texte)) for m in motifs)
@@ -94,7 +99,7 @@ def main() -> int:
     conn = psycopg2.connect(args.dsn, options="-c default_transaction_read_only=on")
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT id, subtype, content FROM memories
+            SELECT id, legacy_subtype, content, compartment FROM memories
             WHERE tenant_id = %s AND agent_id = %s AND status = 'active' AND project IS NULL
             ORDER BY created_at
         """, (args.tenant, args.agent))
@@ -106,8 +111,8 @@ def main() -> int:
     with open(out, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["id", "projet_propose", "methode", "confiance", "extrait"])
-        for mem_id, subtype, contenu in lignes:
-            projet, methode, confiance = classer(contenu, subtype, mots_cles)
+        for mem_id, subtype, contenu, compartiment in lignes:
+            projet, methode, confiance = classer(contenu, subtype, mots_cles, compartiment)
             compte[projet or "(global)"] = compte.get(projet or "(global)", 0) + 1
             w.writerow([mem_id, projet or "", methode, confiance,
                         contenu[:140].replace("\n", " ")])

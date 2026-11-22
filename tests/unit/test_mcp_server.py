@@ -74,7 +74,7 @@ def test_agent_id_n_est_pas_un_parametre_d_outil(outil):
 def test_l_identite_vient_de_l_environnement(appels, monkeypatch):
     enregistres, _ = appels
     monkeypatch.setattr(mcp_server, "SYNAPTIQ_AGENT_ID", "agent_configure")
-    mcp_server.store_memory.fn(content="un fait", memory_type="semantic")
+    mcp_server.store_memory.fn(content="un fait")
     assert enregistres[0]["payload"]["agent_id"] == "agent_configure"
 
 
@@ -144,7 +144,7 @@ def test_sans_identite_les_outils_refusent_plutot_que_de_lire_a_cote(outil, monk
 
     fonction = getattr(mcp_server, outil).fn
     arguments = {
-        "store_memory": {"content": "x", "memory_type": "semantic"},
+        "store_memory": {"content": "x"},
         "recall_memories": {"query": "x"},
         "build_context": {"task": "t", "query": "q"},
     }[outil]
@@ -273,25 +273,23 @@ def test_le_retry_ne_masque_pas_une_panne_durable(monkeypatch):
 
 def test_store_memory_appelle_le_bon_endpoint(appels):
     enregistres, _ = appels
-    resultat = mcp_server.store_memory.fn(content="un fait", memory_type="semantic",
-                                          subtype="fact")
+    resultat = mcp_server.store_memory.fn(content="un fait", compartment="savoirs")
     assert enregistres[0]["url"].endswith("/v1/memories")
-    assert enregistres[0]["payload"]["type"] == "semantic"
-    assert enregistres[0]["payload"]["subtype"] == "fact"
+    assert enregistres[0]["payload"]["compartment"] == "savoirs"
+    assert "type" not in enregistres[0]["payload"]
     assert "mem-1" in resultat
 
 
 def test_recall_memories_formate_les_resultats(appels):
     enregistres, reponse = appels
     reponse["charge"] = {"memories": [
-        {"type": "semantic", "subtype": "preference", "content": "mails courts",
-         "confidence": 0.9},
+        {"compartment": "reflexes", "content": "mails courts", "confidence": 0.9},
     ]}
     resultat = mcp_server.recall_memories.fn(query="style")
     assert enregistres[0]["url"].endswith("/v1/retrieve")
     assert "mails courts" in resultat
-    # Le type est mis en capitales, le sous-type reste tel quel.
-    assert "[SEMANTIC / preference]" in resultat
+    # Le compartiment est rendu par sa région et son titre.
+    assert "[TRONC CÉRÉBRAL - RÉFLEXES]" in resultat
 
 
 def test_recall_memories_sans_resultat(appels):
@@ -300,19 +298,25 @@ def test_recall_memories_sans_resultat(appels):
     assert "Aucun souvenir" in mcp_server.recall_memories.fn(query="inconnu")
 
 
-def test_build_context_aplati_les_7_collections(appels):
+def test_build_context_aplati_les_compartiments(appels):
     enregistres, reponse = appels
     reponse["charge"] = {
         "token_estimate": 42,
-        "context_packet": {"facts": ["un fait"], "preferences": ["une pref"],
-                           "errors": ["une erreur"]},
+        "context_packet": {"reflexes": ["une regle"], "savoirs": ["un fait"],
+                           "alertes": ["une erreur"], "croyances": ["(hypothèse) x"],
+                           "decisions": []},
     }
     resultat = mcp_server.build_context.fn(task="tache", query="requete")
     assert enregistres[0]["url"].endswith("/v1/context/build")
+    # Aucune liste de compartiments imposée : le serveur prend les 9.
+    assert "compartments" not in enregistres[0]["payload"]["constraints"]
     assert "42" in resultat
-    assert "[FAITS] un fait" in resultat
-    assert "[PREFERENCES] une pref" in resultat
-    assert "[ERREURS] une erreur" in resultat
+    assert "[TRONC CÉRÉBRAL - RÉFLEXES] une regle" in resultat
+    assert "[LOBE TEMPORAL - SAVOIRS] un fait" in resultat
+    assert "[AMYGDALE - ALERTES] une erreur" in resultat
+    assert "(hypotheses)" in resultat
+    # Les sections vides ne produisent aucune ligne.
+    assert "DÉCISIONS" not in resultat
 
 
 def test_une_panne_sort_en_erreur_de_protocole(monkeypatch):
@@ -333,7 +337,7 @@ def test_une_panne_sort_en_erreur_de_protocole(monkeypatch):
 
     monkeypatch.setattr(mcp_server.requests, "post", _post_casse)
     with pytest.raises(ToolError, match="injoignable"):
-        mcp_server.store_memory.fn(content="x", memory_type="semantic")
+        mcp_server.store_memory.fn(content="x")
 
 
 # ─── Idempotence de l'écriture directe (correctif du 01/08) ──────────────────
@@ -346,9 +350,10 @@ def test_un_doublon_est_annonce_comme_tel_a_l_agent(appels):
     """
     _, reponse = appels
     reponse["charge"] = {"status": "duplicate", "memory_id": "mem-existante",
-                         "collection": "facts", "canonical_subtype": True}
+                         "compartment": "savoirs", "region": "Lobe temporal",
+                         "compartment_origin": "agent"}
 
-    message = mcp_server.store_memory.fn(content="un fait", memory_type="semantic")
+    message = mcp_server.store_memory.fn(content="un fait")
 
     assert "DEJA PRESENT" in message
     assert "mem-existante" in message
@@ -358,9 +363,10 @@ def test_un_doublon_est_annonce_comme_tel_a_l_agent(appels):
 def test_une_creation_reste_annoncee_comme_un_succes(appels):
     _, reponse = appels
     reponse["charge"] = {"status": "created", "memory_id": "mem-1",
-                         "collection": "facts", "canonical_subtype": True}
+                         "compartment": "savoirs", "region": "Lobe temporal",
+                         "compartment_origin": "agent"}
 
-    message = mcp_server.store_memory.fn(content="un fait", memory_type="semantic")
+    message = mcp_server.store_memory.fn(content="un fait")
 
     assert "[SUCCESS]" in message
     assert "DEJA PRESENT" not in message

@@ -130,8 +130,8 @@ class TestSynaptiqIntegration(unittest.TestCase):
 
             self.assertEqual(len(memories), 1, "La mémoire aurait dû être créée.")
             memory = memories[0]
-            self.assertEqual(memory['type'], 'semantic')
-            self.assertEqual(memory['subtype'], 'preference')
+            self.assertEqual(memory['type'], 'procedural')
+            self.assertEqual(memory['compartment'], 'reflexes')
             self.assertEqual(memory['status'], 'active')
             self.assertIn("courts et concis", memory['content'])
 
@@ -201,8 +201,7 @@ class TestSynaptiqIntegration(unittest.TestCase):
             "task": "Rédiger un e-mail commercial",
             "query": "Quel style utiliser ?",
             "constraints": {
-                "max_tokens": 1000,
-                "memory_types": ["semantic"]
+                "max_tokens": 1000
             }
         })
 
@@ -210,11 +209,11 @@ class TestSynaptiqIntegration(unittest.TestCase):
         data = response.json()
 
         context_packet = data['context_packet']
-        # La mémoire active est semantic/preference -> collection 'preferences'.
+        # La préférence active vit dans le compartiment `reflexes` (tronc cérébral).
         # Elle ne doit contenir QUE la préférence active ("très détaillés et formels").
-        self.assertEqual(len(context_packet['preferences']), 1)
-        self.assertIn("détaillés et formels", context_packet['preferences'][0])
-        self.assertNotIn("courts et concis", context_packet['preferences'][0])
+        self.assertEqual(len(context_packet['reflexes']), 1)
+        self.assertIn("détaillés et formels", context_packet['reflexes'][0])
+        self.assertNotIn("courts et concis", context_packet['reflexes'][0])
 
         client_ctx.__exit__(None, None, None)
         print("\n[SUCCESS] Test d'integration de bout en bout reussi avec succes !")

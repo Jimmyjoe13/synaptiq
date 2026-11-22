@@ -44,7 +44,7 @@ def _non(existant, nouveau):
 def test_ignore_les_non_preferences():
     cur = FakeCursor()
     assert handle_contradictions(cur, "t", "a",
-                                 {"type": "semantic", "subtype": "fact", "content": "x"},
+                                 {"compartment": "savoirs", "content": "x"},
                                  [0.1] * 384, judge=_oui) == []
     assert cur.calls == []  # aucune requête, même de lecture
 
@@ -53,7 +53,7 @@ def test_sans_embedding_aucun_archivage():
     """Sans embedding, le pré-filtre est impossible : on ne touche à rien."""
     cur = FakeCursor()
     assert handle_contradictions(cur, "t", "a",
-                                 {"type": "semantic", "subtype": "preference", "content": "x"},
+                                 {"compartment": "reflexes", "content": "x"},
                                  None, judge=_oui) == []
     assert cur.calls == []
 
@@ -68,7 +68,7 @@ def test_aucune_preference_proche_aucun_appel_au_juge():
 
     cur = FakeCursor(proches=[])
     assert handle_contradictions(cur, "t", "a",
-                                 {"type": "semantic", "subtype": "preference", "content": "x"},
+                                 {"compartment": "reflexes", "content": "x"},
                                  [0.1] * 384, judge=juge_espion) == []
     assert appels == []
     assert len(cur.calls) == 1                      # le SELECT de pré-filtre, rien de plus
@@ -85,7 +85,7 @@ def test_proche_mais_pas_contradictoire_est_conservee():
     cur = FakeCursor(proches=[("id-1", "Jimmy préfère les mails courts")])
     archives = handle_contradictions(
         cur, "t", "a",
-        {"type": "semantic", "subtype": "preference",
+        {"compartment": "reflexes",
          "content": "Jimmy préfère les mails en français"},
         [0.1] * 384, judge=_non,
     )
@@ -100,7 +100,7 @@ def test_contradiction_confirmee_archive():
     cur = FakeCursor(proches=[("id-1", "Jimmy préfère MySQL")])
     archives = handle_contradictions(
         cur, "t", "a",
-        {"type": "semantic", "subtype": "preference", "content": "Jimmy préfère PostgreSQL"},
+        {"compartment": "reflexes", "content": "Jimmy préfère PostgreSQL"},
         [0.1] * 384, judge=_oui,
     )
     assert archives == ["id-1"]
@@ -113,7 +113,7 @@ def test_verdict_par_preference_seules_les_contredites_partent():
                               ("archive-moi", "préférence contredite")])
     archives = handle_contradictions(
         cur, "t", "a",
-        {"type": "semantic", "subtype": "preference", "content": "nouvelle"},
+        {"compartment": "reflexes", "content": "nouvelle"},
         [0.1] * 384,
         judge=lambda existant, nouveau: existant == "préférence contredite",
     )
@@ -123,7 +123,7 @@ def test_verdict_par_preference_seules_les_contredites_partent():
 def test_prefiltre_est_scope_tenant_agent_et_seuil():
     cur = FakeCursor(proches=[])
     handle_contradictions(cur, "tenant1", "agent1",
-                          {"type": "semantic", "subtype": "preference", "content": "x"},
+                          {"compartment": "reflexes", "content": "x"},
                           [0.1] * 384, threshold=0.9, judge=_non)
     query, params = cur.calls[0]
     assert "embedding <=>" in query       # scoping sémantique par pgvector
@@ -141,7 +141,7 @@ def test_prefiltre_confine_au_projet():
     """
     cur = FakeCursor(proches=[])
     handle_contradictions(cur, "tenant1", "agent1",
-                          {"type": "semantic", "subtype": "preference", "content": "x"},
+                          {"compartment": "reflexes", "content": "x"},
                           [0.1] * 384, threshold=0.9, judge=_non, project="emile")
     query, params = cur.calls[0]
     assert "project IS NOT DISTINCT FROM %s" in query
