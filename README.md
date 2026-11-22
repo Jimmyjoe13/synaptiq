@@ -126,7 +126,7 @@ in the transactional outbox, and nothing ever consolidates it. `/v1/health` repo
 ```bash
 # Write a consolidated memory directly
 curl -X POST http://127.0.0.1:8000/v1/memories -H 'Content-Type: application/json' -d '{
-  "agent_id": "george", "type": "semantic", "subtype": "preference",
+  "agent_id": "george", "compartment": "reflexes",
   "content": "Jimmy prefers short progress reports, in French." }'
 
 # Ask for a context packet before calling your LLM
@@ -157,11 +157,11 @@ graph LR
 
 | Component | Path | Role |
 |---|---|---|
-| **API** | `apps/api` | Ingestion, retrieval, context assembly, collection management. |
+| **API** | `apps/api` | Ingestion, retrieval, context assembly, compartment routing. |
 | **Relay** | `apps/relay` | Publishes the transactional outbox to Redis. Without it, `/events` is a silent black hole. |
 | **Worker** | `apps/worker` | Consumes the stream: extract → embed → entangle. Consumer group, ACK, bounded retries, DLQ. |
-| **Core** | `packages/core` | Pure Q-EM engine, pluggable `Embedder`, governance, collection registry. Zero I/O, 96% covered. |
-| **MCP** | `apps/mcp` | Six tools over MCP (`stdio` / `http`). |
+| **Core** | `packages/core` | Pure Q-EM engine, pluggable `Embedder`, governance, the 9 compartments. Zero I/O, 96% covered. |
+| **MCP** | `apps/mcp` | Seven tools over MCP (`stdio` / `http`). |
 | **SDKs** | `packages/sdk-python`, `packages/sdk-typescript` | Native clients. |
 
 **Write reliability.** `/events` writes the event *and* its outbox row in a single
@@ -195,72 +195,49 @@ The algorithmic core lives in `packages/core/synaptiq_core/qem.py`: **pure funct
 fully unit-tested.** Every threshold is an environment variable, read at call time, so an
 ablation study needs no redeploy.
 
-### Families and collections
+### Compartments: a memory organised like a brain
 
-A memory carries a **family** and a **collection**. The distinction is the whole design:
+Since v0.4 a memory lives in one of **nine fixed compartments**, each modelled on a region of
+the human brain and each carrying its own **behaviour**. The agent creates nothing: it only
+judges where a memory belongs. (Until v0.3 agents created their own collections; a production
+audit found 80 of them, a third holding a single memory, near-duplicates everywhere, and the
+same collection spread across three families — hence three different behaviours.)
 
-|  | **Family** | **Collection** |
-|---|---|---|
-| Column | `memories.type` | `memories.subtype` |
-| Values | `semantic` · `episodic` · `procedural` · `working` — **closed** | free, agent-defined |
-| Owner | the engine | the agent |
-| Meaning | a **behaviour**: entanglement, decay, fallback section | a **label**: which shelf, which packet section |
-
-The family is not a filing category. It decides whether a memory is woven into the graph, how
-it decays, and where it falls back. That is why it stays closed — and why the agent gets full
-freedom on the layer above it.
+| Compartment | Brain region | What goes there | Behaviour |
+|---|---|---|---|
+| `reflexes` | Brain stem | Hard rules, firm user preferences, guardrails | **Injected into every context**, never forgotten, ≤ 20 % of the budget |
+| `decisions` | Frontal lobe | Decisions and their rationale, goals, plans | Slow forgetting, entangled |
+| `savoir_faire` | Cerebellum | Procedures, playbooks, coding conventions | Very slow forgetting, entangled |
+| `alertes` | Amygdala | Resolved errors, incidents, traps not to repeat | Weighted ×1.15 at recall, slow forgetting |
+| `environnement` | Parietal lobe | Map of the terrain: servers, access, paths, ports | Slow forgetting, entangled |
+| `savoirs` | Temporal lobe | Durable facts, project state, definitions | Medium forgetting, entangled |
+| `episodes` | Hippocampus | Session log, interactions, milestones | Fast forgetting, outside the graph |
+| `observations` | Occipital lobe | Raw findings: measurements, audit results, logs | Fastest forgetting, outside the graph |
+| `croyances` | Prefrontal cortex | The agent's hypotheses about the user and people | Never decays, rendered as *"(hypothesis, confidence x)"*, ≤ 15 % of the budget, written only through `note_belief` |
 
 ```bash
-curl -X POST http://127.0.0.1:8000/v1/collections -H 'Content-Type: application/json' -d '{
-  "agent_id": "george", "name": "clients_paca", "family": "semantic",
-  "description": "Clients and prospects in the PACA region.", "entangle": true }'
+curl -X POST http://127.0.0.1:8000/v1/memories -H 'Content-Type: application/json' -d '{
+  "agent_id": "george", "compartment": "alertes",
+  "content": "pip resolved starlette too far; pin fastmcp in the same install command." }'
 ```
 
-Seven collections ship with the engine and back the canonical packet sections:
-
-| Collection | Family | Packet section |
-|---|---|---|
-| `fact` · `preference` | `semantic` | `facts` · `preferences` |
-| `interaction` | `episodic` | `episodes` |
-| `rule` · `coding_best_practices` · `code_error_resolution` | `procedural` | `rules` · `best_practices` · `errors` |
-| `scratch` | `working` | `examples` |
+**Filing never leads nowhere.** `compartment` is optional: when it is missing or unknown, the
+engine classifies the memory by similarity with each compartment's prototype (its description
+and examples, embedded with the instance's own model) — and the response always says where the
+memory went and who decided (`compartment_origin`: `agent`, `alias`, `moteur`, `existant`).
+An old v0.3 collection name (`preference`, `code_error_resolution`…) is converted through a
+fixed alias table, so existing clients keep working during the transition.
 
 > [!IMPORTANT]
-> **`context_packet` does not have a fixed number of keys.** The seven canonical sections are
-> always present, and every collection the agent declared adds one — **even when empty**, so
-> the response shape never depends on whether there were hits. Iterate over the packet's
-> entries; never read seven hardcoded keys.
+> **`context_packet` has a fixed shape**: nine sections, always present, in the order above,
+> even when empty. The internal family (`memories.type`) is now *derived* from the compartment
+> and no longer accepted from callers. `GET /v1/compartments` lists the compartments with the
+> agent's memory count in each.
 
-**`entangle` is the setting that moves recall quality.** It used to be the instance-wide
-`QEM_ENTANGLE_TYPES`, so `episodic` wove no graph edges at all, for anyone. An agent can now
-mark one episodic collection as structuring (meeting notes, say) while raw interaction logs
-stay out — feeding the multi-hop path without polluting the graph.
-
-Writing to an undeclared collection is accepted and routed to the family's fallback section —
-and the response says so explicitly (`collection`, `canonical_subtype`), so an agent is never
-left believing in a filing that did not happen.
-
-<details>
-<summary><strong>Keeping a self-built taxonomy readable</strong></summary>
-
-<br>
-
-Give a model the right to create a category and it creates one per nuance: `clients_paca`,
-then `clients_region_paca`, then `prospects_paca`. None is wrong, and the result is a memory
-where nothing can be found. Four guardrails:
-
-| Guardrail | Behaviour |
-|---|---|
-| **Semantic duplicate check** | Descriptions are embedded and compared. Above `COLLECTION_DUP_THRESHOLD` (0.85), creation is refused **and names the near collection**. Unique names protect nothing here — the engine is turned against its own drift. |
-| **Cap** | `MAX_COLLECTIONS_PER_AGENT` (50), surfaced in the listing so it is anticipated rather than hit. |
-| **Merge** | `POST /v1/collections/merge`. Without it a taxonomy can only grow. Memories are relabelled, never destroyed; system collections and cross-family merges are refused. |
-| **Dormant shelves** | Declared but still empty after `COLLECTION_STALE_DAYS` (14) → flagged `stale`. A flaw nobody sees is a flaw nobody fixes. |
-
-There is deliberately **no cap on packet sections**: rendering only prints sections that have
-content, so forty collections still produce a prompt with no empty rubrics — and a cap would
-break the guarantee that a declared collection always appears in the packet's shape.
-
-</details>
+Migrating an existing instance: the `20261122_compartments` migration converts every memory
+with a frozen copy of the alias table (keeping the old name in `legacy_subtype`), then
+`scripts/reclassify_compartments.py` proposes a similarity-based compartment for the memories
+the table could only file by family — as a CSV to review before `--apply`.
 
 ### Contradictions
 
@@ -281,12 +258,11 @@ Base path `/v1`. Unversioned aliases are kept for backward compatibility.
 |:---:|---|---|
 | `GET` | `/v1/health` | Postgres, Redis and **ingestion** status. `degraded` if any is unhealthy. |
 | `POST` | `/v1/events` | Async ingestion, transactional outbox, idempotent via `idempotency_key`. |
-| `POST` | `/v1/memories` | Direct write of a consolidated memory. **Idempotent on content** — a retry returns the same `memory_id` with `status: "duplicate"`. Returns the resolved `collection`. |
-| `POST` | `/v1/retrieve` | Hybrid search (vector + full-text, RRF), filterable by family and collection. |
+| `POST` | `/v1/memories` | Direct write of a consolidated memory. **Idempotent on content** — a retry returns the same `memory_id` with `status: "duplicate"`. Returns the resolved `compartment` and who chose it. |
+| `POST` | `/v1/retrieve` | Hybrid search (vector + full-text, RRF), filterable by compartment. |
 | `POST` | `/v1/context/build` | Q-EM context packet under a token budget. `explain=true` adds a `retrieval_trace`. |
-| `GET` | `/v1/collections` | The agent's taxonomy: volumes, quota, dormant shelves. |
-| `POST` | `/v1/collections` | Declare a collection. |
-| `POST` | `/v1/collections/merge` | Pour one collection into another; the source is dropped. |
+| `GET` | `/v1/compartments` | The nine compartments, their behaviour and the agent's memory count in each. |
+| `GET` | `/v1/beliefs` · `POST` `/v1/beliefs/{id}/contest` | What the agent thinks of the user — readable and contestable. |
 | `DELETE` | `/v1/memories` | GDPR purge — `admin` scope **and** `?confirm=<tenant_id>`. Optional `?agent_id=`. |
 | `GET` | `/metrics` | Prometheus exposition. |
 
@@ -307,16 +283,16 @@ client = SynaptiqClient("http://127.0.0.1:8000", api_key="your_api_key")
 client.capture(agent_id="george", session_id="s1",
                content="User prefers concise progress reports in English.")
 
-# Give the agent its own shelf
-client.create_collection(agent_id="george", name="clients_paca", family="semantic",
-                         description="Clients and prospects in the PACA region.")
+# File a memory in a compartment (omit it and the engine classifies)
+client.store_memory(agent_id="george", compartment="savoir_faire",
+                    content="Run the full test suite before any deployment.")
 
 # Rehydrate a compact context packet before calling the LLM
 ctx = client.build_context(agent_id="george", session_id="s1",
                            task="Draft the weekly update",
                            query="format and language preferences")
 
-for section, items in ctx["context_packet"].items():   # iterate — the keys are dynamic
+for section, items in ctx["context_packet"].items():   # the nine compartments, in order
     for item in items:
         print(f"[{section}] {item}")
 print(ctx["token_estimate"])
@@ -347,16 +323,15 @@ for (const [section, items] of Object.entries(ctx.context_packet)) {
 
 ## MCP server
 
-Six tools, exposed to Claude Desktop, Cursor, Codex CLI, antigravity CLI, or any MCP client:
+Seven tools, exposed to Claude Desktop, Cursor, Codex CLI, antigravity CLI, or any MCP client:
 
 | Tool | Purpose |
 |---|---|
-| `store_memory` | Write a memory — and report which section it landed in. |
-| `recall_memories` | Hybrid search, filterable by family and collection. |
-| `build_context` | Assemble a Q-EM packet under a token budget. |
-| `list_collections` | The agent's taxonomy, with volumes, quota and dormant shelves. |
-| `create_collection` | Declare a new shelf. |
-| `merge_collections` | Pour one collection into another. |
+| `store_memory` | Write a memory into a compartment — and report where it landed and who decided. |
+| `list_compartments` | The nine compartments, their behaviour and volumes. |
+| `recall_memories` | Hybrid search, filterable by compartment. |
+| `build_context` | Assemble a Q-EM packet under a token budget, reflexes always included. |
+| `note_belief` · `list_beliefs` · `contest_belief` | The agent's hypotheses about the user, under guardrails. |
 
 ```json
 { "mcpServers": { "synaptiq": { "serverUrl": "http://127.0.0.1:8765/mcp/" } } }
@@ -369,7 +344,7 @@ so no prompt can make the model act as another agent.
 trade-off), Docker and host installs, client configuration, verification, troubleshooting.
 
 📖 **[Agent integration guide](docs/agent-integration.md)** — the other half of the job: how to
-make an agent actually *use* the memory well. Designing its collections, writing memories that
+make an agent actually *use* the memory well. Filing in the right compartment, writing memories that
 survive being recalled alone, `build_context` vs. raw search — and the four asymmetries that
 degrade recall in silence, starting with the one that matters most: **a direct write to
 `/v1/memories` builds no `entangled_with` edges**, so an agent that only calls `store_memory`
@@ -393,7 +368,7 @@ SYNAPTIQ_AUTH_REQUIRED=true
 ```
 
 📖 **[Full configuration reference](docs/configuration.md)** — storage, embeddings, LLM
-extraction, retrieval, Q-EM thresholds, collections, ingestion, security, observability.
+extraction, retrieval, Q-EM thresholds, compartments, ingestion, security, observability.
 
 > [!CAUTION]
 > **Never change `EMBEDDING_MODEL` on a populated instance without re-embedding.** Two

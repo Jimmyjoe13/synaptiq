@@ -13,6 +13,74 @@
 >   OpenRouter) et `a0b844b`. Le journal avait ces trous avant les tags ; les combler
 >   a posteriori aurait demande d'inventer des notes de version.
 
+## 0.4.0 — les COMPARTIMENTS : une mémoire rangée comme un cerveau (22/11/2026)
+
+Décision de Jimmy du 22/11, après l'audit du même jour : les collections créées librement par
+les agents avaient dégénéré en production (80 collections d'agent, ~25 à un seul souvenir,
+quasi-doublons, une même collection étalée sur 3 ou 4 familles donc sans comportement
+homogène). Elles sont remplacées par **9 compartiments FIXES**, propriété du moteur, inspirés
+des régions du cerveau. L'agent ne crée plus rien : il juge seulement où ranger.
+
+| Compartiment | Région | Comportement |
+|---|---|---|
+| `reflexes` | Tronc cérébral | injecté dans CHAQUE contexte, aucun oubli, ≤ 20 % du budget, hors graphe |
+| `decisions` | Lobe frontal | oubli lent (×3), intriqué |
+| `savoir_faire` | Cervelet | oubli très lent (×4), intriqué |
+| `alertes` | Amygdale | poids ×1,15 au rappel, oubli lent (×4), intriqué |
+| `environnement` | Lobe pariétal | oubli lent (×3), intriqué |
+| `savoirs` | Lobe temporal | oubli moyen (×2), intriqué |
+| `episodes` | Hippocampe | oubli normal (×1), hors graphe |
+| `observations` | Lobe occipital | oubli rapide (×0,5), hors graphe |
+| `croyances` | Cortex préfrontal | ex-`reflective` : aucun oubli, ≤ 15 %, écriture par `note_belief` seulement |
+
+- **Cœur** : `synaptiq_core.compartments` remplace `collections` et `taxonomy`. Source unique
+  des compartiments ; la famille (`memories.type`) est DÉDUITE du compartiment. Classement
+  par similarité (`classer`, `resoudre`) contre des prototypes (description + exemples)
+  calculés avec l'embedder de l'instance, mis en cache par modèle et PARTAGÉS par l'API et le
+  worker. Un rangement ne mène jamais au vide : nom valide > ancien nom (`ALIAS`) > moteur.
+- **Q-EM** : oubli, intrication et poids par compartiment ; quotas par compartiment
+  (`parts_max`) ; injection des réflexes après la propagation (pas de hubs dans le graphe) et
+  avant les priorités au collapse ; paquet de forme FIXE (les 9 sections, dans l'ordre).
+- **API** : `compartment` remplace `type` + `subtype` sur `/v1/memories` (facultatif, la
+  réponse rend `compartment`, `region`, `compartment_origin`, `classification_similarity`) ;
+  `compartments` remplace `memory_types` et `collections` sur `/v1/retrieve` et
+  `/v1/context/build` (noms stricts : 422 sur un inconnu) ; `GET /v1/compartments` remplace
+  `GET /v1/collections`.
+- **Worker** : l'extracteur propose un compartiment (consigne générée depuis le cœur), décidé
+  après vectorisation avec les mêmes règles que l'API. `QEM_ENTANGLE_TYPES` disparaît.
+- **MCP** : 7 outils. `store_memory(content, compartment?, project?)` (description générée
+  depuis le cœur, refuse `croyances`), `list_compartments` ; `create_collection`,
+  `merge_collections` et `list_collections` supprimés.
+- **Migration `20261122_compartments`** (non réversible, convention du dépôt) : colonne
+  `compartment` + contrainte CHECK + index, conversion par copie figée de la table d'alias,
+  famille recalculée, sujet des croyances reporté dans `provenance->>'about'`, `subtype`
+  renommé `legacy_subtype`, `memory_collections` supprimée.
+  `scripts/reclassify_compartments.py` propose ensuite (CSV à relire) un compartiment par
+  similarité pour les souvenirs que la table n'a pu ranger que par famille.
+- **Banc de rappel** (fixture `claude_code_orchestrator`, n=20) : `ctx1200.gold_dans_paquet`
+  0,70 → 0,70, `ctx8000` 0,80 → 0,90. Sans injection des réflexes, la v0.4 améliore aussi la
+  position du gold (MRR ctx1200 0,48 → 0,53) ; avec injection, les réflexes passent en tête
+  du paquet (MRR 0,21) sans évincer de gold — coût de position assumé, réglable par
+  `QEM_REFLEXES_INJECTES`.
+- Corrigés au passage : erreur ruff `C416` du worker et test
+  `test_events_signale_503_quand_la_base_est_absente` (rouges en CI depuis le 26/09) ; cache
+  Redis de `context/build` neutralisé dans les tests d'intégration (test instable).
+
+### Ruptures de compatibilité
+
+- `POST /v1/memories` : `type`/`subtype` **dépréciés** (encore lus, convertis par alias,
+  retrait en v0.5). La réponse ne porte plus `collection` ni `canonical_subtype`.
+- `context_packet` : les clés `facts`, `preferences`, `rules`, `best_practices`, `errors`,
+  `examples`, `user_model`, `human_insights` sont remplacées par les 9 compartiments.
+- `ContextConstraints.memory_types`/`collections` et `RetrieveRequest.memory_type`/
+  `collections` : remplacés par `compartments`.
+- Routes `/v1/collections*` supprimées. Variables `MAX_COLLECTIONS_PER_AGENT`,
+  `COLLECTION_DUP_THRESHOLD`, `COLLECTION_STALE_DAYS`, `QEM_ENTANGLE_TYPES` supprimées ;
+  `QEM_REFLECTIVE_MAX_SHARE` → `QEM_CROYANCES_MAX_SHARE` (ancien nom lu en repli).
+- SDK Python : `store_memory(agent_id, content, compartment=None, …)` ; `list_compartments`.
+  SDK TypeScript : `storeMemory(agent_id, content, options)`, `retrieve(agent_id, query,
+  options)`, `listCompartments`, type `Compartment`.
+
 ## Unreleased — famille `reflective` : ce que l'agent pense (lot C du 26/09)
 
 Decision de Jimmy du 26/09 : un compartiment pour ce que l'agent pense de l'utilisateur et

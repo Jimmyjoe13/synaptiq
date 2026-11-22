@@ -16,7 +16,7 @@ the client inwards.**
 
 > This document gets the server running. Once the tools answer, see
 > **[`agent-integration.md`](agent-integration.md)** for the other half — configuring the
-> *agent* so the memory is actually good: its collections, how it should write and read, and
+> *agent* so the memory is actually good: its compartments, how it should write and read, and
 > the behaviours that degrade recall without ever logging a warning.
 
 ---
@@ -25,12 +25,11 @@ the client inwards.**
 
 | Tool | Purpose |
 |---|---|
-| `store_memory(content, memory_type, subtype?)` | Write a memory. Returns which section it was filed into. |
-| `recall_memories(query, limit?, memory_type?, collections?)` | Hybrid semantic + full-text search. |
-| `build_context(task, query, max_tokens?, collections?)` | Assemble a Q-EM context packet under a token budget. |
-| `list_collections()` | The agent's own taxonomy, with volumes, quota and dormant shelves. |
-| `create_collection(name, family, description, entangle?)` | Declare a new shelf. |
-| `merge_collections(source, target)` | Pour one collection into another; the source is dropped. |
+| `store_memory(content, compartment?, project?)` | Write a memory into one of the nine compartments. Returns where it landed and who decided (agent, alias, engine). |
+| `list_compartments()` | The nine compartments, their behaviour and volumes. |
+| `recall_memories(query, limit?, compartments?, project?)` | Hybrid semantic + full-text search. |
+| `build_context(task, query, max_tokens?, compartments?, project?)` | Assemble a Q-EM context packet under a token budget, reflexes always included. |
+| `note_belief` · `list_beliefs` · `contest_belief` | The agent's hypotheses about the user, under guardrails. |
 
 No tool takes `agent_id` or `tenant_id`. Identity is server configuration, never a
 parameter — otherwise the model itself would choose whose memory it reads and writes.
@@ -298,7 +297,7 @@ Then, from the client, ask the agent to recall something you know is stored.
 | Tool call fails with `Read timed out` on the first call | Cold model load exceeds `SYNAPTIQ_TIMEOUT_S` | Warm the model, or raise `SYNAPTIQ_TIMEOUT_S` |
 | `401 Clé API requise` on every tool | `SYNAPTIQ_AUTH_REQUIRED=true` and no `SYNAPTIQ_API_KEY` in the MCP env | Issue a key (§5 step 3) and set it |
 | `403 Permission 'write' absente` | Key issued read-only | Re-issue with `--scopes read write` |
-| `[INFO] '<x>' n'est pas une collection declaree` | Writing to an undeclared shelf; the memory landed in the family's fallback section | `create_collection(...)`, or reuse an existing one |
+| `[INFO] ... le moteur l'a classe par similarite` | No compartment given, or an unknown name: the engine filed the memory itself | Check the compartment named in the message; rewrite with an explicit `compartment` if it is wrong (`list_compartments`) |
 | API dies at boot on `UnicodeDecodeError` | Non-ASCII byte in `.env` on Windows | Rewrite `.env` in pure ASCII |
 | `TypeError: Router.__init__() ... 'on_startup'` | `fastmcp` installed separately from `requirements.txt` | Reinstall both in one `pip install` |
 | Tools work, but `/events` never becomes a memory | `relay` and/or `worker` not running | `docker compose up -d relay worker`. `/events` returns `201` and queues in the outbox even when nothing consumes it — `/v1/health` reports `"ingestion":"stalled"` |

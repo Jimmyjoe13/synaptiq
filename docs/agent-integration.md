@@ -69,9 +69,9 @@ python scripts/rebuild_entanglement.py --agent my_agent
 ```
 
 `--dry-run` prints the nearest-neighbour similarity histogram with your current threshold
-marked, which is the only honest way to choose one (§8). The script is idempotent, honours each
-collection's `entangle` flag, and emits **only** `entangled_with`: the write path also creates
-a `supersedes_by` edge between `coding_best_practices` and `code_error_resolution`, and
+marked, which is the only honest way to choose one (§8). The script is idempotent, only weaves
+the compartments that entangle, and emits **only** `entangled_with`: the write path also creates
+a `supersedes_by` edge between `savoir_faire` and `alertes` memories, and
 replaying *that* in bulk would make the interference phase cancel memories that are still
 valid. Suppression stays a deliberate write, never a side effect of maintenance.
 
@@ -105,23 +105,23 @@ the graph cost was not, and it was permanent — see §1.
 
 ---
 
-## 2. Contradiction handling only covers `preference`
+## 2. Contradiction handling only covers `reflexes`
 
-`handle_contradictions` returns immediately unless the memory is exactly `semantic` +
-`preference` (`packages/core/synaptiq_core/governance.py`):
+`handle_contradictions` returns immediately unless the memory is in the `reflexes`
+compartment (`packages/core/synaptiq_core/governance.py`):
 
 ```python
-if new_memory.get("type") != "semantic" or new_memory.get("subtype") != "preference":
+if new_memory.get("compartment") != "reflexes":
     return []
 ```
 
-So nothing is ever archived automatically in `fact`, `rule`, `decisions`, `project_state`, or
-any shelf you create — **even with a live LLM judge**. And the judge itself is fail-closed:
+So nothing is ever archived automatically in `savoirs`, `decisions`, `environnement` or any
+other compartment — **even with a live LLM judge**. And the judge itself is fail-closed:
 `CONTRADICTION_JUDGE=auto` with no LLM configured resolves to `no_judge`, which archives
 nothing at all.
 
 The practical consequence for an agent author: **keeping the memory true over time is your
-job, in every collection but one.** Write a correction and you now have two contradictory
+job, in every compartment but one.** Write a correction and you now have two contradictory
 memories coexisting, both `active`, both recallable, with nothing to arbitrate between them.
 For a memory engine that is the worst failure mode — the agent reads a stale fact and has no
 way to know it is stale.
@@ -147,43 +147,32 @@ The `supersedes_by` edge is what makes an archive distinguishable from a disappe
 
 ---
 
-## 3. Design the shelves before the first write
+## 3. File in the right compartment
 
-A `collection` is where a memory lands in the context packet. Deciding them up front is worth
-more than any threshold tuning, because a memory filed nowhere useful is a memory that never
-comes back at the right moment.
+Since v0.4 there is nothing to design: the memory has **nine fixed compartments**, modelled
+on regions of the brain, each with its own behaviour (see the README). The agent's only job is
+to pick the right one — and if it does not, the engine classifies by similarity and says so.
 
-The seven system collections cover general assistants. An agent with a job needs its own. A
-coding/ops agent, as a worked example:
+For a coding/ops agent, the usual mapping:
 
-| Collection | Family | What earns a place in it |
-|---|---|---|
-| `project_state` | `semantic` | What is deployed, what is blocked, what is left to do |
-| `decisions` | `semantic` | A technical choice, **its reason, and the options rejected** |
-| `infra_access` | `semantic` | Hosts, ports, paths, where the credentials live |
-| `deploy_playbooks` | `procedural` | Command sequences proven on the real target |
-| `session_log` | `episodic` | End-of-session journal: done / shipped / tested / left open |
-| `user_workflow` | `procedural` | How this user wants the agent to work |
+| Compartment | What earns a place in it |
+|---|---|
+| `reflexes` | How this user wants the agent to work; rules to apply every time (injected into **every** context) |
+| `decisions` | A technical choice, **its reason, and the options rejected** |
+| `environnement` | Hosts, ports, paths, where the credentials live |
+| `savoir_faire` | Command sequences proven on the real target, coding conventions |
+| `alertes` | An error and its fix; a trap not to fall into again |
+| `savoirs` | What is deployed, what is blocked, what is left to do |
+| `episodes` | End-of-session journal: done / shipped / tested / left open |
+| `observations` | A measurement or audit result, true at one point in time |
 
-Four guardrails apply, and they are there because an unsupervised model creates one category
-per nuance:
+Keep `reflexes` short and few: they are injected regardless of the question (up to
+`QEM_REFLEXES_INJECTES`, at most `QEM_REFLEXES_MAX_SHARE` of the budget). A project fact filed
+there costs tokens in every unrelated session.
 
-- **Semantic duplicate check** at `COLLECTION_DUP_THRESHOLD` (0.85) on the *description* —
-  creation is refused and the near collection is named. Write descriptions that state a
-  distinct purpose, not a synonym of another shelf.
-- **Cap** `MAX_COLLECTIONS_PER_AGENT` (50), surfaced in `list_collections`.
-- **Merge** via `POST /v1/collections/merge` — memories are relabelled, never destroyed.
-- **Dormant shelves** flagged `stale` after `COLLECTION_STALE_DAYS` (14) with no writes.
-
-Set `entangle` deliberately per collection: it decides whether that shelf feeds the multi-hop
-path. Structured episodic content (meeting notes, session journals) is worth weaving in; raw
-interaction logs are not, and `interaction` and `scratch` ship with `entangle=False` for that
-reason.
-
-Instruct the agent to call `list_collections` **before** inventing a `subtype`. An undeclared
-name is accepted and routed to the family's fallback section — the response says so
-explicitly (`collection`, `canonical_subtype`), and an agent that does not read that field
-will believe in a filing that never happened.
+Read the `compartment_origin` field of the write response: `moteur` means the engine chose for
+the agent, `alias` that an old v0.3 name was converted. An agent that ignores it will believe
+in a filing it did not make.
 
 ---
 
@@ -226,19 +215,18 @@ project accounted for roughly half the corpus:
 | Call | Top 3 |
 |---|---|
 | `recall_memories("deployment policy for the VPS", limit=3)` | three memories from an unrelated scraper project |
-| same query, `collections=["decisions"]` | the deployment policy decision, first |
+| same query, `compartments=["decisions"]` | the deployment policy decision, first |
 
 `build_context` is the rehydration tool: it runs the full four-phase pipeline, routes results
 into packet sections, drops redundancies, and respects a token budget. Use it to prepare a
 turn; use `recall_memories` to answer a narrow lookup.
 
-**And filter by collection as soon as you know the shelf.** It is the highest-leverage
+**And filter by compartment as soon as you know it.** It is the highest-leverage
 parameter on both tools — fewer candidates means less noise at the same token budget.
 
 > [!NOTE]
-> `context_packet` has **no fixed number of keys**. The seven canonical sections are always
-> present and every declared collection adds one, even when empty. Iterate over the packet's
-> entries; never read hardcoded keys.
+> `context_packet` has a **fixed shape**: the nine compartments, always present, in order,
+> even when empty. `reflexes` is filled even when nothing matched the query.
 
 ---
 
@@ -253,8 +241,8 @@ client (the example below is Claude Code, the shape generalises):
 
 **Session start — inject the always-true slice, narrowly.** At startup the task is unknown, so
 a full `build_context` is a guess: a large packet, mostly off-topic, and worse than wasted
-tokens because it primes the agent toward the wrong project. Inject only the collections that
-hold in *every* session — how the user wants to work, their format preferences — and leave a
+tokens because it primes the agent toward the wrong project. Inject only the compartment that
+holds in *every* session (`reflexes`) — how the user wants to work, their format preferences — and leave a
 line reminding the agent to call `build_context` once the task is known.
 
 Read those rows straight from Postgres rather than through `/v1/context/build`: the API path
@@ -344,7 +332,7 @@ Run all of it. The first three can pass while recall is quietly broken.
 | # | Check | Passing looks like |
 |---|---|---|
 | 1 | `curl /v1/health` | `postgres`, `redis` **and** `ingestion` all healthy |
-| 2 | MCP tool call, not just server start | a real `store_memory` returning its resolved `collection` |
+| 2 | MCP tool call, not just server start | a real `store_memory` returning its resolved `compartment` |
 | 3 | `SELECT agent_id, count(*) FROM memories GROUP BY 1` | your `SYNAPTIQ_AGENT_ID`, non-zero |
 | 4 | **Edge count for that agent** — `synaptiq_graph_edges_per_memory` or the query in §1 | non-zero, roughly ~1 per memory |
 | 5 | Embedding coherence | cosine of a stored vector vs. one recomputed now = `1.000` |
@@ -359,4 +347,4 @@ stored, and read what comes back.
 
 - [`mcp-server.md`](mcp-server.md) — transports, install, client configuration, troubleshooting
 - [`configuration.md`](configuration.md) — every environment variable
-- [`../README.md`](../README.md) — architecture, Q-EM phases, families and collections
+- [`../README.md`](../README.md) — architecture, Q-EM phases, compartments
