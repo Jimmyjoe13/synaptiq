@@ -169,7 +169,7 @@ def phase_consolidation(cur, tenant: str, agent: str, r: ReglagesSommeil,
     embedder = get_embedder()
     for groupe in groupes:
         try:
-            donnees, modele = client.chat_json(prompt_consolidation(groupe), max_tokens=1500)
+            donnees, modele = client.chat_json(prompt_consolidation(groupe), max_tokens=3000)
         except LLMIndisponible as e:
             logger.warning("Consolidation interrompue : %s", e)
             rapport["note"] = "LLM indisponible : consolidation partielle"

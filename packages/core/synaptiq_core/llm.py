@@ -100,6 +100,8 @@ class ClientLLM:
     # length`) et rendent un contenu vide — constaté en prod le 23/11 à 20 tokens, et le
     # juge de contradiction (plafonné à 64) n'aurait jamais rien rendu.
     min_tokens: int = 512
+    # Plafond des relances d'une réponse coupée par la longueur (budget doublé à chaque fois).
+    max_tokens_plafond: int = 8000
     # Transport injectable (tests) : mêmes signatures que `requests.get` / `requests.post`.
     http_get: Callable[..., Any] = field(default=requests.get, repr=False)
     http_post: Callable[..., Any] = field(default=requests.post, repr=False)
@@ -167,56 +169,74 @@ class ClientLLM:
 
     # ── Appels ───────────────────────────────────────────────────────────────
 
+    def _poster(self, modele: str, messages: list[dict], budget: int, temperature: float):
+        return self.http_post(
+            f"{self.base_url}/chat/completions", headers=self._entetes(),
+            json={"model": modele, "messages": messages, "max_tokens": budget,
+                  "temperature": temperature},
+            timeout=self.timeout)
+
     def chat(self, messages: list[dict], max_tokens: int = 800, temperature: float = 0.0,
              valider: Callable[[str], Any] | None = None) -> Reponse:
-        """Premier modèle qui rend une réponse non vide (et valide, si `valider` est fourni)."""
+        """Premier modèle qui rend une réponse non vide (et valide, si `valider` est fourni).
+
+        Une réponse COUPÉE par la longueur (`finish_reason: length`, vide ou invalide) est
+        retentée sur le MÊME modèle avec un budget doublé, jusqu'à `max_tokens_plafond` :
+        ces modèles raisonnent avant de répondre, et à 1 500 tokens la consolidation d'une
+        poignée d'épisodes s'arrêtait en plein JSON (prod, 23/11). Ce n'est qu'ensuite
+        qu'on passe au modèle suivant.
+        """
         candidats = self.candidats()
         if not candidats:
             raise LLMIndisponible("Aucun modèle LLM disponible (catalogue vide ou tous en pénalité).")
         derniere_erreur = "aucun essai"
         for modele in candidats:
-            try:
-                r = self.http_post(
-                    f"{self.base_url}/chat/completions", headers=self._entetes(),
-                    json={"model": modele, "messages": messages,
-                          "max_tokens": max(max_tokens, self.min_tokens),
-                          "temperature": temperature},
-                    timeout=self.timeout)
-            except Exception as e:      # délai, connexion coupée : modèle suivant
-                derniere_erreur = f"{modele}: {type(e).__name__}"
-                self.penaliser(modele, 120)
-                continue
-            if r.status_code in CODES_ROTATION or r.status_code >= 500:
-                retry = (getattr(r, "headers", None) or {}).get("Retry-After", "")
-                self.penaliser(modele, float(retry) if str(retry).isdigit() else None)
-                derniere_erreur = f"{modele}: HTTP {r.status_code}"
-                logger.info("Rotation LLM : %s indisponible (HTTP %s), modèle suivant.",
-                            modele, r.status_code)
-                continue
-            if r.status_code >= 400:
-                # Erreur de requête (400, 401, 403) : la changer de modèle ne la corrigera
-                # généralement pas, mais un modèle retiré du catalogue répond aussi 400.
-                self.penaliser(modele)
-                derniere_erreur = f"{modele}: HTTP {r.status_code} {str(getattr(r, 'text', ''))[:120]}"
-                continue
-            try:
-                texte = (r.json()["choices"][0]["message"].get("content") or "").strip()
-            except Exception:
-                texte = ""
-            if not texte:
-                # Cas réel (23/11) : `hy4-flash-free` répond 200 avec un contenu vide.
-                self.penaliser(modele, 300)
-                derniere_erreur = f"{modele}: réponse vide"
-                continue
-            if valider is not None:
+            budget = max(max_tokens, self.min_tokens)
+            while True:
                 try:
-                    valider(texte)
-                except Exception:
+                    r = self._poster(modele, messages, budget, temperature)
+                except Exception as e:      # délai, connexion coupée : modèle suivant
+                    derniere_erreur = f"{modele}: {type(e).__name__}"
                     self.penaliser(modele, 120)
-                    derniere_erreur = f"{modele}: réponse invalide"
+                    break
+                if r.status_code in CODES_ROTATION or r.status_code >= 500:
+                    retry = (getattr(r, "headers", None) or {}).get("Retry-After", "")
+                    self.penaliser(modele, float(retry) if str(retry).isdigit() else None)
+                    derniere_erreur = f"{modele}: HTTP {r.status_code}"
+                    logger.info("Rotation LLM : %s indisponible (HTTP %s), modèle suivant.",
+                                modele, r.status_code)
+                    break
+                if r.status_code >= 400:
+                    # Erreur de requête (400, 401, 403) : changer de modèle ne la corrigera
+                    # généralement pas, mais un modèle retiré du catalogue répond aussi 400.
+                    self.penaliser(modele)
+                    derniere_erreur = (f"{modele}: HTTP {r.status_code} "
+                                       f"{str(getattr(r, 'text', ''))[:120]}")
+                    break
+                try:
+                    choix = r.json()["choices"][0]
+                    texte = (choix["message"].get("content") or "").strip()
+                    coupe = choix.get("finish_reason") == "length"
+                except Exception:
+                    texte, coupe = "", False
+                probleme = "réponse vide" if not texte else None
+                if probleme is None and valider is not None:
+                    try:
+                        valider(texte)
+                    except Exception:
+                        probleme = "réponse invalide"
+                if probleme is None:
+                    self.dernier_modele = modele
+                    return Reponse(texte, modele)
+                if coupe and budget < self.max_tokens_plafond:
+                    budget = min(budget * 2, self.max_tokens_plafond)
+                    logger.info("%s coupé par la longueur (%s) : nouvel essai à %d tokens.",
+                                modele, probleme, budget)
                     continue
-            self.dernier_modele = modele
-            return Reponse(texte, modele)
+                # Cas réel (23/11) : `hy4-flash-free` répond 200 avec un contenu vide.
+                self.penaliser(modele, 300 if not texte else 120)
+                derniere_erreur = f"{modele}: {probleme}"
+                break
         raise LLMIndisponible(f"Tous les modèles ont échoué (dernier : {derniere_erreur}).")
 
     def chat_json(self, messages: list[dict], max_tokens: int = 1200) -> tuple[Any, str]:
@@ -266,6 +286,7 @@ def depuis_env(env: dict | None = None) -> ClientLLM | None:
         penalite_s=float(e.get("LLM_ROTATION_COOLDOWN_S", "600")),
         timeout=float(e.get("LLM_TIMEOUT_S", "60")),
         min_tokens=int(e.get("LLM_MIN_TOKENS", "512")),
+        max_tokens_plafond=int(e.get("LLM_MAX_TOKENS", "8000")),
     )
 
 

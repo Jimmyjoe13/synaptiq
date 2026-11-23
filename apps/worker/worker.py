@@ -352,7 +352,7 @@ def call_llm_extractor(event_content: str, occurred_at: str | None = None) -> li
     client = get_client_llm()
     if client is not None and client.rotation:
         try:
-            donnees, modele = client.chat_json(messages, max_tokens=1500)
+            donnees, modele = client.chat_json(messages, max_tokens=3000)
         except LLMIndisponible as e:
             logger.error("Extraction LLM impossible (%s) : repli sur les heuristiques regex.", e)
             EXTRACTION_DEGRADED_COUNTER.inc()

@@ -193,3 +193,39 @@ def test_budget_minimal_de_tokens_pour_les_modeles_qui_raisonnent():
     client.chat([{"role": "user", "content": "x"}], max_tokens=20)
     client.chat([{"role": "user", "content": "x"}], max_tokens=2000)
     assert vus == [512, 2000]
+
+
+class _RepCoupee(_Rep):
+    def __init__(self, contenu, raison):
+        super().__init__(200, contenu)
+        self._raison = raison
+
+    def json(self):
+        return {"choices": [{"finish_reason": self._raison, "message": {"content": self._contenu}}]}
+
+
+def test_reponse_coupee_relancee_sur_le_meme_modele_avec_plus_de_tokens():
+    """Prod du 23/11 : à 1 500 tokens, la consolidation s'arrêtait en plein JSON."""
+    budgets = []
+
+    def _post(url, headers=None, json=None, timeout=None):
+        budgets.append((json["model"], json["max_tokens"]))
+        if json["max_tokens"] < 3000:
+            return _RepCoupee('{"memories": [{"com', "length")
+        return _RepCoupee('{"memories": []}', "stop")
+
+    client = ClientLLM(base_url="http://x/v1", rotation=False, modeles_fixes=["m"],
+                       http_post=_post)
+    donnees, modele = client.chat_json([{"role": "user", "content": "x"}], max_tokens=1500)
+    assert donnees == {"memories": []} and budgets == [("m", 1500), ("m", 3000)]
+
+
+def test_reponse_coupee_au_plafond_passe_au_modele_suivant():
+    def _post(url, headers=None, json=None, timeout=None):
+        if json["model"] == "a":
+            return _RepCoupee("", "length")
+        return _RepCoupee("ok", "stop")
+
+    client = ClientLLM(base_url="http://x/v1", rotation=False, modeles_fixes=["a"],
+                       preference=["a", "b"], http_post=_post, max_tokens_plafond=2000)
+    assert client.chat([{"role": "user", "content": "x"}], max_tokens=1000).modele == "b"
