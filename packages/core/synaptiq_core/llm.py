@@ -95,6 +95,11 @@ class ClientLLM:
     rafraichir_s: float = 3600.0
     penalite_s: float = 600.0
     timeout: float = 60.0
+    # Budget minimal de tokens par appel. Les modèles gratuits d'OpenCode Go RAISONNENT avant
+    # de répondre : sous ~500 tokens ils s'arrêtent en plein raisonnement (`finish_reason:
+    # length`) et rendent un contenu vide — constaté en prod le 23/11 à 20 tokens, et le
+    # juge de contradiction (plafonné à 64) n'aurait jamais rien rendu.
+    min_tokens: int = 512
     # Transport injectable (tests) : mêmes signatures que `requests.get` / `requests.post`.
     http_get: Callable[..., Any] = field(default=requests.get, repr=False)
     http_post: Callable[..., Any] = field(default=requests.post, repr=False)
@@ -173,7 +178,8 @@ class ClientLLM:
             try:
                 r = self.http_post(
                     f"{self.base_url}/chat/completions", headers=self._entetes(),
-                    json={"model": modele, "messages": messages, "max_tokens": max_tokens,
+                    json={"model": modele, "messages": messages,
+                          "max_tokens": max(max_tokens, self.min_tokens),
                           "temperature": temperature},
                     timeout=self.timeout)
             except Exception as e:      # délai, connexion coupée : modèle suivant
@@ -259,6 +265,7 @@ def depuis_env(env: dict | None = None) -> ClientLLM | None:
         rafraichir_s=float(e.get("LLM_ROTATION_REFRESH_S", "3600")),
         penalite_s=float(e.get("LLM_ROTATION_COOLDOWN_S", "600")),
         timeout=float(e.get("LLM_TIMEOUT_S", "60")),
+        min_tokens=int(e.get("LLM_MIN_TOKENS", "512")),
     )
 
 

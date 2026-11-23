@@ -178,3 +178,18 @@ def test_depuis_env_opencode_go_ignore_une_url_locale():
     client = depuis_env({"LLM_PROVIDER": "opencode-go", "LLM_API_KEY": "k",
                          "LLM_BASE_URL": "http://host.docker.internal:1234/v1"})
     assert client.base_url == "https://opencode.ai/zen/go/v1"
+
+
+def test_budget_minimal_de_tokens_pour_les_modeles_qui_raisonnent():
+    """Prod du 23/11 : à 20 tokens, beam-free s'arrêtait en plein raisonnement (vide)."""
+    vus = []
+
+    def _post(url, headers=None, json=None, timeout=None):
+        vus.append(json["max_tokens"])
+        return _Rep(200, "OK")
+
+    client = ClientLLM(base_url="http://x/v1", rotation=False, modeles_fixes=["m"],
+                       http_post=_post)
+    client.chat([{"role": "user", "content": "x"}], max_tokens=20)
+    client.chat([{"role": "user", "content": "x"}], max_tokens=2000)
+    assert vus == [512, 2000]
