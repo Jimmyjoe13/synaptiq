@@ -13,6 +13,33 @@
 >   OpenRouter) et `a0b844b`. Le journal avait ces trous avant les tags ; les combler
 >   a posteriori aurait demande d'inventer des notes de version.
 
+## 0.5.0 — le SOMMEIL, la récompense et la plasticité (lot 2, 23/11/2026)
+
+Décisions de Jimmy du 23/11 : (1) le LLM est un modèle GRATUIT de la bibliothèque OpenCode
+Go, avec rotation automatique (la liste change régulièrement) ; (2) AUCUNE suppression de
+données : SynaptiQ est le cerveau principal, l'oublié est rangé dans des archives.
+
+- **`synaptiq_core.llm`** : client à rotation. Découvre les modèles `-free` sur
+  `https://opencode.ai/zen/go/v1/models` (rafraîchi chaque heure), passe au suivant sur 429
+  (`Retry-After` respecté), 5xx, délai, réponse VIDE ou JSON invalide ; en-tête
+  `x-opencode-session` (exigé par OpenCode Go). Utilisé par l'extraction du worker, le juge de
+  contradiction et le sommeil. `LLM_PROVIDER=opencode-go`, `LLM_MODEL=auto`.
+- **Compartiment `archives`** (mémoire dormante, 10e) : rempli par le sommeil, jamais lu par
+  défaut (`compartments=["archives"]` pour le consulter), `POST /v1/memories/{id}/restore`
+  et outil MCP `restore_memory` pour en sortir un souvenir.
+- **Sommeil** (`apps/worker/sommeil.py`, cron nocturne) : doublons → archives (le mieux
+  noté survit), consolidation des épisodes par le LLM (souvenirs durables, épisodes marqués
+  « consolidés »), oubli des souvenirs jamais relus → archives (jamais réflexes ni
+  croyances), réparation du graphe, affaiblissement des liens délaissés. Rapport dans
+  `audit_log` (`sommeil`). `--dry-run` disponible.
+- **Récompense** : `POST /v1/memories/reinforce` et outil MCP `reinforce` ; `memories.reward`
+  (±1, borné à ±5) pondère le score au rappel (`RECOMPENSE_GAIN`, ×0,5 à ×1,5).
+- **Plasticité** : souvenirs utiles ensemble → lien renforcé (créé à 0,5 s'il n'existe pas,
+  `PLASTICITE_PAS`) ; liens renforcés puis délaissés affaiblis la nuit, jamais sous 0,5.
+- Les outils MCP affichent les ids des souvenirs (indispensables à `reinforce`).
+- Migration `20261123_sommeil` : CHECK étendu à `archives`, `memories.reward`,
+  `relationships.last_reinforced_at`.
+
 ## 0.4.0 — les COMPARTIMENTS : une mémoire rangée comme un cerveau (22/11/2026)
 
 Décision de Jimmy du 22/11, après l'audit du même jour : les collections créées librement par

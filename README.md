@@ -214,6 +214,21 @@ same collection spread across three families — hence three different behaviour
 | `episodes` | Hippocampus | Session log, interactions, milestones | Fast forgetting, outside the graph |
 | `observations` | Occipital lobe | Raw findings: measurements, audit results, logs | Fastest forgetting, outside the graph |
 | `croyances` | Prefrontal cortex | The agent's hypotheses about the user and people | Never decays, rendered as *"(hypothesis, confidence x)"*, ≤ 15 % of the budget, written only through `note_belief` |
+| `archives` | Dormant memory | What the nightly sleep set aside: forgotten memories, duplicates | **Nothing is ever deleted.** Not read by default, consultable on request, restorable |
+
+### Sleep, reward and plasticity
+
+Every night, after the backup, `apps/worker/sommeil.py` consolidates each agent's memory:
+near-duplicates and never-read memories whose recency has faded are moved to `archives`
+(never deleted, never reflexes or beliefs), old episodes are replayed by an LLM into durable
+memories, isolated memories are woven into the graph, and links reinforced then neglected
+weaken back to the strength of a new link. An agent rewards what actually helped with
+`reinforce`: useful memories rank higher next time, and memories useful *together* get their
+link strengthened (Hebbian plasticity).
+
+The LLM is a **free model from the OpenCode Go library, rotated automatically**: the client
+discovers the free models, falls back to the next one on rate limits, errors, empty or invalid
+answers, and refreshes the list hourly — free model line-ups change often.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/memories -H 'Content-Type: application/json' -d '{
@@ -261,7 +276,9 @@ Base path `/v1`. Unversioned aliases are kept for backward compatibility.
 | `POST` | `/v1/memories` | Direct write of a consolidated memory. **Idempotent on content** — a retry returns the same `memory_id` with `status: "duplicate"`. Returns the resolved `compartment` and who chose it. |
 | `POST` | `/v1/retrieve` | Hybrid search (vector + full-text, RRF), filterable by compartment. |
 | `POST` | `/v1/context/build` | Q-EM context packet under a token budget. `explain=true` adds a `retrieval_trace`. |
-| `GET` | `/v1/compartments` | The nine compartments, their behaviour and the agent's memory count in each. |
+| `GET` | `/v1/compartments` | The compartments, their behaviour and the agent's memory count in each. |
+| `POST` | `/v1/memories/reinforce` | Reward useful (or misleading) memories; strengthens links between memories useful together. |
+| `POST` | `/v1/memories/{id}/restore` | Bring a memory back from the archives. |
 | `GET` | `/v1/beliefs` · `POST` `/v1/beliefs/{id}/contest` | What the agent thinks of the user — readable and contestable. |
 | `DELETE` | `/v1/memories` | GDPR purge — `admin` scope **and** `?confirm=<tenant_id>`. Optional `?agent_id=`. |
 | `GET` | `/metrics` | Prometheus exposition. |
@@ -323,7 +340,7 @@ for (const [section, items] of Object.entries(ctx.context_packet)) {
 
 ## MCP server
 
-Seven tools, exposed to Claude Desktop, Cursor, Codex CLI, antigravity CLI, or any MCP client:
+Nine tools, exposed to Claude Desktop, Cursor, Codex CLI, antigravity CLI, or any MCP client:
 
 | Tool | Purpose |
 |---|---|
@@ -332,6 +349,8 @@ Seven tools, exposed to Claude Desktop, Cursor, Codex CLI, antigravity CLI, or a
 | `recall_memories` | Hybrid search, filterable by compartment. |
 | `build_context` | Assemble a Q-EM packet under a token budget, reflexes always included. |
 | `note_belief` · `list_beliefs` · `contest_belief` | The agent's hypotheses about the user, under guardrails. |
+| `reinforce` | Reward the memories that actually helped (or penalise misleading ones). |
+| `restore_memory` | Bring a memory back from the archives. |
 
 ```json
 { "mcpServers": { "synaptiq": { "serverUrl": "http://127.0.0.1:8765/mcp/" } } }

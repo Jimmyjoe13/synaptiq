@@ -30,6 +30,8 @@ the client inwards.**
 | `recall_memories(query, limit?, compartments?, project?)` | Hybrid semantic + full-text search. |
 | `build_context(task, query, max_tokens?, compartments?, project?)` | Assemble a Q-EM context packet under a token budget, reflexes always included. |
 | `note_belief` · `list_beliefs` · `contest_belief` | The agent's hypotheses about the user, under guardrails. |
+| `reinforce(memory_ids, useful?)` | Reward memories that helped (ids are shown by `recall_memories` and `build_context`). |
+| `restore_memory(memory_id)` | Bring a memory back from the archives (`recall_memories(compartments=["archives"])` to browse them). |
 
 No tool takes `agent_id` or `tenant_id`. Identity is server configuration, never a
 parameter — otherwise the model itself would choose whose memory it reads and writes.
