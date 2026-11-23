@@ -35,7 +35,7 @@ import os
 from collections.abc import Callable
 from functools import lru_cache
 
-import requests
+from synaptiq_core.llm import ClientLLM, LLMIndisponible, get_client_llm
 
 logger = logging.getLogger("synaptiq-core.contradiction")
 
@@ -48,18 +48,18 @@ def no_judge(existing: str, new: str) -> bool:
 
 
 class LLMContradictionJudge:
-    """Juge binaire délégué à un LLM (endpoint OpenAI-compatible).
+    """Juge binaire délégué à un LLM, via le client à rotation (`synaptiq_core.llm`).
 
     Une seule question fermée par paire candidate. Le prompt est en anglais pour la même
     raison que celui de l'extraction (cf. `worker.call_llm_extractor`) : un prompt français
     fait dériver les modèles vers de la reformulation au lieu du classement.
+
+    Fail-closed : si aucun modèle ne répond (tous en échec), les deux souvenirs sont
+    conservés. Un juge muet ne doit jamais détruire de donnée.
     """
 
-    def __init__(self, base_url: str, model: str, api_key: str = "", timeout: int = 15) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.api_key = api_key
-        self.timeout = timeout
+    def __init__(self, client: ClientLLM) -> None:
+        self.client = client
 
     def __call__(self, existing: str, new: str) -> bool:
         prompt = (
@@ -72,49 +72,30 @@ class LLMContradictionJudge:
             "two compatible preferences must both survive.\n"
             "Answer with exactly one word: YES or NO."
         )
-        headers = {"Content-Type": "application/json"}
-        if self.api_key and "your_api_key" not in self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
         try:
-            resp = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": "You classify contradictions. Reply YES or NO."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0,
-                    "max_tokens": 4,
-                },
-                timeout=self.timeout,
+            # 64 tokens et non 4 : certains modèles gratuits raisonnent avant de répondre et
+            # rendraient une réponse vide sous un plafond trop serré.
+            reponse = self.client.chat(
+                [{"role": "system", "content": "You classify contradictions. Reply YES or NO."},
+                 {"role": "user", "content": prompt}],
+                max_tokens=64,
+                valider=_oui_ou_non,
             )
-            resp.raise_for_status()
-            verdict = resp.json()["choices"][0]["message"]["content"].strip().upper()
-        except Exception as e:
-            # Fail-closed : en cas de doute, on conserve les deux souvenirs.
+        except LLMIndisponible as e:
             logger.warning("Juge de contradiction indisponible (%s) : aucun archivage.", e)
             return False
-
+        verdict = reponse.texte.strip().upper().lstrip("*\"' ")
         contradicts = verdict.startswith("YES")
-        logger.info("Verdict de contradiction : %s (réponse brute : %r).",
-                    "contradiction" if contradicts else "compatibles", verdict[:20])
+        logger.info("Verdict de contradiction : %s (modèle %s, réponse brute : %r).",
+                    "contradiction" if contradicts else "compatibles", reponse.modele,
+                    verdict[:20])
         return contradicts
 
 
-def _llm_available() -> bool:
-    """Un LLM est-il réellement joignable pour juger ?
-
-    Même règle que l'extracteur du worker : un endpoint LOCAL (LM Studio, Ollama) n'exige
-    aucune clé, un endpoint distant en exige une valide.
-    """
-    if os.getenv("LLM_PROVIDER", "mock") == "mock":
-        return False
-    base_url = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
-    local = any(h in base_url for h in ("localhost", "127.0.0.1", "host.docker.internal"))
-    api_key = os.getenv("LLM_API_KEY", "")
-    return local or bool(api_key and "your_api_key" not in api_key)
+def _oui_ou_non(texte: str) -> None:
+    """Valide une réponse du juge : YES ou NO, sinon le modèle suivant est essayé."""
+    if not texte.strip().upper().lstrip("*\"' ").startswith(("YES", "NO")):
+        raise ValueError(f"Réponse hors format : {texte[:40]!r}")
 
 
 @lru_cache(maxsize=1)
@@ -122,19 +103,15 @@ def get_contradiction_judge() -> ContradictionJudge:
     """Instancie le juge configuré (mis en cache pour tout le process).
 
     `CONTRADICTION_JUDGE` : `auto` (défaut) | `llm` | `off`
-      - auto : juge LLM si un LLM est configuré, sinon aucun archivage.
-      - llm  : force le juge LLM (échoue en fail-closed s'il est injoignable).
+      - auto / llm : juge LLM si un LLM est configuré (`synaptiq_core.llm.depuis_env`),
+        sinon aucun archivage ;
       - off  : jamais d'archivage automatique, quelle que soit la configuration LLM.
     """
     mode = os.getenv("CONTRADICTION_JUDGE", "auto").lower()
-    if mode == "off" or (mode == "auto" and not _llm_available()):
+    client = None if mode == "off" else get_client_llm()
+    if client is None:
         logger.info("Juge de contradiction désactivé (mode=%s) : aucun archivage automatique. "
                     "Les préférences proches coexisteront.", mode)
         return no_judge
-    judge = LLMContradictionJudge(
-        base_url=os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1"),
-        model=os.getenv("LLM_MODEL", "meta-llama/llama-3-8b-instruct:free"),
-        api_key=os.getenv("LLM_API_KEY", ""),
-    )
-    logger.info("Juge de contradiction = LLM (%s, %s).", judge.base_url, judge.model)
-    return judge
+    logger.info("Juge de contradiction = LLM (%s, rotation=%s).", client.base_url, client.rotation)
+    return LLMContradictionJudge(client)

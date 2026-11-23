@@ -35,6 +35,7 @@ from synaptiq_core.compartments import (
     packet_vide,
     parts_max,
 )
+from synaptiq_core.plasticite import facteur_recompense
 from synaptiq_core.qem import (
     apply_contradictions,
     collapse_by_utility,
@@ -82,6 +83,8 @@ class RetrievalConfig:
     # Nombre max de réflexes injectés à CHAQUE contexte, quelle que soit la question
     # (tronc cérébral). 0 = désactive l'injection systématique.
     reflexes_injectes: int = 8
+    # Récompense (lot 2) : score × (1 + gain × reward), reward borné à ±5. 0 = ignorée.
+    recompense_gain: float = 0.1
     # Demi-vie de la décroissance temporelle, en jours. Recalibrée de 90 → 14 le 11/08 :
     # à 90 jours sur un corpus de 13 jours, la décroissance était inerte (amplitude
     # 0,89–1,00 mesurée par l'audit) — elle ne triait rien. 14 jours la rend perceptible
@@ -129,6 +132,8 @@ def _candidat_depuis_ligne(ligne: dict, score: float, recency_factor: float) -> 
         "content": ligne["content"],
         "confidence": float(ligne["confidence"] or 1.0),
         "importance": float(ligne["importance"] or 0.5),
+        "reward": float(ligne.get("reward") or 0.0),
+        "access_count": int(ligne.get("access_count") or 0),
         "last_accessed_at": ligne["last_accessed_at"],
         "created_at": ligne["created_at"],
         # Date du FAIT (≠ created_at) : préfixée au contenu par le collapse, sans quoi le
@@ -224,6 +229,9 @@ def build_context_packet(
         # Poids du compartiment (l'amygdale renforce les souvenirs marquants : alertes).
         if compartiment in PAR_NOM:
             score *= PAR_NOM[compartiment].poids
+        # Récompense explicite (circuit de la dopamine, lot 2) : un souvenir déclaré utile
+        # remonte, un souvenir déclaré inutile descend — sans jamais annuler la pertinence.
+        score *= facteur_recompense(ligne.get("reward"), config.recompense_gain)
         if croyance:
             # Une hypothèse peu assurée ne doit pas passer devant un fait aussi pertinent.
             score *= float(ligne.get("confidence") or 0.0)

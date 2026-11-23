@@ -193,7 +193,33 @@ class SynaptiqClient:
         except Exception as e:
             raise RuntimeError(f"Échec de la contestation : {e}") from e
 
-    # ─── Compartiments : les 9 régions fixes de la mémoire ───────────────────
+    # ─── Récompense, plasticité, archives (lot 2) ─────────────────────────────
+
+    def reinforce(self, agent_id: str, memory_ids: list[str],
+                  useful: bool = True) -> dict[str, Any]:
+        """Récompense (±1) des souvenirs ; s'ils ont servi ensemble, renforce leurs liens."""
+        try:
+            response = requests.post(f"{self.base_url}/v1/memories/reinforce",
+                                     json={"agent_id": agent_id, "memory_ids": memory_ids,
+                                           "useful": useful},
+                                     headers=self.headers, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise RuntimeError(f"Échec du renforcement : {e}") from e
+
+    def restore_memory(self, agent_id: str, memory_id: str) -> dict[str, Any]:
+        """Sort un souvenir des archives, vers son compartiment d'origine."""
+        try:
+            response = requests.post(f"{self.base_url}/v1/memories/{memory_id}/restore",
+                                     json={"agent_id": agent_id}, headers=self.headers,
+                                     timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise RuntimeError(f"Échec de la restauration : {e}") from e
+
+    # ─── Compartiments : les régions fixes de la mémoire ─────────────────────
     # Propriété du moteur : l'agent ne crée rien, il choisit où ranger.
 
     def list_compartments(self, agent_id: str) -> dict[str, Any]:

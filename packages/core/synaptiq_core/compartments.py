@@ -54,7 +54,11 @@ logger = logging.getLogger("synaptiq-core.compartments")
 # Familles internes (= valeurs possibles de `memories.type`). Elles ne sont plus exposées :
 # chaque compartiment en porte une, et seul le moteur les manipule.
 FAMILLE_REFLEXIVE = "reflective"
-FAMILIES: tuple[str, ...] = ("semantic", "episodic", "procedural", "reflective")
+# `dormant` (lot 2) : famille des archives. Un souvenir archivé ne participe plus à rien
+# (ni graphe, ni oubli, ni contexte par défaut) ; sa famille d'origine est conservée dans
+# `provenance->>'archived_from'` pour la restauration.
+FAMILLE_DORMANTE = "dormant"
+FAMILIES: tuple[str, ...] = ("semantic", "episodic", "procedural", "reflective", "dormant")
 
 
 @dataclass(frozen=True)
@@ -83,8 +87,12 @@ class Compartiment:
     # croyance est formulée délibérément (`note_belief`), avec confiance et indices.
     classable: bool = True
     # Accessible par l'écriture ordinaire (`store_memory`) ? Non pour les croyances, qui
-    # passent obligatoirement par le garde-fou de `note_belief`.
+    # passent obligatoirement par le garde-fou de `note_belief`, ni pour les archives, que
+    # seul le sommeil remplit.
     ecriture_directe: bool = True
+    # Interrogé par défaut par `/retrieve` et `/context/build` ? Non pour les archives :
+    # on les consulte en le demandant explicitement (`compartments=["archives"]`).
+    lecture_par_defaut: bool = True
 
     def __post_init__(self) -> None:
         if self.famille not in FAMILIES:
@@ -189,10 +197,23 @@ COMPARTIMENTS: tuple[Compartiment, ...] = (
         "niveau de confiance. Écriture réservée à note_belief.",
         facteur_demi_vie=0.0, intrique=False, part_max=0.15,
         classable=False, ecriture_directe=False),
+    # Décision de Jimmy (23/11) : AUCUNE suppression. SynaptiQ est le cerveau principal où
+    # tout est stocké ; un souvenir oublié n'est pas effacé, il est rangé ici par le
+    # sommeil (oubli, doublon, épisode consolidé). Il reste consultable et restaurable.
+    Compartiment(
+        "archives", "Mémoire dormante", "Archives", FAMILLE_DORMANTE,
+        "Souvenirs oubliés, doublons et épisodes consolidés, rangés par le sommeil. Rien "
+        "n'est supprimé : consultables en le demandant, restaurables dans leur compartiment "
+        "d'origine.",
+        facteur_demi_vie=0.0, intrique=False, classable=False, ecriture_directe=False,
+        lecture_par_defaut=False),
 )
 
 PAR_NOM: dict[str, Compartiment] = {c.nom: c for c in COMPARTIMENTS}
 NOMS: tuple[str, ...] = tuple(c.nom for c in COMPARTIMENTS)
+# Compartiments interrogés quand l'appelant n'en précise aucun (tous sauf les archives).
+NOMS_ACTIFS: tuple[str, ...] = tuple(c.nom for c in COMPARTIMENTS if c.lecture_par_defaut)
+COMPARTIMENT_ARCHIVES = "archives"
 # Compartiments que le moteur peut choisir seul (classement par similarité).
 CLASSABLES: tuple[str, ...] = tuple(c.nom for c in COMPARTIMENTS if c.classable)
 COMPARTIMENT_CROYANCES = "croyances"
@@ -468,4 +489,5 @@ def catalogue() -> list[dict]:
         "always_injected": c.toujours_injecte,
         "max_share": c.part_max,
         "direct_write": c.ecriture_directe,
+        "read_by_default": c.lecture_par_defaut,
     } for c in COMPARTIMENTS]

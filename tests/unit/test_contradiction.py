@@ -16,9 +16,12 @@ from synaptiq_core.contradiction import (
 @pytest.fixture(autouse=True)
 def _vide_le_cache():
     """`get_contradiction_judge` est mis en cache pour le process : purge entre les tests."""
+    from synaptiq_core.llm import get_client_llm
     get_contradiction_judge.cache_clear()
+    get_client_llm.cache_clear()           # le client LLM est lui aussi mis en cache
     yield
     get_contradiction_judge.cache_clear()
+    get_client_llm.cache_clear()
 
 
 # ─── Sélection du juge ───────────────────────────────────────────────────────
@@ -70,14 +73,35 @@ class _FakeResponse:
         return {"choices": [{"message": {"content": self._content}}]}
 
 
+def _client(post):
+    """Client LLM sans rotation, transport HTTP remplacé (aucun réseau)."""
+    from synaptiq_core.llm import ClientLLM
+    return ClientLLM(base_url="http://x/v1", rotation=False, modeles_fixes=["m"],
+                     http_post=post)
+
+
+def test_reponse_ambigue_essaie_un_autre_modele_puis_conserve():
+    """Hors format (ni YES ni NO) : le modèle suivant est essayé ; aucun -> rien d'archivé."""
+    from synaptiq_core.llm import ClientLLM
+    appels = []
+
+    def _post(url, json=None, **kw):
+        appels.append(json["model"])
+        return _FakeResponse("YES" if json["model"] == "b" else "peut-etre")
+
+    client = ClientLLM(base_url="http://x/v1", rotation=False, modeles_fixes=["a"],
+                       preference=["a", "b"], http_post=_post)
+    assert LLMContradictionJudge(client)("x", "y") is True
+    assert appels == ["a", "b"]
+
+
 def _juge_repondant(monkeypatch, content=None, exception=None, status=200):
     def _post(url, **kwargs):
         if exception is not None:
             raise exception
         return _FakeResponse(content, status)
 
-    monkeypatch.setattr("synaptiq_core.contradiction.requests.post", _post)
-    return LLMContradictionJudge(base_url="http://x/v1", model="m")
+    return LLMContradictionJudge(_client(_post))
 
 
 def test_verdict_oui(monkeypatch):
@@ -117,7 +141,5 @@ def test_reponse_malformee_fail_closed(monkeypatch):
         def json(self):
             return {"inattendu": True}
 
-    monkeypatch.setattr("synaptiq_core.contradiction.requests.post",
-                        lambda url, **kw: _Cassee("", 200))
-    juge = LLMContradictionJudge(base_url="http://x/v1", model="m")
+    juge = LLMContradictionJudge(_client(lambda url, **kw: _Cassee("", 200)))
     assert juge("a", "b") is False

@@ -2,7 +2,7 @@
 // Proprietes du moteur : l'agent ne cree rien, il choisit ou ranger.
 export const COMPARTMENTS = [
   "reflexes", "decisions", "savoir_faire", "alertes", "environnement",
-  "savoirs", "episodes", "observations", "croyances",
+  "savoirs", "episodes", "observations", "croyances", "archives",
 ] as const;
 export type Compartment = (typeof COMPARTMENTS)[number];
 
@@ -127,7 +127,19 @@ export class SynaptiqClient {
     return this.post<{ memories: unknown[] }>("/v1/retrieve", body);
   }
 
-  /** Les 9 compartiments, leur fonction et le nombre de souvenirs de l'agent dans chacun. */
+  /** Recompense (+/-1) des souvenirs ; s'ils ont servi ensemble, renforce leurs liens. */
+  reinforce(agent_id: string, memory_ids: string[], useful = true) {
+    return this.post<{ status: string; memories: number; ignored: number; links: number }>(
+      "/v1/memories/reinforce", { agent_id, memory_ids, useful });
+  }
+
+  /** Sort un souvenir des archives, vers son compartiment d'origine. */
+  restoreMemory(agent_id: string, memory_id: string) {
+    return this.post<{ status: string; memory_id: string; compartment: Compartment }>(
+      `/v1/memories/${memory_id}/restore`, { agent_id });
+  }
+
+  /** Les compartiments, leur fonction et le nombre de souvenirs de l'agent dans chacun. */
   listCompartments(agent_id: string) {
     return this.get<CompartmentsResult>("/v1/compartments", { agent_id });
   }

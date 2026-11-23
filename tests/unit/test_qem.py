@@ -501,12 +501,12 @@ def test_collapse_routage_par_compartiment():
     assert packet["observations"] == ["mesure"]
 
 
-def test_collapse_packet_toujours_ses_9_compartiments():
-    """Le context_packet expose toujours les 9 compartiments, dans l'ordre, même à vide."""
+def test_collapse_packet_toujours_ses_10_compartiments():
+    """Le context_packet expose toujours les 10 compartiments, dans l'ordre, même à vide."""
     packet, _, _ = collapse_by_utility({}, max_tokens=1000)
     assert list(packet) == ["reflexes", "decisions", "savoir_faire", "alertes",
                             "environnement", "savoirs", "episodes", "observations",
-                            "croyances"]
+                            "croyances", "archives"]
     assert all(v == [] for v in packet.values())
 
 

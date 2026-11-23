@@ -20,10 +20,18 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # ─── Forme fixe ───────────────────────────────────────────────────────────────
 
-def test_neuf_compartiments_dans_l_ordre_du_paquet():
+def test_dix_compartiments_dans_l_ordre_du_paquet():
     assert cp.NOMS == ("reflexes", "decisions", "savoir_faire", "alertes", "environnement",
-                       "savoirs", "episodes", "observations", "croyances")
+                       "savoirs", "episodes", "observations", "croyances", "archives")
     assert list(cp.packet_vide()) == list(cp.NOMS)
+
+
+def test_les_archives_ne_sont_pas_lues_par_defaut():
+    """Décision du 23/11 : l'oublié est rangé, pas supprimé, et ne pollue pas le rappel."""
+    assert cp.NOMS_ACTIFS == cp.NOMS[:-1]
+    archives = cp.compartiment("archives")
+    assert not archives.lecture_par_defaut and not archives.classable
+    assert not archives.ecriture_directe and archives.facteur_demi_vie == 0
 
 
 def test_chaque_compartiment_a_une_region_et_une_famille_valide():
@@ -54,7 +62,7 @@ def test_famille_de_un_inconnu_retombe_sur_semantic():
 
 def test_seules_les_croyances_sont_fermees_a_l_ecriture_directe():
     fermes = [c.nom for c in cp.COMPARTIMENTS if not c.ecriture_directe]
-    assert fermes == ["croyances"]
+    assert fermes == ["croyances", "archives"]
     assert "croyances" not in cp.CLASSABLES
 
 
@@ -122,8 +130,18 @@ def test_la_migration_part_de_la_meme_table_que_le_coeur():
     assert module.ALIAS == cp.ALIAS
     assert module.ALIAS_PAR_FAMILLE == cp.ALIAS_PAR_FAMILLE
     assert module.REPLI_FAMILLE == cp.REPLI_FAMILLE
+    # Les archives sont arrivées le lendemain (migration `20261123_sommeil`).
+    assert module.COMPARTIMENTS == cp.NOMS_ACTIFS
+    assert module.FAMILLE == {c.nom: c.famille for c in cp.COMPARTIMENTS
+                              if c.nom != "archives"}
+
+
+def test_la_migration_du_sommeil_couvre_les_10_compartiments():
+    chemin = ROOT / "migrations" / "versions" / "20261123_sommeil.py"
+    spec = importlib.util.spec_from_file_location("migration_sommeil", chemin)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
     assert module.COMPARTIMENTS == cp.NOMS
-    assert module.FAMILLE == {c.nom: c.famille for c in cp.COMPARTIMENTS}
 
 
 def test_le_case_sql_de_la_migration_couvre_tous_les_cas():

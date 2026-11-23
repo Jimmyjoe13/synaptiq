@@ -167,3 +167,12 @@ def test_une_panne_sur_les_compartiments_leve_une_erreur_explicite(monkeypatch):
     monkeypatch.setattr(module.requests, "get", _casse)
     with pytest.raises(RuntimeError, match="compartiments"):
         SynaptiqClient().list_compartments(agent_id="a")
+
+
+def test_reinforce_et_restore(appels):
+    client = SynaptiqClient()
+    client.reinforce(agent_id="a", memory_ids=["m1", "m2"], useful=False)
+    client.restore_memory(agent_id="a", memory_id="m1")
+    assert appels[0]["url"].endswith("/v1/memories/reinforce")
+    assert appels[0]["payload"] == {"agent_id": "a", "memory_ids": ["m1", "m2"], "useful": False}
+    assert appels[1]["url"].endswith("/v1/memories/m1/restore")

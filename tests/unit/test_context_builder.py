@@ -13,7 +13,7 @@ from synaptiq_core.context_builder import (
 )
 
 TOUS = ["reflexes", "decisions", "savoir_faire", "alertes", "environnement", "savoirs",
-        "episodes", "observations", "croyances"]
+        "episodes", "observations", "croyances", "archives"]
 CONFIG = RetrievalConfig(hybrid=False, recency_halflife_days=0.0)
 
 

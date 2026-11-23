@@ -36,6 +36,7 @@ from synaptiq_core.compartments import (
     prototypes,
 )
 from synaptiq_core.embeddings import generate_mock_embedding  # noqa: F401 (compat rétro tests)
+from synaptiq_core.llm import LLMIndisponible, get_client_llm
 from synaptiq_core.observability import configure_logging, set_trace_id
 from synaptiq_core.project import normaliser_projet
 
@@ -341,16 +342,32 @@ def call_llm_extractor(event_content: str, occurred_at: str | None = None) -> li
         "\"content\":..., \"summary\": \"short title\", \"occurred_at\": \"YYYY-MM-DD\", "
         "\"confidence\": float 0-1, \"importance\": float 0-1}, ...]}."
     )
+    messages = [
+        {"role": "system", "content": "Precision memory extractor. Reply with JSON only."},
+        {"role": "user", "content": prompt},
+    ]
+    # OpenCode Go (lot 2) : modèles GRATUITS en rotation, via le client partagé du cœur.
+    # Il gère seul la découverte, le passage au modèle suivant et la validation JSON ; la
+    # négociation de `response_format` ci-dessous ne concerne que les autres fournisseurs.
+    client = get_client_llm()
+    if client is not None and client.rotation:
+        try:
+            donnees, modele = client.chat_json(messages, max_tokens=1500)
+        except LLMIndisponible as e:
+            logger.error("Extraction LLM impossible (%s) : repli sur les heuristiques regex.", e)
+            EXTRACTION_DEGRADED_COUNTER.inc()
+            return [_heuristic_extract(event_content)]
+        faits = _validate_extractions(donnees, event_content)
+        logger.info("%d fait(s) extrait(s) de l'événement (modèle %s).", len(faits), modele)
+        return faits
+
     try:
         headers = {"Content-Type": "application/json"}
         if LLM_API_KEY and "your_api_key" not in LLM_API_KEY:
             headers["Authorization"] = f"Bearer {LLM_API_KEY}"
         payload = {
             "model": LLM_MODEL,
-            "messages": [
-                {"role": "system", "content": "Precision memory extractor. Reply with JSON only."},
-                {"role": "user", "content": prompt},
-            ],
+            "messages": messages,
             "temperature": 0,
         }
 

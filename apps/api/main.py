@@ -44,8 +44,10 @@ from synaptiq_core.belief_guard import CroyanceRefusee, valider_croyance
 # le reste de la taxonomie, pour que l'API et le worker rangent selon les MÊMES règles.
 from synaptiq_core.compartments import (
     ALIAS,
+    COMPARTIMENT_ARCHIVES,
     COMPARTIMENT_CROYANCES,
     NOMS,
+    NOMS_ACTIFS,
     PAR_NOM,
     Rangement,
     catalogue,
@@ -58,6 +60,14 @@ from synaptiq_core.context_builder import RetrievalConfig, build_context_packet
 
 # Journalisation structurée + corrélation par trace_id
 from synaptiq_core.observability import configure_logging, set_trace_id
+
+# Récompense et plasticité (lot 2) : fonctions pures, testées sans base
+from synaptiq_core.plasticite import (
+    SOUVENIRS_PAR_RENFORCEMENT_MAX,
+    borner_recompense,
+    paires_hebbiennes,
+    renforcer_poids,
+)
 
 # Taxonomie partagée avec le worker : les DEUX chemins d'écriture appliquent la même règle
 from synaptiq_core.project import (
@@ -115,6 +125,10 @@ QEM_CROYANCES_MAX_SHARE = float(os.getenv(
 QEM_REFLEXES_MAX_SHARE = float(os.getenv("QEM_REFLEXES_MAX_SHARE", "0.20"))
 # Nombre max de réflexes injectés à chaque contexte (tronc cérébral). 0 = désactivé.
 QEM_REFLEXES_INJECTES = int(os.getenv("QEM_REFLEXES_INJECTES", "8"))
+# Récompense (lot 2) : score × (1 + gain × reward). 0 désactive l'effet au rappel.
+RECOMPENSE_GAIN = float(os.getenv("RECOMPENSE_GAIN", "0.1"))
+# Plasticité : renfort d'un lien entre souvenirs déclarés utiles ensemble.
+PLASTICITE_PAS = float(os.getenv("PLASTICITE_PAS", "0.1"))
 # Décroissance temporelle : demi-vie (en jours) du score de récence. Une mémoire non
 # ré-accédée voit sa pertinence divisée par 2 tous les N jours. 0 (ou négatif) = désactivé.
 QEM_RECENCY_HALFLIFE_DAYS = float(os.getenv("QEM_RECENCY_HALFLIFE_DAYS", "14"))
@@ -266,7 +280,7 @@ async def lifespan(app: FastAPI):
         redis_client.close()
 
 
-app = FastAPI(title="SynaptiQ API", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="SynaptiQ API", version="0.5.0", lifespan=lifespan)
 
 # ─── Sécurité : CORS + rate limiting ───
 from fastapi.middleware.cors import CORSMiddleware
@@ -566,7 +580,7 @@ def _fetch_candidates(cur, vector_str: str, query_text: str, tenant: str,
     linéaire en volume : l'écart croît avec le corpus. Ne pas « simplifier » en refactorisant
     le filtre commun dans une CTE.
     """
-    champs = ("id", "type", "compartment", "content", "confidence", "importance",
+    champs = ("id", "type", "compartment", "content", "confidence", "importance", "reward",
               "last_accessed_at", "created_at", "occurred_at", "embedding::text")
     colonnes = ", ".join(champs)
     # Le SELECT final joint `memories` (alias m) et les rangs : sans préfixe, PostgreSQL
@@ -717,7 +731,7 @@ class PostgresMemoryStore:
         frag_projet, p_projet = filtre_projet(self._project, self._include_global)
         self._cur.execute(
             f"""
-            SELECT id, type, compartment, content, confidence, importance,
+            SELECT id, type, compartment, content, confidence, importance, reward,
                    last_accessed_at, created_at, occurred_at, embedding::text,
                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_accessed_at)) AS age_seconds
             FROM memories
@@ -757,7 +771,7 @@ class PostgresMemoryStore:
         # d'appelant dans le SQL, le nom du projet passe en paramètre lié).
         self._cur.execute(
             f"""
-            SELECT id, type, compartment, content, confidence, importance,
+            SELECT id, type, compartment, content, confidence, importance, reward,
                    last_accessed_at, created_at, occurred_at, embedding::text
             FROM memories
             WHERE id = ANY(%s::uuid[])
@@ -801,6 +815,7 @@ def retrieval_config() -> RetrievalConfig:
         croyances_max_share=QEM_CROYANCES_MAX_SHARE,
         reflexes_max_share=QEM_REFLEXES_MAX_SHARE,
         reflexes_injectes=QEM_REFLEXES_INJECTES,
+        recompense_gain=RECOMPENSE_GAIN,
     )
 
 
@@ -836,11 +851,11 @@ class EventInput(BaseModel):
 
 class ContextConstraints(BaseModel):
     max_tokens: int = Field(default=1200, ge=1, le=8000)
-    # Compartiments interrogés. Par défaut les 9 : `croyances` nuance le paquet sous son
-    # quota, `reflexes` y est injecté d'office. Viser un sous-ensemble réduit le bruit à
-    # budget égal (ex. ["alertes", "savoir_faire"] pour un débogage).
+    # Compartiments interrogés. Par défaut tous SAUF `archives` (mémoire dormante, à
+    # demander explicitement) : `croyances` nuance le paquet sous son quota, `reflexes` y
+    # est injecté d'office. Viser un sous-ensemble réduit le bruit à budget égal.
     compartments: list[CompartmentName] = Field(  # type: ignore[valid-type]
-        default_factory=lambda: list(NOMS), min_length=1, max_length=len(NOMS),
+        default_factory=lambda: list(NOMS_ACTIFS), min_length=1, max_length=len(NOMS),
         json_schema_extra={"example": ["savoir_faire", "alertes"]})
     # Filtre projet (lot B). None = tous projets confondus (historique). Avec un projet,
     # `include_global` ajoute les souvenirs globaux (préférences, conventions générales).
@@ -1625,10 +1640,12 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
             # Le fragment et `filtre_params` sont construits ENSEMBLE et dans le même ordre :
             # les trois requêtes ci-dessous sont positionnelles, et un décalage y serait muet
             # (les types concordent) — il fausserait le filtre au lieu de lever.
-            type_filter = "AND m.compartment = ANY(%s)" if request.compartments else ""
-            filtre_params: list = [tenant, request.agent_id]
-            if request.compartments:
-                filtre_params.append(list(request.compartments))
+            # Sans filtre explicite : tous les compartiments SAUF les archives (lot 2).
+            # Le filtre est donc toujours posé — un souvenir archivé ne remonte que si
+            # l'appelant le demande.
+            type_filter = "AND m.compartment = ANY(%s)"
+            filtre_params: list = [tenant, request.agent_id,
+                                   list(request.compartments or NOMS_ACTIFS)]
             # Projet (lot B) : même fragment que `_fetch_candidates`, ajouté en dernier.
             frag_projet, p_projet = filtre_projet(request.project, request.include_global,
                                                   alias="m.")
@@ -1639,7 +1656,7 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
 
             if not RETRIEVAL_HYBRID:
                 cur.execute(f"""
-                    SELECT m.id, m.compartment, m.content, m.confidence, m.importance,
+                    SELECT m.id, m.compartment, m.content, m.confidence, m.importance, m.reward,
                            m.last_accessed_at, m.occurred_at,
                            (1 - (m.embedding <=> %s::vector)) AS similarity
                     FROM memories m
@@ -1697,7 +1714,7 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
                     ) u
                     GROUP BY id
                 )
-                SELECT m.id, m.compartment, m.content, m.confidence, m.importance,
+                SELECT m.id, m.compartment, m.content, m.confidence, m.importance, m.reward,
                        m.last_accessed_at, m.occurred_at,
                        (1 - (m.embedding <=> %s::vector)) AS similarity,
                        r.rank_vec, r.rank_fts
@@ -1731,6 +1748,114 @@ def retrieve_memories(request: RetrieveRequest, auth: AuthContext | None = Depen
         raise HTTPException(status_code=500, detail="Erreur interne du serveur.") from None
     finally:
         pool.putconn(conn)
+
+
+# ─── Récompense, plasticité, restauration (lot 2) ───────────────────────────
+
+class ReinforceInput(BaseModel):
+    agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$")
+    memory_ids: list[uuid.UUID] = Field(..., min_length=1,
+                                        max_length=SOUVENIRS_PAR_RENFORCEMENT_MAX)
+    # True : ces souvenirs ont servi (récompense +1, liens entre eux renforcés).
+    # False : ils ont induit en erreur ou étaient hors sujet (récompense -1).
+    useful: bool = True
+
+
+@v1_router.post("/memories/reinforce")
+def reinforce_memories(payload: ReinforceInput, auth: AuthContext | None = Depends(get_auth)):
+    """Récompense (dopamine) et plasticité (Hebb) sur des souvenirs de l'agent.
+
+    - récompense : `reward` ± 1, borné à ±5, qui pondère ensuite le score au rappel ;
+    - plasticité : si `useful` et au moins deux souvenirs, chaque paire voit son lien
+      `entangled_with` renforcé (créé s'il n'existe pas). Pas de lien vers une croyance ni
+      une archive, ni entre deux projets différents (règle du graphe du lot B).
+    Borné à l'agent de la clé : on ne renforce jamais le souvenir d'un autre agent.
+    """
+    tenant = resolve_tenant(auth)
+    require_scope(auth, "write")
+    resolve_agent(auth, payload.agent_id)
+    ids = [str(i) for i in payload.memory_ids]
+    delta = 1.0 if payload.useful else -1.0
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, reward, compartment, project FROM memories WHERE id = ANY(%s::uuid[]) "
+            "AND tenant_id = %s AND agent_id = %s AND status = 'active'",
+            (ids, tenant, payload.agent_id))
+        trouves = {str(li["id"]): li for li in cur.fetchall()}
+        for mem_id, li in trouves.items():
+            cur.execute("UPDATE memories SET reward = %s WHERE id = %s",
+                        (borner_recompense(float(li["reward"] or 0) + delta), mem_id))
+        liens = 0
+        if payload.useful:
+            for a, b in paires_hebbiennes([i for i, li in trouves.items()
+                                           if li["compartment"] not in
+                                           (COMPARTIMENT_CROYANCES, COMPARTIMENT_ARCHIVES)]):
+                pa, pb = trouves[a]["project"], trouves[b]["project"]
+                if pa and pb and pa != pb:
+                    continue
+                cur.execute(
+                    "SELECT source_memory_id, target_memory_id, weight FROM relationships "
+                    "WHERE relation_type = 'entangled_with' AND ((source_memory_id = %s "
+                    "AND target_memory_id = %s) OR (source_memory_id = %s "
+                    "AND target_memory_id = %s)) LIMIT 1", (a, b, b, a))
+                lien = cur.fetchone()
+                if lien is None:
+                    cur.execute(
+                        "INSERT INTO relationships (source_memory_id, target_memory_id, "
+                        "relation_type, weight, last_reinforced_at) VALUES (%s, %s, "
+                        "'entangled_with', %s, CURRENT_TIMESTAMP) "
+                        "ON CONFLICT (source_memory_id, target_memory_id) DO NOTHING",
+                        (a, b, renforcer_poids(None, 0.0)))
+                else:
+                    cur.execute(
+                        "UPDATE relationships SET weight = %s, last_reinforced_at = "
+                        "CURRENT_TIMESTAMP WHERE source_memory_id = %s AND target_memory_id = %s",
+                        (renforcer_poids(lien["weight"], PLASTICITE_PAS),
+                         lien["source_memory_id"], lien["target_memory_id"]))
+                liens += 1
+        conn.commit()
+    return {"status": "reinforced", "useful": payload.useful,
+            "memories": len(trouves), "ignored": len(ids) - len(trouves), "links": liens}
+
+
+class RestoreInput(BaseModel):
+    agent_id: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$")
+
+
+@v1_router.post("/memories/{memory_id}/restore")
+def restore_memory(memory_id: uuid.UUID, payload: RestoreInput,
+                   auth: AuthContext | None = Depends(get_auth)):
+    """Sort un souvenir des archives et le remet dans son compartiment d'origine.
+
+    L'origine est lue dans `provenance->>'archived_from'` (posée par le sommeil). Inconnue
+    ou invalide : `savoirs`. La trace de l'archivage est conservée dans la provenance.
+    """
+    tenant = resolve_tenant(auth)
+    require_scope(auth, "write")
+    resolve_agent(auth, payload.agent_id)
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT provenance FROM memories WHERE id = %s AND tenant_id = %s "
+            "AND agent_id = %s AND compartment = %s",
+            (str(memory_id), tenant, payload.agent_id, COMPARTIMENT_ARCHIVES))
+        ligne = cur.fetchone()
+        if ligne is None:
+            conn.rollback()
+            raise HTTPException(status_code=404,
+                                detail=f"Aucun souvenir archivé {memory_id} pour cet agent.")
+        origine = (ligne["provenance"] or {}).get("archived_from")
+        if origine not in PAR_NOM or origine == COMPARTIMENT_ARCHIVES:
+            origine = "savoirs"
+        cur.execute(
+            "UPDATE memories SET compartment = %s, type = %s, status = 'active', "
+            "last_accessed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, "
+            "provenance = COALESCE(provenance, '{}'::jsonb) || "
+            "jsonb_build_object('restored_at', CURRENT_TIMESTAMP::text) WHERE id = %s",
+            (origine, PAR_NOM[origine].famille, str(memory_id)))
+        audit(cur, tenant, "restore_memory", auth, payload.agent_id,
+              memory_id=str(memory_id), compartment=origine)
+        conn.commit()
+    return {"status": "restored", "memory_id": str(memory_id), "compartment": origine}
 
 
 # ─── Croyances : ce que l'agent pense (compartiment `croyances`, lot C) ─────

@@ -460,8 +460,10 @@ def recall_memories(query: str, limit: int = 5, compartments: list[str] | None =
 
         output = ["Souvenirs retrouves dans SynaptiQ :"]
         for mem in memories:
+            # L'identifiant est affiche : c'est lui que `reinforce` et `restore_memory`
+            # attendent. Sans lui, l'agent ne pourrait pas dire lequel lui a servi.
             output.append(f"- [{_libelle(mem.get('compartment'))}] {mem['content']} "
-                          f"(Confidence: {mem['confidence']})")
+                          f"(id: {mem.get('id')}, confidence: {mem['confidence']})")
         return "\n".join(output)
     except Exception as e:
         return _echec("Echec de la recherche de souvenirs", e)
@@ -526,9 +528,70 @@ def build_context(task: str, query: str, max_tokens: int = 1200,
             libelle = _libelle(cle)
             for item in items:
                 lines.append(f"- [{libelle}] {item}")
-        return "\n".join(lines) if len(lines) > 1 else "Aucun contexte pertinent trouve."
+        if len(lines) == 1:
+            return "Aucun contexte pertinent trouve."
+        # Identifiants des souvenirs servis : a passer a `reinforce` s'ils ont ete utiles.
+        ids = data.get("selected_memory_ids") or []
+        if ids:
+            lines.append(f"(souvenirs servis : {', '.join(str(i) for i in ids)})")
+        return "\n".join(lines)
     except Exception as e:
         return _echec("Echec de la construction du contexte", e)
+
+
+# ─── Récompense, plasticité, archives (lot 2) ───────────────────────────────
+
+@mcp.tool()
+def reinforce(memory_ids: list[str], useful: bool = True) -> str:
+    """
+    Signale les souvenirs qui t'ont REELLEMENT servi (useful=True) ou induit en erreur
+    (useful=False). Les souvenirs utiles remontent au rappel suivant, et les liens entre
+    ceux qui ont servi ENSEMBLE se renforcent (plasticite). A appeler apres une tache, avec
+    les ids affiches par recall_memories ou build_context.
+
+    Args:
+        memory_ids: Ids des souvenirs concernes (1 a 10).
+        useful: True s'ils ont servi, False s'ils etaient faux ou hors sujet.
+    """
+    url = f"{SYNAPTIQ_API_URL}/v1/memories/reinforce"
+    try:
+        response = _poster(url, {"agent_id": require_agent_id(), "memory_ids": memory_ids,
+                                 "useful": useful})
+        refus = _refus(response)
+        if refus:
+            return refus
+        response.raise_for_status()
+        d = response.json()
+        return (f"[SUCCESS] {d.get('memories')} souvenir(s) "
+                f"{'renforce(s)' if useful else 'affaibli(s)'}, {d.get('links', 0)} lien(s) "
+                f"consolide(s)" + (f", {d['ignored']} id(s) inconnu(s)" if d.get("ignored") else "")
+                + ".")
+    except Exception as e:
+        return _echec("Echec du renforcement", e)
+
+
+@mcp.tool()
+def restore_memory(memory_id: str) -> str:
+    """
+    Sort un souvenir des ARCHIVES (memoire dormante) et le remet dans son compartiment
+    d'origine. Rien n'est jamais supprime dans SynaptiQ : le sommeil range l'oublie dans
+    les archives, consultables avec recall_memories(compartments=['archives']).
+
+    Args:
+        memory_id: Id du souvenir archive.
+    """
+    url = f"{SYNAPTIQ_API_URL}/v1/memories/{memory_id}/restore"
+    try:
+        response = _poster(url, {"agent_id": require_agent_id()})
+        if response.status_code == 404:
+            return f"[REFUSE] {response.json().get('detail', response.text)}"
+        refus = _refus(response)
+        if refus:
+            return refus
+        response.raise_for_status()
+        return f"[SUCCESS] Souvenir restaure dans '{response.json().get('compartment')}'."
+    except Exception as e:
+        return _echec("Echec de la restauration", e)
 
 
 # ─── Croyances : ce que l'agent pense (compartiment `croyances`, lot C) ─────

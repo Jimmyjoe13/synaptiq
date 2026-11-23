@@ -261,3 +261,51 @@ def test_contest_belief_appelle_l_endpoint_dedie(http):
     etat["charge"] = {"status": "contested"}
     _outil("contest_belief")("b1", reason="faux")
     assert appels[0]["url"].endswith("/v1/beliefs/b1/contest")
+
+
+# ─── 8. Lot 2 : récompense, archives, identifiants visibles ──────────────────
+
+def test_reinforce_transmet_les_ids_et_le_verdict(http):
+    appels, etat = http
+    etat["charge"] = {"status": "reinforced", "memories": 2, "ignored": 0, "links": 1}
+    message = _outil("reinforce")(["m1", "m2"])
+    assert appels[0]["url"].endswith("/v1/memories/reinforce")
+    assert appels[0]["payload"] == {"agent_id": "agent_de_test", "memory_ids": ["m1", "m2"],
+                                    "useful": True}
+    assert "2 souvenir(s) renforce(s), 1 lien(s)" in message
+
+
+def test_reinforce_negatif(http):
+    appels, etat = http
+    etat["charge"] = {"status": "reinforced", "memories": 1, "ignored": 1, "links": 0}
+    message = _outil("reinforce")(["m1", "inconnu"], useful=False)
+    assert appels[0]["payload"]["useful"] is False
+    assert "affaibli" in message and "1 id(s) inconnu(s)" in message
+
+
+def test_restore_memory(http):
+    appels, etat = http
+    etat["charge"] = {"status": "restored", "compartment": "savoirs"}
+    message = _outil("restore_memory")("m1")
+    assert appels[0]["url"].endswith("/v1/memories/m1/restore")
+    assert "restaure dans 'savoirs'" in message
+
+
+def test_restore_memory_inconnu(http):
+    _, etat = http
+    etat["status"], etat["charge"] = 404, {"detail": "Aucun souvenir archivé m1"}
+    assert _outil("restore_memory")("m1").startswith("[REFUSE]")
+
+
+def test_recall_affiche_les_ids(http):
+    _, etat = http
+    etat["charge"] = {"memories": [{"id": "m42", "compartment": "savoirs", "content": "x",
+                                    "confidence": 1.0}]}
+    assert "id: m42" in _outil("recall_memories")("q")
+
+
+def test_build_context_affiche_les_ids_servis(http):
+    _, etat = http
+    etat["charge"] = {"token_estimate": 5, "context_packet": {"savoirs": ["x"]},
+                      "selected_memory_ids": ["m1", "m2"]}
+    assert "(souvenirs servis : m1, m2)" in _outil("build_context")("t", "q")
